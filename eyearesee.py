@@ -22,6 +22,7 @@ import os
 import uuid
 import warnings
 from collections import deque, OrderedDict
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 from math import log2
 from typing import Optional, Dict, List, Tuple, Callable
 
@@ -398,6 +399,24 @@ def _has_cjk(text: str, threshold: int = 2) -> bool:
     return False
 
 
+# ── Dedicated thread-pool executors ──────────────────────────────────────────
+# Two separate pools prevent ML inference and blocking HTTP calls from
+# competing for the same threads and stalling each other during AI commands.
+#   _ML_EXECUTOR  — transformer model inference (predict_detailed); kept small
+#                   (2 workers) because each call is CPU-heavy and loading more
+#                   just causes context-switching thrash.
+#   _IO_EXECUTOR  — blocking HTTP calls (ollama, llama.cpp, translation); wider
+#                   (4 workers) because calls block on network I/O, not CPU.
+_ML_EXECUTOR = _ThreadPoolExecutor(max_workers=2, thread_name_prefix="eyrc-ml")
+_IO_EXECUTOR = _ThreadPoolExecutor(max_workers=4, thread_name_prefix="eyrc-io")
+
+# Semaphore created lazily in the async context.
+_ML_SEM: Optional[asyncio.Semaphore] = None
+
+# Cached classify clients (module-level so they survive across calls).
+_classify_ac: Optional[object] = None
+_classify_oc: Optional[object] = None
+
 # ── Translation cache + concurrency control ───────────────────────────────────
 # Cache: plain_text → Optional[str].  A cached None means "already English" or
 # "previously failed" — we don't retry until the process restarts.
@@ -443,7 +462,7 @@ async def _translate_to_english(text: str) -> Optional[str]:
         loop = asyncio.get_running_loop()
         async with _TRANSLATION_SEM:
             raw = await loop.run_in_executor(
-                None, lambda: urllib.request.urlopen(url, timeout=6).read()
+                _IO_EXECUTOR, lambda: urllib.request.urlopen(url, timeout=6).read()
             )
         data = json.loads(raw)
 
@@ -1135,33 +1154,44 @@ async def _llm_classify_ai(text: str, model_key: str) -> float:
             provider = spec["provider"]
             model_id = spec["id"]
 
+        global _classify_ac, _classify_oc
         answer = ""
         if provider == "claude":
             if not ANTHROPIC_AVAILABLE or not ANTHROPIC_API_KEY:
                 return 0.0
-            ac  = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-            msg = await ac.messages.create(
-                model=model_id, max_tokens=10,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            if _classify_ac is None:
+                _classify_ac = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+            try:
+                msg = await _classify_ac.messages.create(
+                    model=model_id, max_tokens=10,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            except Exception:
+                _classify_ac = None
+                raise
             answer = msg.content[0].text if msg.content else ""
         elif provider == "openai":
             if not OPENAI_AVAILABLE or not OPENAI_API_KEY:
                 return 0.0
-            oc   = _openai_mod.AsyncOpenAI(api_key=OPENAI_API_KEY)
-            resp = await oc.chat.completions.create(
-                model=model_id, max_tokens=10,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            if _classify_oc is None:
+                _classify_oc = _openai_mod.AsyncOpenAI(api_key=OPENAI_API_KEY)
+            try:
+                resp = await _classify_oc.chat.completions.create(
+                    model=model_id, max_tokens=10,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            except Exception:
+                _classify_oc = None
+                raise
             answer = resp.choices[0].message.content if resp.choices else ""
         elif provider == "ollama":
             loop   = asyncio.get_running_loop()
             answer, _ = await loop.run_in_executor(
-                None, _ollama_blocking_call, model_id, prompt, 10)
+                _IO_EXECUTOR, _ollama_blocking_call, model_id, prompt, 10)
         elif provider == "llamacpp":
             loop   = asyncio.get_running_loop()
             answer, _ = await loop.run_in_executor(
-                None, _llamacpp_blocking_call, model_id, prompt, 10)
+                _IO_EXECUTOR, _llamacpp_blocking_call, model_id, prompt, 10)
         else:
             return 0.0
 
@@ -2575,9 +2605,15 @@ class IRCClient:
                     fp.ingest(msg)
                 a_score = 100
             else:
+                global _ML_SEM
+                if _ML_SEM is None:
+                    _ML_SEM = asyncio.Semaphore(2)
                 loop = asyncio.get_running_loop()
-                detail = await loop.run_in_executor(
-                    None, self.scoring.ai_detector.predict_detailed, msg)
+                async with _ML_SEM:
+                    detail = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            _ML_EXECUTOR, self.scoring.ai_detector.predict_detailed, msg),
+                        timeout=15.0)
                 prob = detail["prob"]
                 # Optional LLM-based classification: blended in when /model is set.
                 # Weight: 60% local ensemble (fast, always-on) + 40% LLM signal.
@@ -2875,6 +2911,8 @@ class TUI:
         # Claude API state
         self.ai_chat_model: str = CLAUDE_DEFAULT_MODEL   # key into CLAUDE_MODELS
         self._askai_pending: bool = False                # prevent concurrent calls
+        self._anthropic_client = None                    # reuse HTTP connection pool
+        self._openai_client    = None
 
         # Pre-compute curses attributes (avoids repeated function calls every frame)
         try:
@@ -3348,9 +3386,7 @@ class TUI:
         model_key may be:
           • a key from AI_MODELS ("gemma", "sonnet", "gpt4o", …)
           • "ollama:<model-id>" for any Ollama model not pre-registered
-            e.g. "ollama:gemma3:4b", "ollama:llama3.2", "ollama:mistral"
         """
-        # Dynamic Ollama syntax: "ollama:<modelname>"
         if model_key.startswith("ollama:"):
             provider = "ollama"
             model_id = model_key[len("ollama:"):]
@@ -3369,8 +3405,10 @@ class TUI:
                 return ("[error] ANTHROPIC_API_KEY not set — "
                         "set the environment variable and restart"), "?"
             try:
-                ac  = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-                msg = await ac.messages.create(
+                if self._anthropic_client is None:
+                    self._anthropic_client = _anthropic_mod.AsyncAnthropic(
+                        api_key=ANTHROPIC_API_KEY)
+                msg = await self._anthropic_client.messages.create(
                     model=model_id, max_tokens=max_tokens,
                     messages=[{"role": "user", "content": prompt}],
                 )
@@ -3379,6 +3417,7 @@ class TUI:
                 tokens = str(usage.input_tokens + usage.output_tokens) if usage else "?"
                 return answer, tokens
             except Exception as exc:
+                self._anthropic_client = None   # discard on error; recreate next call
                 return f"[error] {exc}", "?"
 
         if provider == "openai":
@@ -3389,8 +3428,10 @@ class TUI:
                 return ("[error] OPENAI_API_KEY not set — "
                         "set the environment variable and restart"), "?"
             try:
-                oc   = _openai_mod.AsyncOpenAI(api_key=OPENAI_API_KEY)
-                resp = await oc.chat.completions.create(
+                if self._openai_client is None:
+                    self._openai_client = _openai_mod.AsyncOpenAI(
+                        api_key=OPENAI_API_KEY)
+                resp = await self._openai_client.chat.completions.create(
                     model=model_id, max_tokens=max_tokens,
                     messages=[{"role": "user", "content": prompt}],
                 )
@@ -3400,23 +3441,19 @@ class TUI:
                 tokens = str(usage.total_tokens) if usage else "?"
                 return answer, tokens
             except Exception as exc:
+                self._openai_client = None      # discard on error; recreate next call
                 return f"[error] {exc}", "?"
 
         if provider == "ollama":
-            # Ollama is local/offline — no API key, just needs `ollama serve` running.
-            # The HTTP call is synchronous so we offload it to a thread executor.
-            loop   = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             answer, tokens = await loop.run_in_executor(
-                None, _ollama_blocking_call, model_id, prompt, max_tokens
-            )
+                _IO_EXECUTOR, _ollama_blocking_call, model_id, prompt, max_tokens)
             return answer, tokens
 
         if provider == "llamacpp":
-            # llama.cpp server — OpenAI-compatible API, no key needed.
-            loop   = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             answer, tokens = await loop.run_in_executor(
-                None, _llamacpp_blocking_call, model_id, prompt, max_tokens
-            )
+                _IO_EXECUTOR, _llamacpp_blocking_call, model_id, prompt, max_tokens)
             return answer, tokens
 
         return f"[error] unknown provider '{provider}'", "?"
@@ -3440,7 +3477,12 @@ class TUI:
 
         answer, tokens = "", "?"
         try:
-            answer, tokens = await self._call_ai(question, model_key, max_tokens=1024)
+            answer, tokens = await asyncio.wait_for(
+                self._call_ai(question, model_key, max_tokens=1024), timeout=120.0)
+        except asyncio.TimeoutError:
+            answer, tokens = "[error] AI request timed out after 120 s", "?"
+        except Exception as exc:
+            answer, tokens = f"[error] {exc}", "?"
         finally:
             self._askai_pending = False
 
@@ -4684,7 +4726,8 @@ class TUI:
             model_key = self.ai_chat_model
             question  = rest
         if question:
-            asyncio.create_task(self._do_askai(question, model_key))
+            t = asyncio.create_task(self._do_askai(question, model_key))
+            t.add_done_callback(self._ai_task_done)
         else:
             keys = " | ".join(AI_MODELS)
             await self.ui_queue.put(("status",
@@ -4757,14 +4800,39 @@ class TUI:
             f"Transcript:\n{transcript}"
         )
 
+        # Mark pending synchronously before creating the task so a second
+        # /summarize issued in the same event-loop tick is rejected.
         self._askai_pending = True
         await self.ui_queue.put(("status",
             f"[summarize] {len(raw_lines)} msgs from {win.name} via "
             f"{model_key} ({label})…"))
+        task = asyncio.create_task(
+            self._do_summarize(prompt, model_key, model_id, label,
+                               win.name, len(raw_lines), speakers))
+        task.add_done_callback(self._ai_task_done)
 
+    def _ai_task_done(self, task: asyncio.Task) -> None:
+        """Done-callback for fire-and-forget AI tasks.  Logs unhandled exceptions
+        to the status window instead of letting them vanish silently."""
+        exc = task.exception() if not task.cancelled() else None
+        if exc:
+            try:
+                self.window_by_name["*status*"].add_line(f"[ai error] {exc}")
+                self._chat_dirty = self.dirty = True
+            except Exception:
+                pass
+
+    async def _do_summarize(self, prompt: str, model_key: str, model_id: str,
+                             label: str, win_name: str, n_msgs: int,
+                             speakers: list) -> None:
         answer, tokens = "", "?"
         try:
-            answer, tokens = await self._call_ai(prompt, model_key, max_tokens=800)
+            answer, tokens = await asyncio.wait_for(
+                self._call_ai(prompt, model_key, max_tokens=800), timeout=120.0)
+        except asyncio.TimeoutError:
+            answer, tokens = "[error] AI request timed out after 120 s", "?"
+        except Exception as exc:
+            answer, tokens = f"[error] {exc}", "?"
         finally:
             self._askai_pending = False
 
@@ -4772,8 +4840,7 @@ class TUI:
         dash.lines.clear()
         dash._wrap_dirty = True
         L = lambda t: dash.add_line(t, timestamp=False)
-
-        L(f"=== /summarize  [{win.name}]  last {len(raw_lines)} msgs  [{model_key}  {label}] ===")
+        L(f"=== /summarize  [{win_name}]  last {n_msgs} msgs  [{model_key}  {label}] ===")
         if speakers:
             L(f"  Speakers: {', '.join(speakers)}")
         L("")
@@ -4781,7 +4848,6 @@ class TUI:
             L(f"  {raw_line}" if raw_line.strip() else "")
         L("")
         L(f"  model: {model_id}  tokens used: {tokens}")
-
         self.current_window_index      = 1
         self._chat_dirty               = True
         self._dashboard_dirty          = False
