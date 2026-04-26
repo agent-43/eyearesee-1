@@ -77,7 +77,7 @@ PluginAPI / PluginManager — hot-reloadable plugin system
 
 Includes performance work (LRU caches, O(1) lookups, chunked log reading) and defensive coding practices.
 Running without dependencies / AI
-Bashpython eyearesee.py --no-ai --no-install
+Bash python eyearesee.py --no-ai --no-install
 This command runs the core IRC client cleanly without installing packages or enabling AI detection.
-
+ 
 eyearesee is an unusually ambitious single-file project: a polished, IRCv3-compliant terminal IRC client merged with a four-signal AI-text-detector and a multi-provider LLM chat interface, all in one ~5,700-line script with no required external dependencies beyond Python's standard library.
