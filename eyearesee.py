@@ -1917,9 +1917,10 @@ class IRCClient:
         line = line.replace("\r", "").replace("\n", "").replace("\x00", "")
         if not line:
             return
-        # IRC protocol maximum is 512 bytes including CRLF (RFC 1459 §2.3).
-        # Encode first so multi-byte UTF-8 chars are truncated on a byte boundary.
-        encoded = line.encode("utf-8", "replace")[:510]
+        # Tagged lines: IRCv3 allows up to 4096 bytes for the tag section plus
+        # 512 bytes for the message body (client→server total ~4608 bytes).
+        max_bytes = 4608 if line.startswith("@") else 510
+        encoded = line.encode("utf-8", "replace")[:max_bytes]
         try:
             self._send_queue.put_nowait(encoded + b"\r\n")
         except asyncio.QueueFull:
@@ -2157,10 +2158,21 @@ class IRCClient:
                     continue
                 if "=" in t:
                     k, v = t.split("=", 1)
-                    # Unescape IRCv3 tag escape sequences
-                    v = (v.replace("\\:", ";").replace("\\s", " ")
-                          .replace("\\\\", "\\").replace("\\r", "\r")
-                          .replace("\\n", "\n"))
+                    # Unescape IRCv3 tag escape sequences (backslash must be processed inline)
+                    _out: list = []
+                    _it = iter(v)
+                    for _c in _it:
+                        if _c == "\\":
+                            _n = next(_it, "")
+                            if _n == ":":   _out.append(";")
+                            elif _n == "s": _out.append(" ")
+                            elif _n == "\\": _out.append("\\")
+                            elif _n == "r": _out.append("\r")
+                            elif _n == "n": _out.append("\n")
+                            else:           _out.append(_n)
+                        else:
+                            _out.append(_c)
+                    v = "".join(_out)
                     tags[k] = v
                 else:
                     tags[t] = ""
@@ -2194,12 +2206,10 @@ class IRCClient:
         self._current_msg_tags = tags
         # If this line carries a batch tag (and we're tracking that batch),
         # buffer it for later bulk dispatch instead of dispatching immediately.
-        # BATCH itself is never buffered — it controls the batch lifecycle.
-        if cmd != "BATCH":
-            batch_ref = tags.get("batch")
-            if batch_ref and batch_ref in self._batch_buffer:
-                self._batch_buffer[batch_ref].append((cmd, nick, params, prefix, tags))
-                return
+        batch_ref = tags.get("batch")
+        if batch_ref and batch_ref in self._batch_buffer:
+            self._batch_buffer[batch_ref].append((cmd, nick, params, prefix, tags))
+            return
         handler = self._irc_handlers.get(cmd)
         if handler:
             await handler(nick, params, prefix)
@@ -2222,7 +2232,12 @@ class IRCClient:
         "message-tags", "batch", "labeled-response", "invite-notify",
         "account-tag", "standard-replies", "setname",
         "chathistory", "draft/chathistory",
-        "monitor",   # some servers CAP-advertise MONITOR support
+        "monitor",
+        "cap-notify",
+        "draft/typing",
+        "draft/event-playback",
+        "draft/read-marker",
+        "knock",
     )
 
     async def _irc_cap(self, nick, params, prefix):
@@ -2249,7 +2264,10 @@ class IRCClient:
                     self._chathistory_cap = "draft/chathistory"
                 want = [c for c in self._WANT_CAPS if c in self._cap_ls_caps]
                 if "sasl" in self._cap_ls_caps and NICKSERV_PASSWORD:
-                    want.append("sasl")
+                    # Only request sasl if server supports PLAIN mechanism
+                    sasl_val = self._cap_ls_values.get("sasl", "")
+                    if not sasl_val or "PLAIN" in sasl_val.upper().split(","):
+                        want.append("sasl")
                 self.send_raw(f"CAP REQ :{' '.join(want)}" if want else "CAP END")
                 self._cap_ls_caps.clear()
         elif subcmd == "ACK":
@@ -2292,10 +2310,14 @@ class IRCClient:
 
     async def _irc_authenticate(self, nick, params, prefix):
         if params and params[0] == "+":
-            payload = base64.b64encode(
-                f"{self.nick}\0{self.nick}\0{NICKSERV_PASSWORD}".encode()
-            ).decode()
-            self.send_raw(f"AUTHENTICATE {payload}")
+            raw = f"{self.nick}\0{self.nick}\0{NICKSERV_PASSWORD}".encode()
+            payload = base64.b64encode(raw).decode()
+            # Chunk at 400 bytes; send "+" as final chunk if payload is exact multiple
+            chunk_size = 400
+            for i in range(0, len(payload), chunk_size):
+                self.send_raw(f"AUTHENTICATE {payload[i:i+chunk_size]}")
+            if len(payload) % chunk_size == 0:
+                self.send_raw("AUTHENTICATE +")
 
     async def _irc_sasl_ok(self, nick, params, prefix):  # 903
         await self.ui_queue.put(("status", "SASL authentication successful — ident set"))
@@ -2304,7 +2326,29 @@ class IRCClient:
 
     async def _irc_sasl_fail(self, nick, params, prefix):  # 904
         await self.ui_queue.put(("status", "SASL authentication failed — falling back to NickServ"))
+        self.send_raw("AUTHENTICATE *")
         self.send_raw("CAP END")
+
+    async def _irc_sasl_nicklocked(self, nick, params, prefix):  # 902
+        await self.ui_queue.put(("status", "SASL failed: nick is locked/registered — cannot authenticate"))
+        self.send_raw("AUTHENTICATE *")
+        self.send_raw("CAP END")
+
+    async def _irc_sasl_aborted(self, nick, params, prefix):  # 906
+        await self.ui_queue.put(("status", "SASL authentication aborted"))
+        self.send_raw("CAP END")
+
+    async def _irc_sasl_alreadyauthed(self, nick, params, prefix):  # 907
+        await self.ui_queue.put(("status", "Already authenticated via SASL"))
+        self.send_raw("CAP END")
+
+    async def _irc_sasl_mechs(self, nick, params, prefix):  # 908
+        mechs = params[-1] if params else ""
+        await self.ui_queue.put(("status", f"SASL mechanisms available: {mechs}"))
+        if "PLAIN" not in mechs.upper().split(","):
+            await self.ui_queue.put(("status", "SASL PLAIN not supported — skipping SASL"))
+            self.send_raw("AUTHENTICATE *")
+            self.send_raw("CAP END")
 
     def _flush_cap_req_queue(self) -> None:
         """Send the next queued cap REQ, or CAP END if the queue is empty."""
@@ -2366,6 +2410,29 @@ class IRCClient:
         self._label_seq += 1
         return f"eyrc-{self._label_seq}"
 
+    def _irc_lower(self, s: str) -> str:
+        """Casefold a nick/channel according to the server's CASEMAPPING."""
+        mapping = self._isupport.get("CASEMAPPING", "rfc1459")
+        s = s.lower()
+        if mapping == "ascii":
+            return s
+        if mapping == "strict-rfc1459":
+            return s.translate(str.maketrans(r"\[]", r"|{}"))
+        # rfc1459 (default)
+        return s.translate(str.maketrans(r"[\\]^", r"{|}~"))
+
+    def _is_chan(self, name: str) -> bool:
+        """Return True if *name* looks like a channel per server's CHANTYPES."""
+        chantypes = self._isupport.get("CHANTYPES", "#&")
+        return bool(name) and name[0] in chantypes
+
+    def _get_prefix_chars(self) -> str:
+        """Return the mode-prefix characters from server's PREFIX ISUPPORT token."""
+        prefix = self._isupport.get("PREFIX", "(qaohv)~&@%+")
+        if ")" in prefix:
+            return prefix.split(")", 1)[1]
+        return "@+%&~!"
+
     async def _irc_logged_in(self, nick, params, prefix):  # 900
         account = params[2] if len(params) > 2 else "?"
         await self.ui_queue.put(("status", f"Logged in as {account}"))
@@ -2401,6 +2468,8 @@ class IRCClient:
         await self.ui_queue.put(("join", nick, channel, ts_str, account, realname))
         if nick == self.nick:
             await self.ui_queue.put(("self_join", channel))
+            if "draft/no-implicit-names" in self._active_caps:
+                self.send_raw(f"NAMES {channel}")
 
     async def _irc_part(self, nick, params, prefix):
         if params:
@@ -2472,8 +2541,14 @@ class IRCClient:
         # is not silently dropped). Without labeled-response fall back to nick match.
         if nick == self.nick and not self._current_batch_is_replay:
             label = self._current_msg_tags.get("label", "")
-            if not label or label in self._sent_labels:
-                self._sent_labels.discard(label)
+            if "labeled-response" in self._active_caps:
+                # Only suppress echoes that carry one of our own sent labels
+                if label in self._sent_labels:
+                    self._sent_labels.discard(label)
+                    return
+                # No label or foreign label: from another session, show it
+            elif "echo-message" in self._active_caps:
+                # No labeled-response: suppress all self-echoes
                 return
         target = params[0]
         msg    = params[1]
@@ -2482,6 +2557,7 @@ class IRCClient:
         ts_str = _parse_server_time(tags["time"]) if "time" in tags else None
         # account-tag: sender's services account (if server advertises it)
         account = tags.get("account", "")
+        msgid = tags.get("msgid", "")
         is_replay = self._current_batch_is_replay
 
         # ACTION must be checked before the generic CTCP block — both use \x01
@@ -2588,7 +2664,7 @@ class IRCClient:
         # only contains bare nicks (matching how JOIN/PART/QUIT events work).
         cleaned = []
         for entry in params[3].split():
-            entry = entry.lstrip("@+%&~!")   # strip mode prefix
+            entry = entry.lstrip(self._get_prefix_chars())   # strip mode prefix
             if "!" in entry:                  # userhost-in-names
                 entry = entry.split("!", 1)[0]
             if entry:
@@ -2600,6 +2676,12 @@ class IRCClient:
 
     async def _irc_away_reply(self, nick, params, prefix):  # 301
         await self.ui_queue.put(("status", f"Away: {' '.join(params[1:])}"))
+
+    async def _irc_unaway(self, nick, params, prefix):  # 305 RPL_UNAWAY
+        await self.ui_queue.put(("status", "You are no longer marked as away"))
+
+    async def _irc_nowaway(self, nick, params, prefix):  # 306 RPL_NOWAWAY
+        await self.ui_queue.put(("status", "You have been marked as away"))
 
     async def _irc_topic_reply(self, nick, params, prefix):  # 332
         channel = params[1] if len(params) > 1 else ""
@@ -2689,6 +2771,23 @@ class IRCClient:
                 await self._dispatch_netjoin_batch(buffered)
                 return
 
+            # draft/multiline: concatenate all PRIVMSG bodies into one message
+            if batch_type == "draft/multiline" and buffered:
+                # Find the target from the first PRIVMSG in the batch
+                first_pm = next((x for x in buffered if x[0] == "PRIVMSG"), None)
+                if first_pm:
+                    _, fn, fp, fpr, ft = first_pm
+                    combined = "\n".join(
+                        x[2][1] for x in buffered
+                        if x[0] == "PRIVMSG" and len(x[2]) > 1
+                    )
+                    synthetic = list(fp)
+                    if len(synthetic) > 1:
+                        synthetic[1] = combined
+                    self._current_msg_tags = ft
+                    await self._irc_privmsg(fn, synthetic, fpr)
+                return
+
             # chathistory replay: suppress scoring, mark lines with [↑]
             is_replay = batch_type in ("chathistory", "draft/chathistory")
             # labeled-response batches need no special handling beyond normal dispatch;
@@ -2698,10 +2797,14 @@ class IRCClient:
             self._current_batch_is_replay = is_replay
             try:
                 for bcmd, bnick, bparams, bprefix, btags in buffered:
-                    handler = self._irc_handlers.get(bcmd)
-                    if handler:
-                        self._current_msg_tags = btags
-                        await handler(bnick, bparams, bprefix)
+                    self._current_msg_tags = btags
+                    if bcmd == "BATCH":
+                        # nested batch — recurse
+                        await self._irc_batch(bnick, bparams, bprefix)
+                    else:
+                        handler = self._irc_handlers.get(bcmd)
+                        if handler:
+                            await handler(bnick, bparams, bprefix)
             finally:
                 self._current_batch_is_replay = prev_replay
                 self._current_msg_tags = {}
@@ -2773,14 +2876,58 @@ class IRCClient:
         else:
             await self.ui_queue.put(("status", f"*** {nick} invited {invitee} to {channel}", ts_str))
 
+    async def _irc_inviting(self, nick, params, prefix):  # 341 RPL_INVITING
+        target  = params[1] if len(params) > 1 else "?"
+        channel = params[2] if len(params) > 2 else "?"
+        await self.ui_queue.put(("status", f"Inviting {target} to {channel}"))
+
+    async def _irc_useronchannel(self, nick, params, prefix):  # 443 ERR_USERONCHANNEL
+        target  = params[1] if len(params) > 1 else "?"
+        channel = params[2] if len(params) > 2 else "?"
+        await self.ui_queue.put(("status", f"{target} is already on {channel}"))
+
+    def _fmt_standard_reply(self, level: str, params: list) -> str:
+        """Format a FAIL/WARN/NOTE reply: LEVEL COMMAND CODE [context…] :description"""
+        command = params[0] if params else "?"
+        code    = params[1] if len(params) > 1 else "?"
+        desc    = params[-1] if len(params) > 2 else ""
+        ctx_parts = params[2:-1] if len(params) > 3 else []
+        ctx  = f" [{' '.join(ctx_parts)}]" if ctx_parts else ""
+        return f"[{level}] {command} {code}{ctx}: {desc}" if desc else f"[{level}] {command} {code}"
+
     async def _irc_fail(self, nick, params, prefix):
-        await self.ui_queue.put(("status", f"[FAIL] {' '.join(params)}"))
+        await self.ui_queue.put(("status", self._fmt_standard_reply("FAIL", params)))
 
     async def _irc_warn(self, nick, params, prefix):
-        await self.ui_queue.put(("status", f"[WARN] {' '.join(params)}"))
+        await self.ui_queue.put(("status", self._fmt_standard_reply("WARN", params)))
 
     async def _irc_note(self, nick, params, prefix):
-        await self.ui_queue.put(("status", f"[NOTE] {' '.join(params)}"))
+        await self.ui_queue.put(("status", self._fmt_standard_reply("NOTE", params)))
+
+    async def _irc_knock(self, nick, params, prefix):  # 710 RPL_KNOCK (received knock)
+        channel = params[1] if len(params) > 1 else "?"
+        user    = params[2] if len(params) > 2 else nick
+        reason  = params[-1] if len(params) > 3 else ""
+        msg = f"*** {user} knocks on {channel}"
+        if reason:
+            msg += f": {reason}"
+        await self.ui_queue.put(("status", msg))
+
+    async def _irc_knockdlvr(self, nick, params, prefix):  # 711 RPL_KNOCKDLVR
+        channel = params[1] if len(params) > 1 else "?"
+        await self.ui_queue.put(("status", f"Knock delivered to {channel}"))
+
+    async def _irc_toomanyknock(self, nick, params, prefix):  # 712 ERR_TOOMANYKNOCK
+        channel = params[1] if len(params) > 1 else "?"
+        await self.ui_queue.put(("status", f"Too many knocks on {channel}"))
+
+    async def _irc_chanopen(self, nick, params, prefix):  # 713 ERR_CHANOPEN
+        channel = params[1] if len(params) > 1 else "?"
+        await self.ui_queue.put(("status", f"{channel} is open — just /join it"))
+
+    async def _irc_knockonchan(self, nick, params, prefix):  # 714 ERR_KNOCKONCHAN
+        channel = params[1] if len(params) > 1 else "?"
+        await self.ui_queue.put(("status", f"You're already in {channel}"))
 
     async def _irc_mononline(self, nick, params, prefix):   # 730 RPL_MONONLINE
         for entry in (params[-1] if params else "").split(","):
@@ -2814,6 +2961,9 @@ class IRCClient:
                 self._isupport.pop(token[1:], None)
             elif "=" in token:
                 k, v = token.split("=", 1)
+                # Unescape \xHH sequences that some servers embed in ISUPPORT values
+                v = re.sub(r"\\x([0-9A-Fa-f]{2})",
+                           lambda m: chr(int(m.group(1), 16)), v)
                 self._isupport[k] = v
             else:
                 self._isupport[token] = True
@@ -2822,6 +2972,10 @@ class IRCClient:
             self._isupport["_network_announced"] = True
             await self.ui_queue.put(("status",
                 f"Network: {self._isupport['NETWORK']}"))
+        if "UTF8ONLY" in self._isupport and "_utf8only_announced" not in self._isupport:
+            self._isupport["_utf8only_announced"] = True
+            await self.ui_queue.put(("status",
+                "[isupport] Server is UTF-8 only (UTF8ONLY)"))
 
     async def _irc_no_such_nick(self, nick, params, prefix):  # 401 ERR_NOSUCHNICK
         target = params[1] if len(params) > 1 else params[0] if params else "?"
@@ -2850,6 +3004,10 @@ class IRCClient:
         h["AUTHENTICATE"] = self._irc_authenticate
         h["903"]          = self._irc_sasl_ok
         h["904"]          = self._irc_sasl_fail
+        h["902"]          = self._irc_sasl_nicklocked
+        h["906"]          = self._irc_sasl_aborted
+        h["907"]          = self._irc_sasl_alreadyauthed
+        h["908"]          = self._irc_sasl_mechs
         h["900"]          = self._irc_logged_in
         h["001"]          = self._irc_welcome
         h["JOIN"]         = self._irc_join
@@ -2864,10 +3022,14 @@ class IRCClient:
         h["QUIT"]         = self._irc_quit
         h["353"]          = self._irc_names
         h["301"]          = self._irc_away_reply
+        h["305"]          = self._irc_unaway
+        h["306"]          = self._irc_nowaway
         h["332"]          = self._irc_topic_reply
         h["331"]          = self._irc_no_topic
         h["433"]          = self._irc_nick_in_use
         h["432"]          = self._irc_bad_nick
+        h["341"]          = self._irc_inviting
+        h["443"]          = self._irc_useronchannel
         h["401"]          = self._irc_no_such_nick
         h["005"]          = self._irc_isupport
         h["AWAY"]         = self._irc_away_notify
@@ -2884,6 +3046,11 @@ class IRCClient:
         h["732"]          = self._irc_monlist
         h["734"]          = self._irc_monlistfull
         h["354"]          = self._irc_whox_reply
+        h["710"]          = self._irc_knock
+        h["711"]          = self._irc_knockdlvr
+        h["712"]          = self._irc_toomanyknock
+        h["713"]          = self._irc_chanopen
+        h["714"]          = self._irc_knockonchan
         # WHOIS numerics — bind each with its code via a closure
         for _code in _WHOIS_REPLIES:
             _c = _code
@@ -2967,6 +3134,18 @@ class IRCClient:
 
     def cmd_invite(self, nick: str, channel: str) -> None:
         self.send_raw(f"INVITE {nick} {channel}")
+
+    def cmd_knock(self, channel: str, message: str = "") -> None:
+        if message:
+            self.send_raw(f"KNOCK {channel} :{message}")
+        else:
+            self.send_raw(f"KNOCK {channel}")
+
+    def cmd_markread(self, target: str, msgid: str = "*") -> None:
+        """Send a MARKREAD command for draft/read-marker support."""
+        if "draft/read-marker" in self._active_caps:
+            self.send_raw(f"MARKREAD {target} timestamp={msgid}" if msgid != "*"
+                         else f"MARKREAD {target}")
 
     def cmd_who(self, target: str) -> None:
         self.send_raw(f"WHO {target}")
@@ -4695,6 +4874,8 @@ class TUI:
         h["monitor"]      = self._slash_monitor
         h["whox"]         = self._slash_whox
         h["tagmsg"]       = self._slash_tagmsg
+        h["knock"]        = self._slash_knock
+        h["markread"]     = self._slash_markread
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -5709,6 +5890,28 @@ class TUI:
                 tags[part.strip()] = ""
         c.cmd_tagmsg(target, tags)
         await self.ui_queue.put(("status", f"[tagmsg] sent to {target}: {tag_str}"))
+
+    async def _slash_knock(self, args, extra, line):
+        """Send a KNOCK to request entry to an invite-only channel."""
+        c = self._active_client()
+        parts = args.strip().split(None, 1)
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /knock <channel> [message]"))
+            return
+        channel = parts[0]
+        message = parts[1] if len(parts) > 1 else ""
+        c.cmd_knock(channel, message)
+        await self.ui_queue.put(("status", f"Knocked on {channel}"))
+
+    async def _slash_markread(self, args, extra, line):
+        """Mark the current channel as read up to the latest message."""
+        c = self._active_client()
+        target = args.strip() or self.current_channel or ""
+        if not target:
+            await self.ui_queue.put(("status", "Usage: /markread [channel]"))
+            return
+        c.cmd_markread(target)
+        await self.ui_queue.put(("status", f"[markread] marked {target} as read"))
 
     async def _slash_redraw(self, args, extra, line):
         channel = args.strip() or self.current_channel or ""
