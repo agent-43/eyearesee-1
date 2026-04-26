@@ -426,6 +426,18 @@ _CACHE_MISS = object()                        # sentinel: key absent from cache
 _TRANSLATION_SEM: Optional[asyncio.Semaphore] = None   # created lazily in async context
 
 
+def _parse_server_time(ts: str) -> str:
+    """Convert IRCv3 server-time tag value (ISO 8601 UTC) to local [HH:MM] string."""
+    try:
+        from datetime import datetime, timezone
+        s = ts.rstrip("Z")
+        fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in s else "%Y-%m-%dT%H:%M:%S"
+        dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).astimezone(tz=None)
+        return dt.strftime("[%H:%M]")
+    except Exception:
+        return time.strftime("[%H:%M]")
+
+
 async def _translate_to_english(text: str) -> Optional[str]:
     """Translate *text* to English via Google Translate's free public endpoint.
 
@@ -1731,9 +1743,11 @@ class ChatWindow:
         self.scroll_offset: int = 0  # 0 = pinned to bottom
         self._persist = True         # write new lines to disk
 
-    def add_line(self, text: str, timestamp: bool = True) -> None:
+    def add_line(self, text: str, timestamp: bool = True,
+                 ts_str: Optional[str] = None) -> None:
         if timestamp:
-            text = f"{time.strftime('[%H:%M]')} {text}"
+            ts = ts_str if ts_str else time.strftime("[%H:%M]")
+            text = f"{ts} {text}"
         self.lines.append(text)
         self._wrap_dirty = True
         if self._persist:
@@ -1764,6 +1778,15 @@ class IRCClient:
         self.joined_channels: set = {DEFAULT_CHANNEL} if DEFAULT_CHANNEL else set()
         self._ctcp_times: Dict[str, deque] = {}  # rate-limit CTCP replies
         self._cap_ls_caps: set = set()           # accumulated caps across multiline CAP LS
+        self._cap_ls_values: dict = {}           # cap name → advertised value (e.g. sts=...)
+        self._active_caps: set = set()           # currently ACKed/enabled caps
+        self._batch_buffer: dict = {}            # batch ref → [(cmd,nick,params,prefix,tags)]
+        self._batch_types: dict = {}             # batch ref → batch type string
+        self._current_batch_is_replay: bool = False  # True while replaying chathistory batch
+        self._monitor_nicks: set = set()         # nicks on MONITOR list
+        self._chathistory_cap: str = ""          # "chathistory" or "draft/chathistory"
+        self._replay_enabled: bool = False       # must be set True before /replay works
+        self._label_seq: int = 0                 # monotonic label counter (labeled-response)
         # Send queue — all outbound data goes here; _run_writer flushes it with
         # flood-control rate limiting so the server never disconnects us for flooding.
         self._send_queue: asyncio.Queue = asyncio.Queue(maxsize=512)
@@ -2131,6 +2154,14 @@ class IRCClient:
             return
         cmd, nick, params, prefix, tags = parsed
         self._current_msg_tags = tags
+        # If this line carries a batch tag (and we're tracking that batch),
+        # buffer it for later bulk dispatch instead of dispatching immediately.
+        # BATCH itself is never buffered — it controls the batch lifecycle.
+        if cmd != "BATCH":
+            batch_ref = tags.get("batch")
+            if batch_ref and batch_ref in self._batch_buffer:
+                self._batch_buffer[batch_ref].append((cmd, nick, params, prefix, tags))
+                return
         handler = self._irc_handlers.get(cmd)
         if handler:
             await handler(nick, params, prefix)
@@ -2146,33 +2177,72 @@ class IRCClient:
     async def _irc_pong(self, nick, params, prefix):
         self._last_pong = time.monotonic()
 
+    # Capabilities we request whenever the server offers them.
+    _WANT_CAPS = (
+        "away-notify", "multi-prefix", "account-notify", "extended-join",
+        "chghost", "server-time", "echo-message", "userhost-in-names",
+        "message-tags", "batch", "labeled-response", "invite-notify",
+        "account-tag", "standard-replies", "setname",
+        "chathistory", "draft/chathistory",
+    )
+
     async def _irc_cap(self, nick, params, prefix):
         subcmd = params[1].upper() if len(params) > 1 else ""
         if subcmd == "LS":
-            # CAP LS 302 sends caps across multiple lines; "*" in params[2] means more coming.
-            # Cap names may carry values ("sasl=PLAIN,EXTERNAL") — strip after "=".
+            # CAP LS 302 sends caps across multiple lines; "*" means more coming.
+            # Preserve cap values (e.g. sts=port=6697,duration=3600).
             more_coming = len(params) > 2 and params[2] == "*"
-            for raw_cap in (params[-1] if params else "").lower().split():
-                self._cap_ls_caps.add(raw_cap.split("=")[0])
+            for raw_cap in (params[-1] if params else "").split():
+                if "=" in raw_cap:
+                    cname, cval = raw_cap.split("=", 1)
+                else:
+                    cname, cval = raw_cap, ""
+                cname = cname.lower()
+                self._cap_ls_caps.add(cname)
+                if cval:
+                    self._cap_ls_values[cname] = cval
             if not more_coming:
-                _OPTIONAL_CAPS = (
-                    "away-notify", "multi-prefix", "account-notify",
-                    "extended-join", "chghost", "server-time",
-                    "echo-message", "userhost-in-names",
-                )
-                want = [c for c in _OPTIONAL_CAPS if c in self._cap_ls_caps]
+                if "sts" in self._cap_ls_values and not self.use_ssl:
+                    self._handle_sts(self._cap_ls_values["sts"])
+                if "chathistory" in self._cap_ls_caps:
+                    self._chathistory_cap = "chathistory"
+                elif "draft/chathistory" in self._cap_ls_caps:
+                    self._chathistory_cap = "draft/chathistory"
+                want = [c for c in self._WANT_CAPS if c in self._cap_ls_caps]
                 if "sasl" in self._cap_ls_caps and NICKSERV_PASSWORD:
                     want.append("sasl")
                 self.send_raw(f"CAP REQ :{' '.join(want)}" if want else "CAP END")
                 self._cap_ls_caps.clear()
         elif subcmd == "ACK":
             acked = set((params[-1] if params else "").lower().split())
+            self._active_caps |= acked
             if "sasl" in acked:
                 self.send_raw("AUTHENTICATE PLAIN")
             else:
                 self.send_raw("CAP END")
         elif subcmd == "NAK":
             self.send_raw("CAP END")
+        elif subcmd == "NEW":
+            # Dynamic cap announcement — request any we want that we don't have yet.
+            new_avail: dict = {}
+            for raw_cap in (params[-1] if params else "").split():
+                if "=" in raw_cap:
+                    cname, cval = raw_cap.split("=", 1)
+                else:
+                    cname, cval = raw_cap, ""
+                new_avail[cname.lower()] = cval
+                if cval:
+                    self._cap_ls_values[cname.lower()] = cval
+            if "sts" in new_avail and not self.use_ssl:
+                self._handle_sts(new_avail["sts"])
+            want = [c for c in self._WANT_CAPS
+                    if c in new_avail and c not in self._active_caps]
+            if want:
+                self.send_raw(f"CAP REQ :{' '.join(want)}")
+        elif subcmd == "DEL":
+            removed = {c.lower() for c in (params[-1] if params else "").split()}
+            self._active_caps -= removed
+            await self.ui_queue.put(("status", f"[cap] server withdrew: {' '.join(removed)}"))
 
     async def _irc_authenticate(self, nick, params, prefix):
         if params and params[0] == "+":
@@ -2189,6 +2259,45 @@ class IRCClient:
     async def _irc_sasl_fail(self, nick, params, prefix):  # 904
         await self.ui_queue.put(("status", "SASL authentication failed — falling back to NickServ"))
         self.send_raw("CAP END")
+
+    def _handle_sts(self, sts_value: str) -> None:
+        """Parse Strict Transport Security CAP value and warn if TLS upgrade needed."""
+        params: dict = {}
+        for part in sts_value.split(","):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                params[k] = v
+            else:
+                params[part] = ""
+        port     = params.get("port", "6697")
+        duration = params.get("duration", "0")
+        preload  = "preload" in params
+        msg = (f"[STS] Server requires TLS — reconnect with SSL on port {port} "
+               f"(policy duration={duration}s{', preload' if preload else ''}). "
+               f"Use /server {self.server} {port} ssl to upgrade.")
+        try:
+            self.ui_queue.put_nowait(("status", msg))
+        except Exception:
+            pass
+
+    def send_tagged(self, tags: dict, line: str) -> None:
+        """Prepend IRCv3 message tags to *line* when message-tags cap is active."""
+        if tags and "message-tags" in self._active_caps:
+            def _esc(v: str) -> str:
+                return (v.replace("\\", "\\\\").replace(";", "\\:")
+                          .replace(" ", "\\s").replace("\r", "\\r")
+                          .replace("\n", "\\n"))
+            tag_str = ";".join(
+                f"{k}={_esc(str(v))}" if v else k for k, v in tags.items()
+            )
+            self.send_raw(f"@{tag_str} {line}")
+        else:
+            self.send_raw(line)
+
+    def _next_label(self) -> str:
+        """Generate a unique label for labeled-response."""
+        self._label_seq += 1
+        return f"eyrc-{self._label_seq}"
 
     async def _irc_logged_in(self, nick, params, prefix):  # 900
         account = params[2] if len(params) > 2 else "?"
@@ -2276,10 +2385,17 @@ class IRCClient:
             return
         # echo-message CAP causes the server to reflect our own sends back to us.
         # We already display messages locally when sent, so skip the server echo.
-        if nick == self.nick:
+        # (With labeled-response this could be smarter, but dedup-by-nick is safe.)
+        if nick == self.nick and not self._current_batch_is_replay:
             return
         target = params[0]
         msg    = params[1]
+        tags   = self._current_msg_tags
+        # server-time: prefer server-provided timestamp over local clock
+        ts_str = _parse_server_time(tags["time"]) if "time" in tags else None
+        # account-tag: sender's services account (if server advertises it)
+        account = tags.get("account", "")
+        is_replay = self._current_batch_is_replay
 
         # ACTION must be checked before the generic CTCP block — both use \x01
         # wrappers and falling into the CTCP branch silently drops /me lines.
@@ -2326,7 +2442,12 @@ class IRCClient:
         m_score = self.scoring.score_message(None, u_state)
         # Display immediately with a placeholder AI score (0); a background task
         # scores the message and sends an "ai_score" update once ML inference finishes.
-        await self.ui_queue.put(("msg", nick, target, msg, u_score, m_score, 0, 0, is_action))
+        # Extra fields: ts_str (server-time or None), account (account-tag or ""),
+        #               is_replay (True when delivered inside a chathistory batch).
+        await self.ui_queue.put(("msg", nick, target, msg, u_score, m_score, 0, 0,
+                                 is_action, ts_str, account, is_replay))
+        if is_replay:
+            return  # don't score replayed history; it's already been seen
         _t = asyncio.create_task(self._score_msg_bg(nick, target, msg, u_state, u_score, m_score))
         self._bg_tasks.add(_t)
         _t.add_done_callback(self._bg_tasks.discard)
@@ -2350,10 +2471,6 @@ class IRCClient:
             await self.ui_queue.put(("notice", nick, display_target, text))
         else:
             await self.ui_queue.put(("status", f"NOTICE {text}"))
-
-    async def _irc_invite(self, nick, params, prefix):
-        channel = params[1] if len(params) > 1 else (params[0] if params else "")
-        await self.ui_queue.put(("status", f"*** {nick} invites you to join {channel}"))
 
     async def _irc_quit(self, nick, params, prefix):
         self.users.pop(nick, None)
@@ -2435,6 +2552,88 @@ class IRCClient:
         else:
             await self.ui_queue.put(("status", f"* {nick} is identified as {account}"))
 
+    async def _irc_setname(self, nick, params, prefix):
+        realname = params[0] if params else ""
+        await self.ui_queue.put(("status", f"* {nick} changed real name to: {realname}"))
+
+    async def _irc_batch(self, nick, params, prefix):
+        if not params:
+            return
+        ref_dir = params[0]
+        if ref_dir.startswith("+"):
+            ref = ref_dir[1:]
+            self._batch_buffer[ref] = []
+            self._batch_types[ref] = params[1] if len(params) > 1 else ""
+        elif ref_dir.startswith("-"):
+            ref = ref_dir[1:]
+            buffered = self._batch_buffer.pop(ref, [])
+            batch_type = self._batch_types.pop(ref, "")
+            is_replay = batch_type in ("chathistory", "draft/chathistory")
+            prev_replay = self._current_batch_is_replay
+            self._current_batch_is_replay = is_replay
+            try:
+                for bcmd, bnick, bparams, bprefix, btags in buffered:
+                    handler = self._irc_handlers.get(bcmd)
+                    if handler:
+                        self._current_msg_tags = btags
+                        await handler(bnick, bparams, bprefix)
+            finally:
+                self._current_batch_is_replay = prev_replay
+                self._current_msg_tags = {}
+
+    async def _irc_tagmsg(self, nick, params, prefix):
+        # TAGMSG carries only client tags (no visible text).
+        # Deliver any +typing= tag or other client-only tags as a status note.
+        tags = self._current_msg_tags
+        target = params[0] if params else ""
+        typing = tags.get("+typing", "")
+        if typing == "active":
+            await self.ui_queue.put(("status", f"* {nick} is typing in {target}…"))
+        elif typing in ("done", "paused"):
+            pass  # silent — stop indicator
+
+    async def _irc_invite(self, nick, params, prefix):
+        if len(params) < 2:
+            return
+        invitee = params[0]
+        channel = params[1]
+        if invitee.lower() == self.nick.lower():
+            await self.ui_queue.put(("status", f"*** {nick} invites you to join {channel}"))
+        else:
+            # invite-notify: someone else in the channel was invited
+            await self.ui_queue.put(("status", f"*** {nick} invited {invitee} to {channel}"))
+
+    async def _irc_fail(self, nick, params, prefix):
+        await self.ui_queue.put(("status", f"[FAIL] {' '.join(params)}"))
+
+    async def _irc_warn(self, nick, params, prefix):
+        await self.ui_queue.put(("status", f"[WARN] {' '.join(params)}"))
+
+    async def _irc_note(self, nick, params, prefix):
+        await self.ui_queue.put(("status", f"[NOTE] {' '.join(params)}"))
+
+    async def _irc_mononline(self, nick, params, prefix):   # 730 RPL_MONONLINE
+        for entry in (params[-1] if params else "").split(","):
+            if entry:
+                bare = entry.split("!")[0] if "!" in entry else entry
+                await self.ui_queue.put(("status", f"[monitor] {bare} is online"))
+
+    async def _irc_monoffline(self, nick, params, prefix):  # 731 RPL_MONOFFLINE
+        for n in (params[-1] if params else "").split(","):
+            if n:
+                await self.ui_queue.put(("status", f"[monitor] {n} is offline"))
+
+    async def _irc_monlist(self, nick, params, prefix):     # 732 RPL_MONLIST
+        nicks = [n for n in (params[-1] if params else "").split(",") if n]
+        if nicks:
+            await self.ui_queue.put(("status", f"[monitor] watching: {', '.join(nicks)}"))
+
+    async def _irc_monlistfull(self, nick, params, prefix): # 734 ERR_MONLISTFULL
+        await self.ui_queue.put(("status", f"[monitor] list full — {' '.join(params[1:])}"))
+
+    async def _irc_whox_reply(self, nick, params, prefix):  # 354 RPL_WHOSPCRPL
+        await self.ui_queue.put(("status", f"[who] {' '.join(params[1:])}"))
+
     async def _irc_isupport(self, nick, params, prefix):  # 005 RPL_ISUPPORT
         """Parse ISUPPORT tokens and extract useful server capabilities."""
         # params = [yournick, TOKEN, TOKEN=value, ..., "are supported by this server"]
@@ -2504,6 +2703,17 @@ class IRCClient:
         h["AWAY"]         = self._irc_away_notify
         h["CHGHOST"]      = self._irc_chghost
         h["ACCOUNT"]      = self._irc_account
+        h["SETNAME"]      = self._irc_setname
+        h["BATCH"]        = self._irc_batch
+        h["TAGMSG"]       = self._irc_tagmsg
+        h["FAIL"]         = self._irc_fail
+        h["WARN"]         = self._irc_warn
+        h["NOTE"]         = self._irc_note
+        h["730"]          = self._irc_mononline
+        h["731"]          = self._irc_monoffline
+        h["732"]          = self._irc_monlist
+        h["734"]          = self._irc_monlistfull
+        h["354"]          = self._irc_whox_reply
         # WHOIS numerics — bind each with its code via a closure
         for _code in _WHOIS_REPLIES:
             _c = _code
@@ -2583,11 +2793,52 @@ class IRCClient:
     def cmd_who(self, target: str) -> None:
         self.send_raw(f"WHO {target}")
 
+    def cmd_whox(self, target: str, fields: str = "hnuraf", token: str = "100") -> None:
+        """Send WHOX query (extended WHO) when server advertises WHOX in ISUPPORT."""
+        if "WHOX" in self._isupport:
+            f = fields.replace(" ", "")
+            self.send_raw(f"WHO {target} %{f},{token}")
+        else:
+            self.send_raw(f"WHO {target}")
+
     def cmd_whowas(self, nick: str) -> None:
         self.send_raw(f"WHOWAS {nick}")
 
     def cmd_names(self, channel: str = "") -> None:
         self.send_raw(f"NAMES {channel}" if channel else "NAMES")
+
+    def cmd_monitor_add(self, nicks: List[str]) -> None:
+        self._monitor_nicks.update(n.lower() for n in nicks)
+        self.send_raw(f"MONITOR + {','.join(nicks)}")
+
+    def cmd_monitor_remove(self, nicks: List[str]) -> None:
+        for n in nicks:
+            self._monitor_nicks.discard(n.lower())
+        self.send_raw(f"MONITOR - {','.join(nicks)}")
+
+    def cmd_monitor_clear(self) -> None:
+        self._monitor_nicks.clear()
+        self.send_raw("MONITOR C")
+
+    def cmd_monitor_list(self) -> None:
+        self.send_raw("MONITOR L")
+
+    def cmd_monitor_status(self) -> None:
+        self.send_raw("MONITOR S")
+
+    def cmd_chathistory(self, channel: str, count: int = 50) -> None:
+        if self._chathistory_cap:
+            self.send_raw(f"CHATHISTORY LATEST {channel} * {count}")
+        else:
+            try:
+                self.ui_queue.put_nowait(("status",
+                    "Server does not support chat history (chathistory CAP missing)"))
+            except Exception:
+                pass
+
+    def cmd_tagmsg(self, target: str, tags: dict) -> None:
+        """Send a TAGMSG (client-only tags, no visible body text)."""
+        self.send_tagged(tags, f"TAGMSG {target}")
 
     async def _score_msg_bg(self, nick: str, target: str, msg: str,
                             u_state: "UserState", u_score: int, m_score: int) -> None:
@@ -3927,7 +4178,12 @@ class TUI:
     # ── TUI event handlers ────────────────────────────────────────────────────
 
     async def _ev_msg(self, event):
-        _, nick, target, msg, u_score, m_score, a_score, rolling_ai, is_action = event
+        # Unpack with defaults for the optional tail fields added for IRCv3
+        (_, nick, target, msg, u_score, m_score, a_score, rolling_ai,
+         is_action, *_extra) = event
+        ts_str    = _extra[0] if len(_extra) > 0 else None
+        account   = _extra[1] if len(_extra) > 1 else ""
+        is_replay = _extra[2] if len(_extra) > 2 else False
         if nick.lower() in self.ignored_nicks:
             return
         if target.startswith("#"):
@@ -3941,7 +4197,10 @@ class TUI:
             is_chan   = False
         win = self.ensure_window(win_name, is_channel=is_chan)
         prefix_str = f"* {nick} " if is_action else f"<{nick}> "
-        win.add_line(f"{prefix_str}{msg}")
+        # Replay lines get a visual marker; account shown if account-tag active
+        replay_mark = "[↑] " if is_replay else ""
+        acc_mark    = f"[{account}]" if account else ""
+        win.add_line(f"{replay_mark}{prefix_str}{acc_mark}{msg}", ts_str=ts_str)
         our_nick = self._active_client().nick
         if (our_nick and nick.lower() != our_nick.lower()
                 and not self.mention_beep_muted
@@ -4180,6 +4439,10 @@ class TUI:
         h["redraw"]       = self._slash_redraw
         h["userlist"]     = self._slash_userlist
         h["mute"]         = self._slash_mute
+        h["replay"]       = self._slash_replay
+        h["monitor"]      = self._slash_monitor
+        h["whox"]         = self._slash_whox
+        h["tagmsg"]       = self._slash_tagmsg
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -4540,7 +4803,9 @@ class TUI:
 
     async def _slash_who(self, args, extra, line):
         if args:
-            self._active_client().cmd_who(args)
+            c = self._active_client()
+            # Use WHOX when server supports it; falls back to plain WHO automatically
+            c.cmd_whox(args)
 
     async def _slash_whowas(self, args, extra, line):
         if args:
@@ -5110,6 +5375,88 @@ class TUI:
         self._resize_windows()
         state = "shown" if self._show_userlist else "hidden"
         await self.ui_queue.put(("status", f"Userlist {state}"))
+
+    async def _slash_replay(self, args, extra, line):
+        """Request chat history for the current channel via CHATHISTORY."""
+        a = args.strip().lower()
+        c = self._active_client()
+        if a in ("on", "enable"):
+            c._replay_enabled = True
+            await self.ui_queue.put(("status", "[replay] chat history replay enabled"))
+            return
+        if a in ("off", "disable"):
+            c._replay_enabled = False
+            await self.ui_queue.put(("status", "[replay] chat history replay disabled"))
+            return
+        if not c._replay_enabled:
+            await self.ui_queue.put(("status",
+                "[replay] disabled — use /replay on to enable, then /replay [n] to fetch"))
+            return
+        chan = self.current_channel or ""
+        if not chan.startswith("#"):
+            await self.ui_queue.put(("status", "[replay] must be in a channel"))
+            return
+        try:
+            count = int(a) if a.isdigit() else 50
+        except ValueError:
+            count = 50
+        count = max(1, min(count, 500))
+        c.cmd_chathistory(chan, count)
+        await self.ui_queue.put(("status", f"[replay] requesting last {count} messages for {chan}…"))
+
+    async def _slash_monitor(self, args, extra, line):
+        """MONITOR a nick for online/offline notifications."""
+        c = self._active_client()
+        parts = args.strip().split(None, 1)
+        subcmd = parts[0].lower() if parts else ""
+        nicks_raw = parts[1] if len(parts) > 1 else ""
+        nicks = [n.strip() for n in nicks_raw.split(",") if n.strip()]
+        if subcmd in ("+", "add", "watch") and nicks:
+            c.cmd_monitor_add(nicks)
+            await self.ui_queue.put(("status", f"[monitor] watching: {', '.join(nicks)}"))
+        elif subcmd in ("-", "del", "remove") and nicks:
+            c.cmd_monitor_remove(nicks)
+            await self.ui_queue.put(("status", f"[monitor] stopped watching: {', '.join(nicks)}"))
+        elif subcmd in ("c", "clear"):
+            c.cmd_monitor_clear()
+            await self.ui_queue.put(("status", "[monitor] cleared all"))
+        elif subcmd in ("l", "list"):
+            c.cmd_monitor_list()
+        elif subcmd in ("s", "status"):
+            c.cmd_monitor_status()
+        else:
+            await self.ui_queue.put(("status",
+                "Usage: /monitor + nick[,…] | - nick[,…] | list | clear | status"))
+
+    async def _slash_whox(self, args, extra, line):
+        """Send a WHOX query for the current channel or given target."""
+        c = self._active_client()
+        parts = args.strip().split(None, 1)
+        target = parts[0] if parts else (self.current_channel or "")
+        fields = parts[1].replace(" ", "") if len(parts) > 1 else "hnuraf"
+        if not target:
+            await self.ui_queue.put(("status", "Usage: /whox [target] [fields]"))
+            return
+        c.cmd_whox(target, fields)
+
+    async def _slash_tagmsg(self, args, extra, line):
+        """Send a TAGMSG with client-only tags to target."""
+        c = self._active_client()
+        parts = args.strip().split(None, 1)
+        if len(parts) < 2:
+            await self.ui_queue.put(("status",
+                "Usage: /tagmsg <target> key=value[;key2=value2]"))
+            return
+        target, tag_str = parts
+        tags: dict = {}
+        for part in tag_str.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                tags[k.strip()] = v.strip()
+            elif part.strip():
+                tags[part.strip()] = ""
+        c.cmd_tagmsg(target, tags)
+        await self.ui_queue.put(("status", f"[tagmsg] sent to {target}: {tag_str}"))
 
     async def _slash_redraw(self, args, extra, line):
         channel = args.strip() or self.current_channel or ""
