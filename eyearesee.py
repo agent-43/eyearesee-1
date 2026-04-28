@@ -1787,8 +1787,6 @@ class IRCClient:
         self._chathistory_cap: str = ""          # "chathistory" or "draft/chathistory"
         self._replay_enabled: bool = False       # must be set True before /replay works
         self._label_seq: int = 0                 # monotonic label counter (labeled-response)
-        self._cap_req_queue: list = []           # individual caps queued after a CAP NAK
-        self._network_announced: bool = False    # one-shot announce of NETWORK token
         # Send queue — all outbound data goes here; _run_writer flushes it with
         # flood-control rate limiting so the server never disconnects us for flooding.
         self._send_queue: asyncio.Queue = asyncio.Queue(maxsize=512)
@@ -2017,24 +2015,7 @@ class IRCClient:
         attempt = 0
         while self.running:
             self._identified = False
-            # Reset all per-connection state. Anything populated by
-            # the previous session (caps, ISUPPORT, batches,
-            # chathistory cap, ...) would otherwise leak into the
-            # new connection and produce subtle bugs (stale
-            # CASEMAPPING, dropped self-echoes from the old server,
-            # network name never re-announced, ...).
             self._cap_ls_caps.clear()
-            self._cap_ls_values.clear()
-            self._active_caps.clear()
-            self._isupport.clear()
-            self._batch_buffer.clear()
-            self._batch_types.clear()
-            self._cap_req_queue.clear()
-            self._network_announced = False
-            self._current_msg_tags = {}
-            self._chathistory_cap = ""
-            self._current_batch_is_replay = False
-            self._label_seq = 0
             keepalive_task: Optional[asyncio.Task] = None
             writer_task:    Optional[asyncio.Task] = None
             try:
@@ -2138,31 +2119,10 @@ class IRCClient:
                     continue
                 if "=" in t:
                     k, v = t.split("=", 1)
-                    # Unescape IRCv3 tag escape sequences in a single
-                    # left-to-right pass. A chain of .replace() calls
-                    # is order-dependent and can re-decode the bytes
-                    # produced by an earlier replacement (e.g. an input
-                    # containing \\: would be mis-decoded).
-                    # Per IRCv3:
-                    #     \: → ;   \s → space   \\ → \
-                    #     \r → CR  \n → LF
-                    #     unknown \X → X (drop the backslash)
-                    #     trailing lone \ → dropped
-                    _out: list = []
-                    _it = iter(v)
-                    for _c in _it:
-                        if _c == "\\":
-                            _n = next(_it, "")
-                            if   _n == ":":  _out.append(";")
-                            elif _n == "s":  _out.append(" ")
-                            elif _n == "\\": _out.append("\\")
-                            elif _n == "r":  _out.append("\r")
-                            elif _n == "n":  _out.append("\n")
-                            elif _n == "":   pass  # trailing \ — drop
-                            else:             _out.append(_n)
-                        else:
-                            _out.append(_c)
-                    v = "".join(_out)
+                    # Unescape IRCv3 tag escape sequences
+                    v = (v.replace("\\:", ";").replace("\\s", " ")
+                          .replace("\\\\", "\\").replace("\\r", "\r")
+                          .replace("\\n", "\n"))
                     tags[k] = v
                 else:
                     tags[t] = ""
@@ -2249,11 +2209,6 @@ class IRCClient:
                 elif "draft/chathistory" in self._cap_ls_caps:
                     self._chathistory_cap = "draft/chathistory"
                 want = [c for c in self._WANT_CAPS if c in self._cap_ls_caps]
-                # If both std and draft chathistory are advertised, ask
-                # for only the std one — some servers NAK requests that
-                # name both variants.
-                if "chathistory" in want and "draft/chathistory" in want:
-                    want.remove("draft/chathistory")
                 if "sasl" in self._cap_ls_caps and NICKSERV_PASSWORD:
                     want.append("sasl")
                 self.send_raw(f"CAP REQ :{' '.join(want)}" if want else "CAP END")
@@ -2266,16 +2221,7 @@ class IRCClient:
             else:
                 self.send_raw("CAP END")
         elif subcmd == "NAK":
-            # Server rejected a batched REQ. Retry each cap
-            # individually so we still get whichever subset the
-            # server actually supports. Only when the retry queue
-            # drains do we fall through to CAP END (and only if
-            # SASL is not still in flight — its numeric handlers
-            # own CAP END themselves).
-            nak_caps = (params[-1] if params else "").lower().split()
-            if len(nak_caps) > 1:
-                self._cap_req_queue.extend(nak_caps)
-            self._flush_cap_req_queue()
+            self.send_raw("CAP END")
         elif subcmd == "NEW":
             # Dynamic cap announcement — request any we want that we don't have yet.
             new_avail: dict = {}
@@ -2304,12 +2250,6 @@ class IRCClient:
                 f"{self.nick}\0{self.nick}\0{NICKSERV_PASSWORD}".encode()
             ).decode()
             self.send_raw(f"AUTHENTICATE {payload}")
-        else:
-            # Non-'+' prompt (e.g. a challenge for a mechanism we
-            # don't implement). Abort SASL so the server doesn't hang;
-            # CAP END is sent by the SASL numeric handlers (904/etc.)
-            # once the server confirms the abort.
-            self.send_raw("AUTHENTICATE *")
 
     async def _irc_sasl_ok(self, nick, params, prefix):  # 903
         await self.ui_queue.put(("status", "SASL authentication successful — ident set"))
@@ -2318,47 +2258,10 @@ class IRCClient:
 
     async def _irc_sasl_fail(self, nick, params, prefix):  # 904
         await self.ui_queue.put(("status", "SASL authentication failed — falling back to NickServ"))
-        # Abort the SASL session cleanly before ending CAP.
-        self.send_raw("AUTHENTICATE *")
         self.send_raw("CAP END")
 
-    def _irc_lower(self, s: str) -> str:
-        r"""Casefold *s* per the server's CASEMAPPING ISUPPORT token.
-
-        The default is rfc1459, which folds {|}~ to []\^ in addition
-        to ASCII case. This matters for nick/channel equality checks:
-        plain str.lower() would treat 'Foo[' and 'foo{' as different.
-        """
-        mapping = self._isupport.get("CASEMAPPING", "rfc1459")
-        s = s.lower()
-        if mapping == "ascii":
-            return s
-        if mapping == "strict-rfc1459":
-            return s.translate(str.maketrans(r"\[]", r"|{}"))
-        # rfc1459 (default)
-        return s.translate(str.maketrans(r"[\\]^", r"{|}~"))
-
-    def _flush_cap_req_queue(self) -> None:
-        """Pop the next queued single-cap REQ, or send CAP END.
-
-        Used after CAP NAK to retry caps one at a time. SASL is
-        deliberately *not* flushed here: when SASL is in flight
-        the SASL numeric handlers (903/904) own CAP END, and we
-        must not race them.
-        """
-        if self._cap_req_queue:
-            cap = self._cap_req_queue.pop(0)
-            self.send_raw(f"CAP REQ :{cap}")
-        elif "sasl" not in self._active_caps:
-            self.send_raw("CAP END")
-
     def _handle_sts(self, sts_value: str) -> None:
-        """Parse Strict Transport Security CAP value and warn if TLS upgrade needed.
-
-        Per IRCv3 STS:
-          • duration=0 → server is *revoking* its policy. No warning.
-          • port must be a valid TCP port number; ignore garbage.
-        """
+        """Parse Strict Transport Security CAP value and warn if TLS upgrade needed."""
         params: dict = {}
         for part in sts_value.split(","):
             if "=" in part:
@@ -2366,26 +2269,11 @@ class IRCClient:
                 params[k] = v
             else:
                 params[part] = ""
-        # Validate port — fall back to the IRC TLS default if missing/garbage.
-        port_str = params.get("port", "6697")
-        try:
-            port_int = int(port_str)
-            if not (1 <= port_int <= 65535):
-                raise ValueError
-            port = str(port_int)
-        except (TypeError, ValueError):
-            port = "6697"
-        # Validate duration — treat malformed as 0 (revoke).
-        try:
-            duration_int = int(params.get("duration", "0") or "0")
-        except (TypeError, ValueError):
-            duration_int = 0
-        if duration_int <= 0:
-            # Server is revoking its STS policy. Nothing to warn about.
-            return
-        preload = "preload" in params
+        port     = params.get("port", "6697")
+        duration = params.get("duration", "0")
+        preload  = "preload" in params
         msg = (f"[STS] Server requires TLS — reconnect with SSL on port {port} "
-               f"(policy duration={duration_int}s{', preload' if preload else ''}). "
+               f"(policy duration={duration}s{', preload' if preload else ''}). "
                f"Use /server {self.server} {port} ssl to upgrade.")
         try:
             self.ui_queue.put_nowait(("status", msg))
@@ -2498,9 +2386,7 @@ class IRCClient:
         # echo-message CAP causes the server to reflect our own sends back to us.
         # We already display messages locally when sent, so skip the server echo.
         # (With labeled-response this could be smarter, but dedup-by-nick is safe.)
-        # Compare via _irc_lower so case-mapping (rfc1459 default) is honoured.
-        if (self._irc_lower(nick) == self._irc_lower(self.nick)
-                and not self._current_batch_is_replay):
+        if nick == self.nick and not self._current_batch_is_replay:
             return
         target = params[0]
         msg    = params[1]
@@ -2598,14 +2484,9 @@ class IRCClient:
         # When userhost-in-names CAP is active entries look like "@nick!user@host";
         # strip mode-prefix chars and drop the !user@host suffix so the user list
         # only contains bare nicks (matching how JOIN/PART/QUIT events work).
-        # PREFIX advertises mode-prefix chars as e.g. '(qaohv)~&@%+'
-        # — the substring after ')' is the set to strip. Fall back
-        # to the historical defaults when the server doesn't advertise.
-        prefix_isup = self._isupport.get("PREFIX", "(qaohv)~&@%+")
-        prefix_chars = prefix_isup.split(")", 1)[1] if ")" in prefix_isup else "@+%&~!"
         cleaned = []
         for entry in params[3].split():
-            entry = entry.lstrip(prefix_chars)
+            entry = entry.lstrip("@+%&~!")   # strip mode prefix
             if "!" in entry:                  # userhost-in-names
                 entry = entry.split("!", 1)[0]
             if entry:
@@ -2666,18 +2547,6 @@ class IRCClient:
 
     async def _irc_account(self, nick, params, prefix):
         account = params[0] if params else "*"
-        # Persist on the UserState (creating one if we haven't seen
-        # this nick before) so account-tag consumers elsewhere see
-        # a consistent value. setattr keeps us forward-compatible
-        # even if UserState doesn't yet declare `account`.
-        u = self.users.get(nick)
-        if u is None:
-            u = UserState(nick)
-            self.users[nick] = u
-        try:
-            u.account = "" if account == "*" else account
-        except Exception:
-            pass  # __slots__ without `account` — ignore
         if account == "*":
             await self.ui_queue.put(("status", f"* {nick} logged out of services"))
         else:
@@ -2728,7 +2597,7 @@ class IRCClient:
             return
         invitee = params[0]
         channel = params[1]
-        if self._irc_lower(invitee) == self._irc_lower(self.nick):
+        if invitee.lower() == self.nick.lower():
             await self.ui_queue.put(("status", f"*** {nick} invites you to join {channel}"))
         else:
             # invite-notify: someone else in the channel was invited
@@ -2778,11 +2647,9 @@ class IRCClient:
                 self._isupport[k] = v
             else:
                 self._isupport[token] = True
-        # Announce the network name the first time we see it.
-        # The flag lives on the instance, not in _isupport, so it
-        # doesn't shadow real ISUPPORT tokens.
-        if "NETWORK" in self._isupport and not self._network_announced:
-            self._network_announced = True
+        # Announce the network name the first time we see it
+        if "NETWORK" in self._isupport and "_network_announced" not in self._isupport:
+            self._isupport["_network_announced"] = True
             await self.ui_queue.put(("status",
                 f"Network: {self._isupport['NETWORK']}"))
 
@@ -3026,11 +2893,7 @@ class IRCClient:
             )
             raise
         except Exception:
-            # Inference failed for some other reason. Don't pretend
-            # the score was 0 — that would skew the rolling AI
-            # average toward 'human' and mislead the suspect heuristic.
-            # Drop this message from scoring entirely.
-            return
+            pass  # inference failed; log with score 0 so the event is still recorded
         u_state.record_message(msg, a_score)
         rolling_ai = int(u_state.rolling_ai_likelihood())
         log_ai_event(
@@ -3251,17 +3114,10 @@ class TUI:
         # join errors / join success messages land there immediately.
         if DEFAULT_CHANNEL:
             _dcw = ChatWindow(DEFAULT_CHANNEL, is_channel=True, server_id=_psid)
-            _primary_ctx.channel_users[DEFAULT_CHANNEL] = set()
-            # Load persisted chat history before the new-session marker so
-            # previous messages appear above it in chronological order.
-            _hist = load_chat_history(DEFAULT_CHANNEL)
-            for _hl in _hist:
-                _dcw.lines.append(_hl)
-            if _hist:
-                _dcw._wrap_dirty = True
-            _dcw.add_line(f"log channel {DEFAULT_CHANNEL} enabled", timestamp=True)
             self.windows.append(_dcw)
             self.window_by_name[DEFAULT_CHANNEL] = _dcw
+            _primary_ctx.channel_users[DEFAULT_CHANNEL] = set()
+            _dcw.add_line(f"log channel {DEFAULT_CHANNEL} enabled", timestamp=True)
 
         # Alias primary ctx dicts directly onto self so all existing code continues
         # to work without changes.  _sync_ctx() swaps these aliases when a
@@ -3414,13 +3270,6 @@ class TUI:
         wk  = self._wk(sid, name)
         if wk not in self.window_by_name:
             win = ChatWindow(name, is_channel=is_channel, server_id=sid)
-            # Restore persisted chat history before first use so the window
-            # shows previous messages immediately on creation.
-            hist = load_chat_history(name)
-            for hl in hist:
-                win.lines.append(hl)
-            if hist:
-                win._wrap_dirty = True
             self.windows.append(win)
             self.window_by_name[wk] = win
             if is_channel and name not in self.channel_users:
@@ -4075,26 +3924,14 @@ class TUI:
         uw = self._uw
         self.user_win.erase()
         self.user_win.border()
-
-        # Prefer the current window's channel; fall back to current_channel for
-        # non-channel windows (status/dashboard) so the userlist stays populated
-        # while browsing those windows.  DM windows (no leading #) are excluded.
-        cur_win = self.get_current_window()
-        if cur_win.is_channel and cur_win.name in self.channel_users:
-            display_ch = cur_win.name
-        elif self.current_channel and self.current_channel in self.channel_users:
-            display_ch = self.current_channel
-        else:
-            display_ch = None
-
-        header = f" Users ({display_ch or 'None'}) "
+        header = f" Users ({self.current_channel or 'None'}) "
         try:
             self.user_win.addstr(0, 1, header[:uw], self._attr_userheader)
         except curses.error:
             pass
 
-        if display_ch:
-            ch = display_ch
+        if self.current_channel and self.current_channel in self.channel_users:
+            ch = self.current_channel
             if ch not in self._sorted_users:
                 self._sorted_users[ch] = sorted(self.channel_users[ch])
             users = self._sorted_users[ch]
@@ -4388,7 +4225,7 @@ class TUI:
             self._dashboard_dirty = True
         else:
             self._suspect_nicks.discard(nick)
-        if win_name in self.channel_users and nick not in self.channel_users[win_name]:
+        if win_name in self.channel_users:
             self.channel_users[win_name].add(nick)
             self._sorted_users.pop(win_name, None)
             self._userlist_dirty = True
