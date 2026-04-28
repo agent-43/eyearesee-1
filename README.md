@@ -1,6 +1,6 @@
 # eyearesee — Terminal IRC Client with AI Detection
 
-**eyearesee.py** is a single-file, ~5,720-line Python 3 IRC (Internet Relay Chat) client that runs in the terminal as a curses-based TUI. The name is a phonetic spelling of "I-R-C."
+**eyearesee.py** is a single-file, ~6,205-line Python 3 IRC (Internet Relay Chat) client that runs in the terminal as a curses-based TUI. The name is a phonetic spelling of "I-R-C."
 
 Beyond being a fully featured IRC client, it has an unusual headline feature: it scores every message it sees with an ensemble of AI/LLM-detection models, flagging users whose chat looks machine-generated.
 
