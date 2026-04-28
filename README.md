@@ -11,6 +11,9 @@ python eyearesee.py
 Note: python eyearesee.py --no-ai --no-install will run without installing dependencies or using offline AI.
 For further usage help type: /commands
 Thank you Amigojapan for feature list suggestions! Check his page out! https://github.com/amigojapan
+( If on windows you have the option of installing a llm for AI, to do so just: winget install llama.cpp
+and run the command: llama-server -hf ggml-org/gemma-4-E2B-it-GGUF --jinja -c 0 --host 127.0.0.1 --port 8033
+and if you like use the /model command in the irc client to use it )
 What it is, at a glance
 
 Type: Asynchronous (asyncio) terminal IRC client with a curses-based text UI
