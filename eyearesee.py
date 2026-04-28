@@ -12,6 +12,8 @@ import sys
 import unicodedata
 import urllib.parse
 import urllib.request
+import hashlib
+import hmac
 import heapq
 import io
 import json
@@ -25,6 +27,12 @@ from collections import deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 from math import log2
 from typing import Optional, Dict, List, Tuple, Callable
+
+# =========================
+# CLI flags — parsed before any optional imports or install code runs
+# =========================
+_NO_AI:      bool = "--no-ai"      in sys.argv
+_NO_INSTALL: bool = "--no-install" in sys.argv
 
 # =========================
 # Anthropic (optional)
@@ -45,6 +53,20 @@ try:
 except ImportError:
     _openai_mod = None  # type: ignore
     OPENAI_AVAILABLE = False
+
+# =========================
+# cryptography (optional — needed for SASL ECDSA-NIST256P-CHALLENGE)
+# =========================
+try:
+    from cryptography.hazmat.primitives.asymmetric import ec as _ecdsa_ec
+    from cryptography.hazmat.primitives import hashes as _ecdsa_hashes
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key as _load_pem_private_key
+    CRYPTOGRAPHY_AVAILABLE = True
+except ImportError:
+    _ecdsa_ec = None            # type: ignore
+    _ecdsa_hashes = None        # type: ignore
+    _load_pem_private_key = None  # type: ignore
+    CRYPTOGRAPHY_AVAILABLE = False
 
 # =========================
 # Curses (Windows-aware)
@@ -76,7 +98,7 @@ except ModuleNotFoundError:
     try:
         import windows_curses  # type: ignore
     except ImportError:
-        if "--no-install" in sys.argv:
+        if _NO_INSTALL:
             sys.exit("windows-curses not found and --no-install is set. "
                      "Run without --no-install or: pip install windows-curses")
         print("windows-curses not found — installing...")
@@ -91,12 +113,19 @@ DEFAULT_PORT = 6697
 DEFAULT_NICK = "cfuser"
 DEFAULT_CHANNEL = "##anime"
 NICKSERV_PASSWORD = os.environ.get("IRC_NICKSERV_PASSWORD", "")
+# SASL mechanism and credential paths.  Supported mechanisms:
+#   PLAIN                    — password in IRC_NICKSERV_PASSWORD (default)
+#   EXTERNAL                 — TLS client certificate (IRC_SASL_CERT + IRC_SASL_KEY)
+#   SCRAM-SHA-256            — RFC-5802 SCRAM (password in IRC_NICKSERV_PASSWORD)
+#   ECDSA-NIST256P-CHALLENGE — EC challenge-response (IRC_SASL_KEY; needs 'cryptography' pkg)
+SASL_MECHANISM = os.environ.get("IRC_SASL_MECHANISM", "PLAIN").upper()
+SASL_CERT      = os.environ.get("IRC_SASL_CERT", "")   # path to PEM client certificate
+SASL_KEY       = os.environ.get("IRC_SASL_KEY", "")    # path to PEM private key
 
 MAX_MESSAGES = 500
 USER_HISTORY_WINDOW = 200
 AI_SUSPECT_THRESHOLD = 70
-# Disable all AI detection (--no-ai flag).  Models are never loaded when True.
-_NO_AI: bool = "--no-ai" in sys.argv
+# _NO_AI / _NO_INSTALL are defined early (before imports) — see top of file.
 # AI detection logging: enabled by default.  Set IRC_AI_LOG=0 to disable at startup.
 # Can also be toggled at runtime with /logtoggle.
 _ai_logging_enabled: bool = os.environ.get("IRC_AI_LOG", "1") not in ("0", "false", "no", "off")
@@ -910,12 +939,13 @@ def load_historical_suspects(threshold: int) -> list:
 # AI Detector
 # =========================
 AI_AVAILABLE = False
-try:
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification, GPT2LMHeadModel, GPT2TokenizerFast
-    import torch
-    AI_AVAILABLE = True
-except Exception:
-    AI_AVAILABLE = False
+if not _NO_AI:
+    try:
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification, GPT2LMHeadModel, GPT2TokenizerFast
+        import torch
+        AI_AVAILABLE = True
+    except Exception:
+        AI_AVAILABLE = False
 
 IRC_CASUAL_WORDS = frozenset({
     "lol", "lmao", "lmfao", "rofl", "haha", "hehe", "xd", "xdd",
@@ -1756,6 +1786,8 @@ class ChatWindow:
 # Reuse one SSL context across all connections (parsing the CA bundle is expensive).
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.minimum_version = ssl.TLSVersion.TLSv1_2
+if SASL_MECHANISM == "EXTERNAL" and SASL_CERT and SASL_KEY:
+    _SSL_CTX.load_cert_chain(SASL_CERT, SASL_KEY)
 
 # =========================
 # IRCClient - FULL + CTCP
@@ -1788,6 +1820,8 @@ class IRCClient:
         self._replay_enabled: bool = False       # must be set True before /replay works
         self._label_seq: int = 0                 # monotonic label counter (labeled-response)
         self._cap_req_queue: list = []           # individual caps queued after a CAP NAK
+        self._sasl_state: dict = {}              # per-mechanism state across AUTHENTICATE exchanges
+        self._auth_buffer: str = ""              # accumulates chunked AUTHENTICATE data (>400 chars)
         self._network_announced: bool = False    # one-shot announce of NETWORK token
         # Send queue — all outbound data goes here; _run_writer flushes it with
         # flood-control rate limiting so the server never disconnects us for flooding.
@@ -2030,6 +2064,8 @@ class IRCClient:
             self._batch_buffer.clear()
             self._batch_types.clear()
             self._cap_req_queue.clear()
+            self._sasl_state.clear()
+            self._auth_buffer = ""
             self._network_announced = False
             self._current_msg_tags = {}
             self._chathistory_cap = ""
@@ -2257,7 +2293,14 @@ class IRCClient:
                 # name both variants.
                 if "chathistory" in want and "draft/chathistory" in want:
                     want.remove("draft/chathistory")
-                if "sasl" in self._cap_ls_caps and NICKSERV_PASSWORD:
+                _sasl_creds_ok = (
+                    SASL_MECHANISM == "EXTERNAL"
+                        and bool(SASL_CERT and SASL_KEY)
+                    or SASL_MECHANISM == "ECDSA-NIST256P-CHALLENGE"
+                        and bool(SASL_KEY)
+                    or bool(NICKSERV_PASSWORD)
+                )
+                if "sasl" in self._cap_ls_caps and _sasl_creds_ok:
                     want.append("sasl")
                 self.send_raw(f"CAP REQ :{' '.join(want)}" if want else "CAP END")
                 self._cap_ls_caps.clear()
@@ -2265,7 +2308,7 @@ class IRCClient:
             acked = set((params[-1] if params else "").lower().split())
             self._active_caps |= acked
             if "sasl" in acked:
-                self.send_raw("AUTHENTICATE PLAIN")
+                self.send_raw(f"AUTHENTICATE {SASL_MECHANISM}")
             else:
                 self.send_raw("CAP END")
         elif subcmd == "NAK":
@@ -2301,17 +2344,174 @@ class IRCClient:
             self._active_caps -= removed
             await self.ui_queue.put(("status", f"[cap] server withdrew: {' '.join(removed)}"))
 
+    # ------------------------------------------------------------------
+    # SASL helpers
+    # ------------------------------------------------------------------
+
+    def _send_authenticate(self, payload: str) -> None:
+        """Send AUTHENTICATE with 400-char chunking per IRCv3 SASL spec."""
+        if not payload:
+            self.send_raw("AUTHENTICATE +")
+            return
+        for i in range(0, len(payload), 400):
+            self.send_raw(f"AUTHENTICATE {payload[i:i+400]}")
+        if len(payload) % 400 == 0:
+            # Exact multiple — trailing empty chunk signals end of message.
+            self.send_raw("AUTHENTICATE +")
+
+    async def _sasl_plain(self, _challenge: str) -> None:
+        payload = base64.b64encode(
+            f"{self.nick}\0{self.nick}\0{NICKSERV_PASSWORD}".encode("utf-8")
+        ).decode()
+        self._send_authenticate(payload)
+
+    async def _sasl_external(self, _challenge: str) -> None:
+        # Empty authzid — server derives identity from TLS client-cert CN/SAN.
+        self._send_authenticate("")
+
+    async def _sasl_scram_sha256(self, server_data: str) -> None:
+        """SCRAM-SHA-256 (RFC 5802) state machine."""
+        step = self._sasl_state.get("step", 0)
+
+        if step == 0:
+            # Server sent "+" — begin exchange with client-first-message.
+            cnonce = base64.b64encode(os.urandom(18)).decode()
+            # Escape '=' → '=3D' and ',' → '=2C' in username per spec.
+            safe_nick = self.nick.replace("=", "=3D").replace(",", "=2C")
+            cfm_bare = f"n={safe_nick},r={cnonce}"
+            cfm = f"n,,{cfm_bare}"
+            self._sasl_state = {"step": 1, "cnonce": cnonce, "cfm_bare": cfm_bare}
+            self._send_authenticate(base64.b64encode(cfm.encode("utf-8")).decode())
+
+        elif step == 1:
+            # Server sent server-first-message: r=…,s=…,i=…
+            if not server_data:
+                await self.ui_queue.put(("status", "[SASL] SCRAM: empty server-first — aborting"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+            sfm = base64.b64decode(server_data).decode("utf-8")
+            sfm_parts: dict = {}
+            for part in sfm.split(","):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    sfm_parts[k] = v
+
+            r = sfm_parts.get("r", "")
+            s = sfm_parts.get("s", "")
+            i_str = sfm_parts.get("i", "4096")
+            cnonce = self._sasl_state["cnonce"]
+
+            if not r.startswith(cnonce):
+                await self.ui_queue.put(("status", "[SASL] SCRAM: server nonce mismatch — aborting"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+
+            salt = base64.b64decode(s)
+            iterations = int(i_str)
+            pw = NICKSERV_PASSWORD.encode("utf-8")
+
+            salted_pw   = hashlib.pbkdf2_hmac("sha256", pw, salt, iterations)
+            client_key  = hmac.new(salted_pw, b"Client Key", hashlib.sha256).digest()
+            stored_key  = hashlib.sha256(client_key).digest()
+            server_key  = hmac.new(salted_pw, b"Server Key", hashlib.sha256).digest()
+
+            # GS2 header for no channel binding: "n,," → base64 = "biws"
+            cb = base64.b64encode(b"n,,").decode()
+            cfw_noproof = f"c={cb},r={r}"
+            auth_message = f"{self._sasl_state['cfm_bare']},{sfm},{cfw_noproof}"
+
+            client_sig   = hmac.new(stored_key, auth_message.encode("utf-8"), hashlib.sha256).digest()
+            client_proof = bytes(a ^ b for a, b in zip(client_key, client_sig))
+            server_sig   = hmac.new(server_key, auth_message.encode("utf-8"), hashlib.sha256).digest()
+
+            cfm_final = f"{cfw_noproof},p={base64.b64encode(client_proof).decode()}"
+            self._sasl_state = {
+                "step": 2,
+                "expected_server_sig": base64.b64encode(server_sig).decode(),
+            }
+            self._send_authenticate(base64.b64encode(cfm_final.encode("utf-8")).decode())
+
+        elif step == 2:
+            # Server-final-message (optional — server may go straight to 903).
+            if server_data:
+                try:
+                    sfinal = base64.b64decode(server_data).decode("utf-8")
+                    for part in sfinal.split(","):
+                        if part.startswith("v="):
+                            expected = self._sasl_state.get("expected_server_sig", "")
+                            if part[2:] != expected:
+                                await self.ui_queue.put(
+                                    ("status", "[SASL] SCRAM: server signature mismatch (MITM?)"))
+                            break
+                except Exception:
+                    pass
+            self._sasl_state = {}
+
+    async def _sasl_ecdsa(self, server_data: str) -> None:
+        """ECDSA-NIST256P-CHALLENGE state machine."""
+        step = self._sasl_state.get("step", 0)
+
+        if step == 0:
+            # Server sent "+" — send account name (nick).
+            self._sasl_state = {"step": 1}
+            self._send_authenticate(base64.b64encode(self.nick.encode("utf-8")).decode())
+
+        elif step == 1:
+            # Server sent the challenge to sign.
+            if not server_data:
+                await self.ui_queue.put(("status", "[SASL] ECDSA: empty challenge — aborting"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+            if not CRYPTOGRAPHY_AVAILABLE:
+                await self.ui_queue.put((
+                    "status",
+                    "[SASL] ECDSA requires the 'cryptography' package — pip install cryptography",
+                ))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+            if not SASL_KEY:
+                await self.ui_queue.put(("status", "[SASL] ECDSA: IRC_SASL_KEY not set — aborting"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+            try:
+                challenge_bytes = base64.b64decode(server_data)
+                with open(SASL_KEY, "rb") as _kf:
+                    private_key = _load_pem_private_key(_kf.read(), password=None)
+                # sign() hashes with SHA-256 internally before signing.
+                sig = private_key.sign(challenge_bytes, _ecdsa_ec.ECDSA(_ecdsa_hashes.SHA256()))
+                self._send_authenticate(base64.b64encode(sig).decode())
+                self._sasl_state = {}
+            except Exception as exc:
+                await self.ui_queue.put(("status", f"[SASL] ECDSA signing failed: {exc}"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+
     async def _irc_authenticate(self, nick, params, prefix):
-        if params and params[0] == "+":
-            payload = base64.b64encode(
-                f"{self.nick}\0{self.nick}\0{NICKSERV_PASSWORD}".encode()
-            ).decode()
-            self.send_raw(f"AUTHENTICATE {payload}")
+        chunk = params[0] if params else "+"
+        # IRCv3 SASL: each chunk is ≤ 400 chars of base64; accumulate until
+        # we get a short chunk (or "+").  "+" alone means empty payload.
+        if len(chunk) == 400:
+            self._auth_buffer += chunk
+            return
+        server_data = self._auth_buffer + ("" if chunk == "+" else chunk)
+        self._auth_buffer = ""
+
+        mech = SASL_MECHANISM
+        if mech == "PLAIN":
+            await self._sasl_plain(server_data)
+        elif mech == "EXTERNAL":
+            await self._sasl_external(server_data)
+        elif mech == "SCRAM-SHA-256":
+            await self._sasl_scram_sha256(server_data)
+        elif mech == "ECDSA-NIST256P-CHALLENGE":
+            await self._sasl_ecdsa(server_data)
         else:
-            # Non-'+' prompt (e.g. a challenge for a mechanism we
-            # don't implement). Abort SASL so the server doesn't hang;
-            # CAP END is sent by the SASL numeric handlers (904/etc.)
-            # once the server confirms the abort.
+            await self.ui_queue.put(("status", f"[SASL] Unknown mechanism '{mech}' — aborting"))
             self.send_raw("AUTHENTICATE *")
 
     async def _irc_sasl_ok(self, nick, params, prefix):  # 903
@@ -4723,6 +4923,8 @@ class TUI:
             self._active_client().cmd_service("ChanServ", args)
 
     async def _slash_ai(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[ai] disabled by --no-ai")); return
         if args:
             await self.show_user_ai_profile(args)
         else:
@@ -4735,6 +4937,8 @@ class TUI:
 
     async def _slash_bot(self, args, extra, line):
         """Mark a nick as a confirmed bot/AI and build a fingerprint from history."""
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[bot] disabled by --no-ai")); return
         nick = args.strip()
         if not nick:
             await self.ui_queue.put(("status", "Usage: /bot <nick>  —  mark as confirmed bot/AI"))
@@ -4772,6 +4976,8 @@ class TUI:
 
     async def _slash_unbot(self, args, extra, line):
         """Remove confirmed-bot status from a nick."""
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[unbot] disabled by --no-ai")); return
         nick = args.strip()
         if not nick:
             await self.ui_queue.put(("status", "Usage: /unbot <nick>"))
@@ -4788,6 +4994,8 @@ class TUI:
         await self.ui_queue.put(("status", f"[bot] {nick} removed from confirmed-bot list"))
 
     async def _slash_topai(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[topai] disabled by --no-ai")); return
         cur_win = self.get_current_window()
         channel = cur_win.name if cur_win.name.startswith("#") else self.current_channel or ""
         if not channel or channel not in self.channel_users:
@@ -4861,6 +5069,8 @@ class TUI:
         self.dirty                     = True
 
     async def _slash_aitoggle(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[aitoggle] disabled by --no-ai")); return
         detector = self._active_client().scoring.ai_detector
         detector.enabled = not detector.enabled
         det_state = "ENABLED" if detector.enabled else "DISABLED"
@@ -4868,6 +5078,8 @@ class TUI:
         await self.ui_queue.put(("status", f"AI detection {det_state}  ({log_state})"))
 
     async def _slash_logtoggle(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[logtoggle] disabled by --no-ai")); return
         global _ai_logging_enabled
         # Write a final "disabled" record before we stop writing, or a "enabled" record
         # immediately after we start — so the log gap is bounded and auditable.
@@ -5154,6 +5366,8 @@ class TUI:
                 f"Usage: /theme <1-{len(THEMES)}>  {names}  (current: {self.current_theme})"))
 
     async def _slash_askai(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[askai] disabled by --no-ai")); return
         rest = line[len("/askai"):].strip()
         if not rest:
             keys = " | ".join(AI_MODELS)
@@ -5184,6 +5398,8 @@ class TUI:
           n      – number of most-recent messages to include (default 50, max 200)
           model  – any key from /model  (e.g. sonnet, gpt4o)
         """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[summarize] disabled by --no-ai")); return
         if self._askai_pending:
             await self.ui_queue.put(("status", "/summarize already in progress, please wait…"))
             return
@@ -6123,15 +6339,22 @@ def _ensure_deps() -> bool:
     """Check for every required and optional package.
     Any that are absent are installed via pip automatically.
     Returns True if at least one package was installed (the process must
-    restart so that the freshly installed modules can be imported)."""
+    restart so that the freshly installed modules can be imported).
+    Skipped entirely when --no-install is set."""
+
+    if _NO_INSTALL:
+        return False
 
     # (import_name, pip_package_name, description_for_display)
     wanted: List[Tuple[str, str, str]] = [
         ("anthropic",    "anthropic",      "Claude API client  (/askai, /summarize)"),
         ("openai",       "openai",         "OpenAI API client  (/askai, /summarize with GPT models)"),
-        ("transformers", "transformers",   "AI text detection  (HuggingFace)"),
-        ("torch",        "torch",          "AI text detection  (PyTorch)"),
     ]
+    if not _NO_AI:
+        wanted += [
+            ("transformers", "transformers",   "AI text detection  (HuggingFace)"),
+            ("torch",        "torch",          "AI text detection  (PyTorch)"),
+        ]
     missing = [
         (imp, pkg, desc) for imp, pkg, desc in wanted
         if importlib.util.find_spec(imp) is None
