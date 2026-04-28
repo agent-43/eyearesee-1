@@ -3251,10 +3251,17 @@ class TUI:
         # join errors / join success messages land there immediately.
         if DEFAULT_CHANNEL:
             _dcw = ChatWindow(DEFAULT_CHANNEL, is_channel=True, server_id=_psid)
+            _primary_ctx.channel_users[DEFAULT_CHANNEL] = set()
+            # Load persisted chat history before the new-session marker so
+            # previous messages appear above it in chronological order.
+            _hist = load_chat_history(DEFAULT_CHANNEL)
+            for _hl in _hist:
+                _dcw.lines.append(_hl)
+            if _hist:
+                _dcw._wrap_dirty = True
+            _dcw.add_line(f"log channel {DEFAULT_CHANNEL} enabled", timestamp=True)
             self.windows.append(_dcw)
             self.window_by_name[DEFAULT_CHANNEL] = _dcw
-            _primary_ctx.channel_users[DEFAULT_CHANNEL] = set()
-            _dcw.add_line(f"log channel {DEFAULT_CHANNEL} enabled", timestamp=True)
 
         # Alias primary ctx dicts directly onto self so all existing code continues
         # to work without changes.  _sync_ctx() swaps these aliases when a
@@ -3407,6 +3414,13 @@ class TUI:
         wk  = self._wk(sid, name)
         if wk not in self.window_by_name:
             win = ChatWindow(name, is_channel=is_channel, server_id=sid)
+            # Restore persisted chat history before first use so the window
+            # shows previous messages immediately on creation.
+            hist = load_chat_history(name)
+            for hl in hist:
+                win.lines.append(hl)
+            if hist:
+                win._wrap_dirty = True
             self.windows.append(win)
             self.window_by_name[wk] = win
             if is_channel and name not in self.channel_users:
@@ -4061,14 +4075,26 @@ class TUI:
         uw = self._uw
         self.user_win.erase()
         self.user_win.border()
-        header = f" Users ({self.current_channel or 'None'}) "
+
+        # Prefer the current window's channel; fall back to current_channel for
+        # non-channel windows (status/dashboard) so the userlist stays populated
+        # while browsing those windows.  DM windows (no leading #) are excluded.
+        cur_win = self.get_current_window()
+        if cur_win.is_channel and cur_win.name in self.channel_users:
+            display_ch = cur_win.name
+        elif self.current_channel and self.current_channel in self.channel_users:
+            display_ch = self.current_channel
+        else:
+            display_ch = None
+
+        header = f" Users ({display_ch or 'None'}) "
         try:
             self.user_win.addstr(0, 1, header[:uw], self._attr_userheader)
         except curses.error:
             pass
 
-        if self.current_channel and self.current_channel in self.channel_users:
-            ch = self.current_channel
+        if display_ch:
+            ch = display_ch
             if ch not in self._sorted_users:
                 self._sorted_users[ch] = sorted(self.channel_users[ch])
             users = self._sorted_users[ch]
@@ -4362,7 +4388,7 @@ class TUI:
             self._dashboard_dirty = True
         else:
             self._suspect_nicks.discard(nick)
-        if win_name in self.channel_users:
+        if win_name in self.channel_users and nick not in self.channel_users[win_name]:
             self.channel_users[win_name].add(nick)
             self._sorted_users.pop(win_name, None)
             self._userlist_dirty = True
