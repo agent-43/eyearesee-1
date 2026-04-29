@@ -10,7 +10,7 @@ Beyond being a fully featured IRC client, it features a unique headline feature:
 
 To run the core client without installing dependencies or enabling AI detection:
 
-```bash
+
 python eyearesee.py --no-ai --no-install
 
 Installation & Setup Notes
