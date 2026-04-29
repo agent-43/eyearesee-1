@@ -142,6 +142,7 @@ CHAT_LOG_LOAD      = 500
 # AI provider keys
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
+DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY", "")
 # Ollama: local/offline LLM server.  Override with OLLAMA_URL env var if running elsewhere.
 OLLAMA_URL: str    = os.environ.get("OLLAMA_URL",    "http://127.0.0.1:11434")
 # llama.cpp: local server with OpenAI-compatible API.  Override with LLAMACPP_URL env var.
@@ -161,6 +162,9 @@ AI_MODELS: Dict[str, Dict[str, str]] = {
     "gpt4o":   {"provider": "openai",   "id": "gpt-4o",                     "label": "GPT-4o"},
     "gpt4":    {"provider": "openai",   "id": "gpt-4-turbo",                "label": "GPT-4 Turbo"},
     "gpt35":   {"provider": "openai",   "id": "gpt-3.5-turbo",              "label": "GPT-3.5 Turbo"},
+    # ── Cloud: DeepSeek ──────────────────────────────────────────────────
+    "deepseek": {"provider": "deepseek", "id": "deepseek-chat",     "label": "DeepSeek-V3"},
+    "dsr1":     {"provider": "deepseek", "id": "deepseek-reasoner", "label": "DeepSeek-R1"},
     # ── Local/offline: Ollama ─────────────────────────────────────────────
     "gemma":   {"provider": "ollama",   "id": "gemma3:4b",   "label": "Gemma 3 4B   (Ollama/offline)"},
     "llama3":  {"provider": "ollama",   "id": "llama3.2",    "label": "Llama 3.2    (Ollama/offline)"},
@@ -3521,6 +3525,7 @@ class TUI:
         self._askai_pending: bool = False                # prevent concurrent calls
         self._anthropic_client = None                    # reuse HTTP connection pool
         self._openai_client    = None
+        self._deepseek_client  = None
 
         # Pre-compute curses attributes (avoids repeated function calls every frame)
         try:
@@ -4057,6 +4062,31 @@ class TUI:
                 return answer, tokens
             except Exception as exc:
                 self._openai_client = None      # discard on error; recreate next call
+                return f"[error] {exc}", "?"
+
+        if provider == "deepseek":
+            if not OPENAI_AVAILABLE:
+                return ("[error] openai package not installed — "
+                        "run: pip install openai"), "?"
+            if not DEEPSEEK_API_KEY:
+                return ("[error] DEEPSEEK_API_KEY not set — "
+                        "set the environment variable and restart"), "?"
+            try:
+                if self._deepseek_client is None:
+                    self._deepseek_client = _openai_mod.AsyncOpenAI(
+                        api_key=DEEPSEEK_API_KEY,
+                        base_url="https://api.deepseek.com")
+                resp = await self._deepseek_client.chat.completions.create(
+                    model=model_id, max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                answer = (resp.choices[0].message.content
+                          if resp.choices else "(empty response)")
+                usage  = getattr(resp, "usage", None)
+                tokens = str(usage.total_tokens) if usage else "?"
+                return answer, tokens
+            except Exception as exc:
+                self._deepseek_client = None
                 return f"[error] {exc}", "?"
 
         if provider == "ollama":
@@ -5582,6 +5612,8 @@ class TUI:
                     avail = "  (ANTHROPIC_API_KEY not set)"
                 elif spec["provider"] == "openai" and not OPENAI_API_KEY:
                     avail = "  (OPENAI_API_KEY not set)"
+                elif spec["provider"] == "deepseek" and not DEEPSEEK_API_KEY:
+                    avail = "  (DEEPSEEK_API_KEY not set)"
                 sw.add_line(f"  {chat_mark}{det_mark} {k:<8} {spec['label']:<22} [{spec['provider']}]{avail}")
             sw.add_line("  > = chat model   D = also used for AI detection")
             sw.add_line(f"  Usage: /model <key>   current: {self.ai_chat_model}")
@@ -5601,8 +5633,8 @@ class TUI:
                 f"Unknown model '{key}'. Available: {keys}  (current: {self.ai_chat_model})"))
 
     async def _slash_api(self, args, extra, line):
-        global ANTHROPIC_API_KEY, OPENAI_API_KEY, OLLAMA_URL, LLAMACPP_URL
-        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OLLAMA_URL", "LLAMACPP_URL"}
+        global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, OLLAMA_URL, LLAMACPP_URL
+        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "OLLAMA_URL", "LLAMACPP_URL"}
 
         if not args:
             sw = self._status_win()
@@ -5619,6 +5651,7 @@ class TUI:
             rows = [
                 ("Claude",    "ANTHROPIC_API_KEY", ANTHROPIC_API_KEY, "console.anthropic.com"),
                 ("OpenAI",    "OPENAI_API_KEY",    OPENAI_API_KEY,    "platform.openai.com"),
+                ("DeepSeek",  "DEEPSEEK_API_KEY",  DEEPSEEK_API_KEY,  "platform.deepseek.com"),
                 ("Ollama",    "OLLAMA_URL",         OLLAMA_URL,        "local server — no key needed"),
                 ("llama.cpp", "LLAMACPP_URL",       LLAMACPP_URL,      "local server — no key needed"),
             ]
@@ -5649,6 +5682,9 @@ class TUI:
                 OPENAI_API_KEY = value
                 if _openai_mod is not None:
                     _openai_mod.api_key = value
+            elif var_name == "DEEPSEEK_API_KEY":
+                DEEPSEEK_API_KEY = value
+                self._deepseek_client = None   # force reconnect with new key
             elif var_name == "OLLAMA_URL":
                 OLLAMA_URL = value
             elif var_name == "LLAMACPP_URL":
@@ -5659,7 +5695,7 @@ class TUI:
             return
 
         await self.ui_queue.put(("status",
-            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  OLLAMA_URL  LLAMACPP_URL"))
+            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  DEEPSEEK_API_KEY  OLLAMA_URL  LLAMACPP_URL"))
 
     async def _slash_mute(self, args, extra, line):
         self.mention_beep_muted = not self.mention_beep_muted
