@@ -135,6 +135,7 @@ _ai_logging_enabled: bool = os.environ.get("IRC_AI_LOG", "1") not in ("0", "fals
 _SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
 AI_LOG_PATH        = os.path.join(_SCRIPT_DIR, "ai_scores.log")
 INPUT_HISTORY_PATH = os.path.join(_SCRIPT_DIR, "irc_input_history.txt")
+IRC_CONFIG_PATH    = os.path.join(_SCRIPT_DIR, "irc_config.json")
 INPUT_HISTORY_MAX  = 500
 CHAT_LOG_DIR       = os.path.join(_SCRIPT_DIR, "chat_logs")
 CHAT_LOG_LOAD      = 500
@@ -214,6 +215,26 @@ def _chat_log_path(window_name: str) -> str:
     # Collapse dot-sequences to prevent directory traversal (e.g. ".." → "_")
     safe = re.sub(r'\.{2,}', '_', safe) or "_"
     return os.path.join(CHAT_LOG_DIR, safe + ".log")
+
+def load_irc_config() -> dict:
+    """Return saved server/nick/channel config, or {} if none exists."""
+    try:
+        with open(IRC_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+def save_irc_config(server: str, port: int, nick: str, channel: str) -> None:
+    """Persist server/nick/channel (never the password) for next launch."""
+    try:
+        with open(IRC_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"server": server, "port": port,
+                       "nick": nick, "channel": channel}, f, indent=2)
+    except OSError:
+        pass
 
 def load_input_history() -> List[str]:
     """Return up to INPUT_HISTORY_MAX lines, most-recent first."""
@@ -6549,6 +6570,17 @@ def main():
     print("╚══════════════════════════════════════╝")
     print("  Press Enter to accept the [default].\n")
 
+    # Pre-populate defaults from last session (server/nick/channel only).
+    _saved = load_irc_config()
+    if _saved.get("server"):
+        DEFAULT_SERVER = _saved["server"]
+    if _saved.get("port"):
+        DEFAULT_PORT = int(_saved["port"])
+    if _saved.get("nick"):
+        DEFAULT_NICK = _saved["nick"]
+    if _saved.get("channel"):
+        DEFAULT_CHANNEL = _saved["channel"]
+
     # Server — accepts host  or  host:port
     raw = input(f"  Server   [{DEFAULT_SERVER}] : ").strip()
     if raw:
@@ -6577,10 +6609,13 @@ def main():
         DEFAULT_CHANNEL = re.sub(r'[\x00-\x07\x09-\x1f\x7f ,]', '', DEFAULT_CHANNEL)[:50] \
                           or DEFAULT_CHANNEL
 
-    # NickServ password — hidden input, blank = skip
+    # NickServ password — hidden input, blank = skip (never saved to disk)
     raw = getpass.getpass("  NickServ password (blank to skip) : ")
     if raw:
         NICKSERV_PASSWORD = raw
+
+    # Persist server/nick/channel for next launch (password deliberately excluded).
+    save_irc_config(DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, DEFAULT_CHANNEL)
 
     print(f"\n  → {DEFAULT_SERVER}:{DEFAULT_PORT} (SSL)  nick={DEFAULT_NICK}"
           + (f"  channel={DEFAULT_CHANNEL}" if DEFAULT_CHANNEL else ""))
