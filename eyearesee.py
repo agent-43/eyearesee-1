@@ -2920,15 +2920,11 @@ class IRCClient:
                 self._current_msg_tags = {}
 
     async def _irc_tagmsg(self, nick, params, prefix):
-        # TAGMSG carries only client tags (no visible text).
-        # Deliver any +typing= tag or other client-only tags as a status note.
         tags = self._current_msg_tags
         target = params[0] if params else ""
-        typing = tags.get("+typing", "")
-        if typing == "active":
-            await self.ui_queue.put(("status", f"* {nick} is typing in {target}…"))
-        elif typing in ("done", "paused"):
-            pass  # silent — stop indicator
+        typing_state = tags.get("+typing", "")
+        if typing_state in ("active", "paused", "done"):
+            await self.ui_queue.put(("typing", nick, target, typing_state))
 
     async def _irc_invite(self, nick, params, prefix):
         if len(params) < 2:
@@ -3509,6 +3505,16 @@ class TUI:
         self._dashboard_mode = "suspects"
         self._prev_on_dashboard = False           # edge-detect navigate-back-to-dashboard
         self._dashboard_profile_locked = False    # one-shot: skip reset on same-tick navigate
+
+        # IRCv3 +typing client tag
+        # Incoming: {target_lower: {nick_lower: [orig_nick, state, expiry_monotonic]}}
+        #   state "active" expires in 6 s, "paused" in 30 s; "done" removes immediately
+        self._typing_peers: dict = {}
+        # Outgoing
+        self._typing_out_target: str = ""   # target we are currently reporting typing for
+        self._typing_out_last:   float = 0.0  # monotonic time of last +typing=active sent
+        self._typing_out_state:  str = ""   # "active" | "paused" | ""
+        self._typing_last_key:   float = 0.0  # monotonic time of last buffer-modifying key
 
         # Claude API state
         self.ai_chat_model: str = CLAUDE_DEFAULT_MODEL   # key into CLAUDE_MODELS
@@ -4213,6 +4219,19 @@ class TUI:
 
         # Row 0 is permanently the title bar; content occupies rows 1..chat_height-1.
         content_height = self._content_height
+
+        # IRCv3 typing: expire stale entries then check if any peers are typing here.
+        _now_m = time.monotonic()
+        _tgt_key = current_win.name.lower()
+        _peers = self._typing_peers.get(_tgt_key)
+        if _peers:
+            _stale = [_n for _n, _e in _peers.items() if _now_m > _e[2]]
+            for _n in _stale:
+                del _peers[_n]
+        _typing_names = [_e[0] for _e in _peers.values()] if _peers else []
+        if _typing_names:
+            content_height = max(1, content_height - 1)  # reserve bottom row for indicator
+
         max_offset = max(0, total - content_height)
         current_win.scroll_offset = min(current_win.scroll_offset, max_offset)
         offset = current_win.scroll_offset
@@ -4270,6 +4289,20 @@ class TUI:
             else:
                 base = attr_normal
             _render(i + 1, line, base, tw)  # +1: row 0 is reserved for the title bar
+
+        # Typing indicator — drawn on the row just below the last message row.
+        if _typing_names:
+            if len(_typing_names) == 1:
+                _typ_text = f" ✎ {_typing_names[0]} is typing…"
+            elif len(_typing_names) == 2:
+                _typ_text = f" ✎ {_typing_names[0]} and {_typing_names[1]} are typing…"
+            else:
+                _typ_text = f" ✎ {len(_typing_names)} people are typing…"
+            try:
+                self.chat_win.addstr(content_height + 1, 1,
+                                     _typ_text[:tw], curses.A_DIM)
+            except curses.error:
+                pass
 
         title = (f" {current_win.name} [↑ {offset} line{'s' if offset != 1 else ''}] "
                  if offset > 0 else f" {current_win.name} ")
@@ -4522,6 +4555,7 @@ class TUI:
         h["join_error"]  = self._ev_join_error
         h["part"]        = self._ev_part
         h["quit"]        = self._ev_quit
+        h["typing"]      = self._ev_typing
         for k in ("whois", "kick", "mode", "status"):
             h[k] = self._ev_status_line
 
@@ -4599,8 +4633,26 @@ class TUI:
             self.channel_users[win_name].add(nick)
             self._sorted_users.pop(win_name, None)
             self._userlist_dirty = True
+        # A sent message implicitly clears any typing indicator for that nick.
+        tgt_peers = self._typing_peers.get(win_name.lower(), {})
+        if tgt_peers.pop(nick.lower(), None) is not None:
+            pass  # _chat_dirty already set below
         self._chat_dirty = True
         self.dirty = True
+
+    async def _ev_typing(self, event):
+        _, nick, target, state = event
+        tgt = target.lower()
+        nick_l = nick.lower()
+        peers = self._typing_peers.setdefault(tgt, {})
+        if state == "done":
+            peers.pop(nick_l, None)
+        else:
+            expiry = time.monotonic() + (6.0 if state == "active" else 30.0)
+            peers[nick_l] = [nick, state, expiry]
+        if tgt == self.get_current_window().name.lower():
+            self._chat_dirty = True
+            self.dirty = True
 
     async def _ev_ai_score(self, event):
         _, nick, rolling_ai = event
@@ -6173,6 +6225,37 @@ class TUI:
 
         return False
 
+    # ── IRCv3 outgoing +typing helpers ───────────────────────────────────────
+
+    def _typing_chat_target(self) -> str:
+        """Return the current chat target, or '' for non-chat windows."""
+        cur = self.get_current_window()
+        return "" if cur.name in ("*status*", "*dashboard*") else cur.name
+
+    def _send_typing(self, state: str) -> None:
+        """Send a +typing TAGMSG; update outgoing state bookkeeping."""
+        if state == "done":
+            target = self._typing_out_target
+        else:
+            target = self._typing_chat_target()
+        if not target:
+            return
+        c = self._active_client()
+        if "message-tags" not in c._active_caps:
+            return
+        c.cmd_tagmsg(target, {"+typing": state})
+        if state == "done":
+            self._typing_out_target = ""
+            self._typing_out_last   = 0.0
+            self._typing_out_state  = ""
+        elif state == "active":
+            self._typing_out_target = target
+            self._typing_out_last   = time.monotonic()
+            self._typing_out_state  = "active"
+        else:  # paused
+            self._typing_out_target = target
+            self._typing_out_state  = "paused"
+
     async def run(self) -> None:
         try:
             await self._run_loop()
@@ -6192,6 +6275,9 @@ class TUI:
                 had_key = True
                 is_enter = self._handle_key(ch)
                 if is_enter:
+                    # Send +typing=done *before* clearing the buffer.
+                    if self._typing_out_state in ("active", "paused"):
+                        self._send_typing("done")
                     line = self.input_buffer
                     if line.strip():
                         self.input_history.appendleft(line)
@@ -6204,6 +6290,18 @@ class TUI:
                     self.completion_state = None
                     self._input_dirty  = True
                     break  # redraw before consuming the next key
+
+            # ── 1b. Outgoing +typing notifications ────────────────────────────────
+            if had_key:
+                _new_tgt = self._typing_chat_target()
+                if _new_tgt != self._typing_out_target and self._typing_out_state in ("active", "paused"):
+                    self._send_typing("done")   # switched windows while typing
+                if self.input_buffer.strip() and _new_tgt:
+                    self._typing_last_key = time.monotonic()
+                    if time.monotonic() - self._typing_out_last >= 3.0:
+                        self._send_typing("active")
+                elif not self.input_buffer.strip() and self._typing_out_state in ("active", "paused"):
+                    self._send_typing("done")   # buffer cleared (Ctrl-U / backspace to empty)
 
             # ── 2. Immediate input refresh — bypasses the 30fps chat throttle ────
             # Typing, cursor movement and backspace feel instantaneous because the
@@ -6229,6 +6327,13 @@ class TUI:
                     n += 1
             except asyncio.QueueEmpty:
                 pass
+
+            # ── 3b. Outgoing +typing=paused after 5 s of inactivity ──────────────
+            if (self._typing_out_state == "active"
+                    and self._typing_out_target
+                    and self.input_buffer.strip()
+                    and time.monotonic() - self._typing_last_key >= 5.0):
+                self._send_typing("paused")
 
             # ── 4. Dashboard auto-refresh ─────────────────────────────────────────
             now = time.monotonic()
