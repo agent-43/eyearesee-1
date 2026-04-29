@@ -1896,6 +1896,7 @@ class ChatWindow:
         self._msg_store: dict = {}   # {msgid: (nick, text_preview)} — for reply lookups
         self._last_msgid: str = ""   # msgid of most recent incoming message
         self._reactions: dict = {}   # {msgid: {emoji: [nick, ...]}}
+        self._unread_from: int = -1  # index of first unread line (-1 = none)
         self.wrapped_cache: List[str] = []
         self.url_map: Dict[int, str] = {}  # wrapped line index -> full URL
         self._wrap_dirty = True
@@ -1945,6 +1946,7 @@ class IRCClient:
         self._active_caps: set = set()           # currently ACKed/enabled caps
         self._batch_buffer: dict = {}            # batch ref → [(cmd,nick,params,prefix,tags)]
         self._batch_types: dict = {}             # batch ref → batch type string
+        self._batch_params: dict = {}            # batch ref → original BATCH+ params (for multiline target)
         self._current_batch_is_replay: bool = False  # True while replaying chathistory batch
         self._monitor_nicks: set = set()         # nicks on MONITOR list
         self._chathistory_cap: str = ""          # "chathistory" or "draft/chathistory"
@@ -2195,6 +2197,7 @@ class IRCClient:
             self._isupport.clear()
             self._batch_buffer.clear()
             self._batch_types.clear()
+            self._batch_params.clear()
             self._cap_req_queue.clear()
             self._sasl_state.clear()
             self._auth_buffer = ""
@@ -2396,6 +2399,7 @@ class IRCClient:
         "message-tags", "batch", "labeled-response", "invite-notify",
         "account-tag", "standard-replies", "setname",
         "chathistory", "draft/chathistory",
+        "draft/multiline", "message-redaction", "read-marker",
     )
 
     async def _irc_cap(self, nick, params, prefix):
@@ -3035,10 +3039,16 @@ class IRCClient:
             ref = ref_dir[1:]
             self._batch_buffer[ref] = []
             self._batch_types[ref] = params[1] if len(params) > 1 else ""
+            self._batch_params[ref] = params  # save full params for multiline target
         elif ref_dir.startswith("-"):
             ref = ref_dir[1:]
-            buffered = self._batch_buffer.pop(ref, [])
+            buffered   = self._batch_buffer.pop(ref, [])
             batch_type = self._batch_types.pop(ref, "")
+            open_params = self._batch_params.pop(ref, [])
+            # draft/multiline: combine lines into a single message
+            if batch_type == "draft/multiline":
+                await self._handle_multiline_batch(buffered, open_params)
+                return
             is_replay = batch_type in ("chathistory", "draft/chathistory")
             prev_replay = self._current_batch_is_replay
             self._current_batch_is_replay = is_replay
@@ -3055,6 +3065,52 @@ class IRCClient:
             finally:
                 self._current_batch_is_replay = prev_replay
                 self._current_msg_tags = {}
+
+    async def _handle_multiline_batch(self, buffered: list, open_params: list) -> None:
+        """Combine draft/multiline batch lines into a single PRIVMSG dispatch."""
+        target = open_params[2] if len(open_params) > 2 else ""
+        if not target or not buffered:
+            return
+        combined: list = []
+        first_tags: dict = {}
+        first_nick: str = ""
+        for bcmd, bnick, bparams, bprefix, btags in buffered:
+            if bcmd != "PRIVMSG":
+                continue
+            if not first_nick:
+                first_nick = bnick
+                first_tags = btags
+            line_text = bparams[1] if len(bparams) > 1 else ""
+            concat = "draft/multiline-concat" in btags
+            if combined and not concat:
+                combined.append("\n")
+            combined.append(line_text)
+        if not combined or not first_nick:
+            return
+        combined_text = "".join(combined)
+        prev_tags = self._current_msg_tags
+        self._current_msg_tags = first_tags
+        try:
+            await self._irc_privmsg(first_nick, [target, combined_text], "")
+        finally:
+            self._current_msg_tags = prev_tags
+
+    async def _irc_redact(self, nick, params, prefix):
+        """Handle incoming REDACT command (message-redaction CAP)."""
+        if len(params) < 2:
+            return
+        target = params[0]
+        msgid  = params[1]
+        reason = params[2] if len(params) > 2 else ""
+        await self.ui_queue.put(("redact", nick, target, msgid, reason))
+
+    async def _irc_markread(self, nick, params, prefix):
+        """Handle incoming MARKREAD response (read-marker CAP)."""
+        if len(params) < 2:
+            return
+        target = params[0]
+        ts_arg = params[1]  # e.g. "timestamp=2024-01-15T14:30:00.000Z"
+        await self.ui_queue.put(("markread", target, ts_arg))
 
     async def _irc_tagmsg(self, nick, params, prefix):
         tags = self._current_msg_tags
@@ -3183,6 +3239,8 @@ class IRCClient:
         h["SETNAME"]      = self._irc_setname
         h["BATCH"]        = self._irc_batch
         h["TAGMSG"]       = self._irc_tagmsg
+        h["REDACT"]       = self._irc_redact
+        h["MARKREAD"]     = self._irc_markread
         h["FAIL"]         = self._irc_fail
         h["WARN"]         = self._irc_warn
         h["NOTE"]         = self._irc_note
@@ -3233,6 +3291,8 @@ class IRCClient:
         self.send_raw(f"KICK {channel} {user} :{reason}" if reason else f"KICK {channel} {user}")
 
     def cmd_msg(self, target: str, text: str, is_action: bool = False) -> Optional[tuple]:
+        if "\n" in text and not is_action and "draft/multiline" in self._active_caps:
+            return self._cmd_msg_multiline(target, text)
         body = f":\x01ACTION {text}\x01" if is_action else f":{text}"
         if "labeled-response" in self._active_caps:
             label = self._next_label()
@@ -3253,6 +3313,22 @@ class IRCClient:
         a_score = 0  # own messages are human
         rolling_ai = int(u_state.rolling_ai_likelihood())
         return ("msg", self.nick, target, text, u_score, m_score, a_score, rolling_ai, is_action)
+
+    def _cmd_msg_multiline(self, target: str, text: str) -> Optional[tuple]:
+        """Send text containing \\n as a draft/multiline BATCH."""
+        ref = f"ml{self._next_label()}"
+        self.send_raw(f"BATCH +{ref} draft/multiline {target}")
+        for ln in text.split("\n"):
+            self.send_tagged({"batch": ref}, f"PRIVMSG {target} :{ln}")
+        self.send_raw(f"BATCH -{ref}")
+        if self.nick not in self.users:
+            u = UserState(self.nick)
+            self.users[self.nick] = u
+        u_state = self.users[self.nick]
+        u_state.record_message(text)
+        u_score = self.scoring.score_user(u_state)
+        rolling_ai = int(u_state.rolling_ai_likelihood())
+        return ("msg", self.nick, target, text, u_score, 50, 0, rolling_ai, False)
 
     def cmd_service(self, service: str, command: str) -> None:
         self.send_raw(f"PRIVMSG {service} :{command}")
@@ -3800,7 +3876,7 @@ class TUI:
         url_map: Dict[int, str] = {}
 
         def _wrap_raw(raw: str) -> None:
-            """Wrap a raw (possibly IRC-formatted) text fragment into wrapped[]."""
+            """Wrap a single raw fragment (no \\n) into wrapped[], word-wrapping if wide."""
             if not raw:
                 return
             s = irc_strip_formatting(raw)
@@ -3814,25 +3890,17 @@ class TUI:
                 s   = irc_strip_formatting(raw)
             wrapped.append(raw)
 
-        _msgids = win._line_msgids
-        for _src_i, line in enumerate(win.lines):
-            _src_msgid = _msgids[_src_i] if _src_i < len(_msgids) else ""
-            if not line:
+        def _wrap_one_line(raw_line: str) -> None:
+            """Wrap one logical line (no embedded \\n): URL-split then word-wrap."""
+            if not raw_line:
                 wrapped.append("")
-                continue
-            stripped = irc_strip_formatting(line)
+                return
+            stripped = irc_strip_formatting(raw_line)
             url_matches = list(_URL_RE.finditer(stripped))
             if url_matches:
-                # Extract each URL as its own single display line so long URLs
-                # never get split across rows.  The full URL is stored in url_map;
-                # the display line is truncated with "…" only if needed.
-                #
-                # Use `stripped` (not `line`) for position tracking: IRC bots
-                # sometimes apply bold/underline codes around or inside the URL
-                # text, so searching the raw line for the stripped URL string
-                # would fail.  The stripped text has no such codes and find()
-                # is always reliable on it.  Pre/post segments are wrapped via
-                # _wrap_raw which accepts plain text without IRC codes.
+                # Extract each URL as its own display line so long URLs never split.
+                # Use stripped text for URL position tracking (IRC codes in raw_line
+                # would shift offsets); pre/post segments fed through _wrap_raw.
                 remaining = stripped
                 for um in url_matches:
                     url_str   = um.group(0)
@@ -3849,17 +3917,43 @@ class TUI:
                     remaining = remaining[pos + len(url_str):].lstrip()
                 _wrap_raw(remaining)
             else:
-                # Normal word-wrap — no URLs present
+                r = raw_line
                 s = stripped
                 while _str_visual_width(s) > max_width:
-                    rm = _irc_visual_pos(line, max_width)
-                    sp = line.rfind(" ", 0, rm)
+                    rm = _irc_visual_pos(r, max_width)
+                    sp = r.rfind(" ", 0, rm)
                     if sp == -1:
                         sp = rm if rm > 0 else 1
-                    wrapped.append(line[:sp])
-                    line = line[sp:].lstrip()
-                    s    = irc_strip_formatting(line)
-                wrapped.append(line)
+                    wrapped.append(r[:sp])
+                    r = r[sp:].lstrip()
+                    s = irc_strip_formatting(r)
+                wrapped.append(r)
+
+        _msgids      = win._line_msgids
+        _unread_from = win._unread_from
+
+        for _src_i, line in enumerate(win.lines):
+            _src_msgid = _msgids[_src_i] if _src_i < len(_msgids) else ""
+
+            # read-marker: inject separator before the first unread line
+            if _unread_from >= 0 and _src_i == _unread_from:
+                _sep_inner = "  unread  "
+                _sep_dash  = "─" * max(0, (max_width - len(_sep_inner)) // 2)
+                wrapped.append(_sep_dash + _sep_inner + _sep_dash)
+
+            if not line:
+                wrapped.append("")
+                continue
+
+            # draft/multiline: messages with embedded \n from a multiline batch
+            if "\n" in line:
+                parts = line.split("\n")
+                _wrap_one_line(parts[0])
+                for _sp in parts[1:]:
+                    _wrap_one_line("    " + _sp if _sp else "")
+            else:
+                _wrap_one_line(line)
+
             # Inject a reactions summary line immediately after this message
             if _src_msgid and _src_msgid in win._reactions:
                 _reacts = win._reactions[_src_msgid]
@@ -4708,7 +4802,22 @@ class TUI:
     def get_current_window(self) -> ChatWindow:
         return self.windows[self.current_window_index]
 
+    def _mark_window_read(self, win: "ChatWindow") -> None:
+        """Send MARKREAD for *win* and clear its unread marker."""
+        if win.name in ("*status*", "*dashboard*") or not win.is_channel:
+            return
+        client = self._active_client()
+        if "read-marker" not in client._active_caps:
+            return
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        client.send_raw(f"MARKREAD {win.name} timestamp={ts}")
+        win._unread_from = -1
+        win._wrap_dirty = True
+
     def switch_to_next_window(self):
+        prev_win = self.get_current_window()
+        self._mark_window_read(prev_win)
         self.current_window_index = (self.current_window_index + 1) % len(self.windows)
         win = self.get_current_window()
         if win.name not in ("*status*", "*dashboard*"):
@@ -4716,6 +4825,7 @@ class TUI:
         if win.name in self._unread_windows:
             win.scroll_offset = 0  # jump to bottom so the new messages are visible
         self._unread_windows.discard(win.name)
+        win._unread_from = -1
         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
 
@@ -4771,6 +4881,8 @@ class TUI:
         h["quit"]        = self._ev_quit
         h["typing"]      = self._ev_typing
         h["react"]       = self._ev_react
+        h["redact"]      = self._ev_redact
+        h["markread"]    = self._ev_markread
         for k in ("whois", "kick", "mode", "status"):
             h[k] = self._ev_status_line
 
@@ -4817,6 +4929,9 @@ class TUI:
             win_name = nick
             is_chan   = False
         win = self.ensure_window(win_name, is_channel=is_chan)
+        # read-marker: mark the first unread line when this window is not active
+        if not is_replay and win is not self.get_current_window() and win._unread_from < 0:
+            win._unread_from = len(win.lines)  # points to the line about to be added
         # +reply: show a quoted preview of the referenced message
         if reply_to:
             ref = win._msg_store.get(reply_to)
@@ -4895,6 +5010,50 @@ class TUI:
         nicks = win._reactions.setdefault(msgid, {}).setdefault(emoji, [])
         if nick not in nicks:
             nicks.append(nick)
+        win._wrap_dirty = True
+        if win is self.get_current_window():
+            self._chat_dirty = True
+            self.dirty = True
+
+    async def _ev_redact(self, event):
+        _, nick, target, msgid, reason = event
+        win_name = target if target.startswith("#") else nick
+        wk = self._wk(self._active_server_id, win_name)
+        win = self.window_by_name.get(wk)
+        if win is None:
+            return
+        for i, mid in enumerate(win._line_msgids):
+            if mid == msgid:
+                old_line = win.lines[i]
+                ts_prefix = old_line[:8] if old_line.startswith("[") and len(old_line) >= 8 else ""
+                reason_str = f": {reason}" if reason else ""
+                win.lines[i] = f"{ts_prefix} [redacted by {nick}{reason_str}]"
+                win._wrap_dirty = True
+                break
+        if win is self.get_current_window():
+            self._chat_dirty = True
+            self.dirty = True
+
+    async def _ev_markread(self, event):
+        _, target, ts_arg = event
+        wk = self._wk(self._active_server_id, target)
+        win = self.window_by_name.get(wk)
+        if win is None:
+            return
+        if not ts_arg.startswith("timestamp="):
+            return
+        ts_iso = ts_arg[len("timestamp="):]
+        marker_time = _parse_server_time(ts_iso)  # returns "[HH:MM]" or None
+        if not marker_time:
+            return
+        # Find index of the first line whose timestamp is after the marker
+        unread_from = -1
+        for i, line in enumerate(win.lines):
+            if line.startswith("[") and len(line) >= 7 and line[6] == "]":
+                if line[:7] > marker_time:
+                    unread_from = i
+                    break
+        win._unread_from = unread_from
         win._wrap_dirty = True
         if win is self.get_current_window():
             self._chat_dirty = True
@@ -5000,6 +5159,10 @@ class TUI:
         self.current_channel = channel
         self.current_window_index = self.windows.index(win)
         self._unread_windows.discard(channel)
+        # Fetch stored read marker from server if supported
+        client = self._active_client()
+        if "read-marker" in client._active_caps:
+            client.send_raw(f"MARKREAD {channel} *")
         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
 
@@ -5121,6 +5284,8 @@ class TUI:
         h["tagmsg"]       = self._slash_tagmsg
         h["reply"]        = self._slash_reply
         h["react"]        = self._slash_react
+        h["ml"] = h["multiline"] = self._slash_multiline
+        h["redact"]       = self._slash_redact
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -5521,6 +5686,7 @@ class TUI:
         win._msg_store.clear()
         win._reactions.clear()
         win._last_msgid = ""
+        win._unread_from = -1
         win._wrap_dirty = True
 
     async def _slash_close(self, args, extra, line):
@@ -5541,6 +5707,7 @@ class TUI:
         if args.isdigit():
             idx = int(args) - 1
             if 0 <= idx < len(self.windows):
+                self._mark_window_read(self.get_current_window())
                 self.current_window_index = idx
                 win = self.windows[idx]
                 if win.name not in ("*status*", "*dashboard*"):
@@ -5548,6 +5715,7 @@ class TUI:
                 if win.name in self._unread_windows:
                     win.scroll_offset = 0
                 self._unread_windows.discard(win.name)
+                win._unread_from = -1
                 self._chat_dirty = self._userlist_dirty = self._input_dirty = True
                 self.dirty = True
 
@@ -5952,6 +6120,8 @@ class TUI:
         _E("/me <text>",                    "Send an action line  (* nick waves)")
         _E("/reply <text>",                 "Reply to last message with +reply tag (IRCv3 message-tags)")
         _E("/react <emoji>",                "React to last message with +react TAGMSG (IRCv3 message-tags)")
+        _E("/ml <l1> | <l2> | ...",         "Send multiline message via draft/multiline batch")
+        _E("/redact [reason]",              "Redact last message in this window (message-redaction)")
         _C("")
         _H("Channels")
         _E("/join <channel>",               "Join a channel (# is added automatically if omitted)")
@@ -6218,6 +6388,41 @@ class TUI:
         win._wrap_dirty = True
         self._chat_dirty = True
         self.dirty = True
+
+    async def _slash_multiline(self, args, extra, line):
+        """Send a multiline message using draft/multiline batch (| = line break)."""
+        slash_end = line.index(" ") + 1 if " " in line else len(line)
+        text_raw = line[slash_end:].strip()
+        if not text_raw:
+            await self.ui_queue.put(("status", "Usage: /ml <line1> | <line2> | ..."))
+            return
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/ml: not in a chat window"))
+            return
+        # Replace | separators with actual newlines
+        text = "\n".join(part.strip() for part in text_raw.split("|"))
+        client = self._active_client()
+        result = client.cmd_msg(win.name, text)
+        if result:
+            await self.ui_queue.put(result)
+
+    async def _slash_redact(self, args, extra, line):
+        """Redact the last message in this window (message-redaction CAP)."""
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/redact: not in a chat window"))
+            return
+        if not win._last_msgid:
+            await self.ui_queue.put(("status",
+                "/redact: no msgid — server may not support message-tags"))
+            return
+        reason = (args + (" " + extra if extra else "")).strip()
+        client = self._active_client()
+        if reason:
+            client.send_raw(f"REDACT {win.name} {win._last_msgid} :{reason}")
+        else:
+            client.send_raw(f"REDACT {win.name} {win._last_msgid}")
 
     async def _slash_redraw(self, args, extra, line):
         channel = args.strip() or self.current_channel or ""
