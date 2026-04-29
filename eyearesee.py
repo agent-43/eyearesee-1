@@ -2400,6 +2400,7 @@ class IRCClient:
         "account-tag", "standard-replies", "setname",
         "chathistory", "draft/chathistory",
         "draft/multiline", "message-redaction", "read-marker",
+        "draft/account-registration",
     )
 
     async def _irc_cap(self, nick, params, prefix):
@@ -3162,6 +3163,20 @@ class IRCClient:
     async def _irc_monlistfull(self, nick, params, prefix): # 734 ERR_MONLISTFULL
         await self.ui_queue.put(("status", f"[monitor] list full — {' '.join(params[1:])}"))
 
+    async def _irc_reg_success(self, nick, params, prefix):  # 920 RPL_REG_SUCCESS
+        acct = params[1] if len(params) > 1 else "?"
+        await self.ui_queue.put(("status", f"[register] '{acct}' registered successfully"))
+
+    async def _irc_reg_verification(self, nick, params, prefix):  # 921 RPL_REG_VERIFICATION_REQUIRED
+        acct = params[1] if len(params) > 1 else "?"
+        detail = params[-1] if len(params) > 2 else ""
+        await self.ui_queue.put(("status",
+            f"[register] '{acct}' needs email verification" + (f" — {detail}" if detail else "")))
+
+    async def _irc_reg_error(self, nick, params, prefix):  # 922–924 ERR_REG_*
+        msg = params[-1] if params else "unknown error"
+        await self.ui_queue.put(("status", f"[register] error: {msg}"))
+
     async def _irc_whox_reply(self, nick, params, prefix):  # 354 RPL_WHOSPCRPL
         await self.ui_queue.put(("status", f"[who] {' '.join(params[1:])}"))
 
@@ -3249,6 +3264,9 @@ class IRCClient:
         h["732"]          = self._irc_monlist
         h["734"]          = self._irc_monlistfull
         h["354"]          = self._irc_whox_reply
+        h["920"]          = self._irc_reg_success
+        h["921"]          = self._irc_reg_verification
+        h["922"] = h["923"] = h["924"] = self._irc_reg_error
         # WHOIS numerics — bind each with its code via a closure
         for _code in _WHOIS_REPLIES:
             _c = _code
@@ -5286,6 +5304,7 @@ class TUI:
         h["react"]        = self._slash_react
         h["ml"] = h["multiline"] = self._slash_multiline
         h["redact"]       = self._slash_redact
+        h["register"]     = self._slash_register
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -6423,6 +6442,25 @@ class TUI:
             client.send_raw(f"REDACT {win.name} {win._last_msgid} :{reason}")
         else:
             client.send_raw(f"REDACT {win.name} {win._last_msgid}")
+
+    async def _slash_register(self, args, extra, line):
+        """Register a new account via draft/account-registration.
+
+        Usage: /register <account|*> <email> <password>
+        Use * as account to register the current nick as the account name.
+        """
+        c = self._active_client()
+        if "draft/account-registration" not in c._active_caps:
+            await self.ui_queue.put(("status",
+                "[register] server does not support draft/account-registration"))
+            return
+        parts = args.strip().split(None, 2)
+        if len(parts) < 3:
+            await self.ui_queue.put(("status",
+                "Usage: /register <account|*> <email> <password>"))
+            return
+        account, email, password = parts
+        c.send_raw(f"REGISTER {account} {email} :{password}")
 
     async def _slash_redraw(self, args, extra, line):
         channel = args.strip() or self.current_channel or ""
