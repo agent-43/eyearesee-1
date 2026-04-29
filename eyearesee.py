@@ -144,6 +144,7 @@ CHAT_LOG_LOAD      = 500
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
 DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY", "")
+GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
 # Ollama: local/offline LLM server.  Override with OLLAMA_URL env var if running elsewhere.
 OLLAMA_URL: str    = os.environ.get("OLLAMA_URL",    "http://127.0.0.1:11434")
 # llama.cpp: local server with OpenAI-compatible API.  Override with LLAMACPP_URL env var.
@@ -166,6 +167,9 @@ AI_MODELS: Dict[str, Dict[str, str]] = {
     # ── Cloud: DeepSeek ──────────────────────────────────────────────────
     "deepseek": {"provider": "deepseek", "id": "deepseek-chat",     "label": "DeepSeek-V3"},
     "dsr1":     {"provider": "deepseek", "id": "deepseek-reasoner", "label": "DeepSeek-R1"},
+    # ── Cloud: GitHub Copilot ────────────────────────────────────────────
+    "copilot":  {"provider": "copilot",  "id": "gpt-4o",            "label": "Copilot GPT-4o"},
+    "copilot-mini": {"provider": "copilot", "id": "gpt-4o-mini",    "label": "Copilot GPT-4o-mini"},
     # ── Local/offline: Ollama ─────────────────────────────────────────────
     "gemma":   {"provider": "ollama",   "id": "gemma3:4b",   "label": "Gemma 3 4B   (Ollama/offline)"},
     "llama3":  {"provider": "ollama",   "id": "llama3.2",    "label": "Llama 3.2    (Ollama/offline)"},
@@ -335,42 +339,139 @@ def irc_strip_formatting(text: str) -> str:
 # Python's len() and f-string alignment know nothing about this, so every
 # column calculation must go through these helpers instead.
 
+# Unicode zero-width / presentation constants
+_ZWJ  = '‍'   # ZERO WIDTH JOINER
+_VS15 = '︎'   # VARIATION SELECTOR-15 (text presentation)
+_VS16 = '️'   # VARIATION SELECTOR-16 (emoji presentation)
+
 def _char_width(ch: str) -> int:
-    """Terminal display width of a single character: 2 for wide/fullwidth, 1 otherwise."""
+    """Terminal display width of a single Unicode scalar value.
+
+    Returns 0 for combining marks, enclosing marks, and Unicode format
+    characters (categories Mn/Mc/Me/Cf — includes ZWJ U+200D and variation
+    selectors U+FE0E/U+FE0F).  Returns 2 for wide/fullwidth East-Asian
+    characters and for symbol/pictographic emoji in the SMP that Python's
+    unicodedata may classify as EAW 'N' (e.g. U+1F3F3 WHITE FLAG).
+    Returns 1 for everything else.
+
+    Call _next_cluster() when iterating over strings so that ZWJ sequences
+    are counted as one glyph instead of summing each component's width.
+    """
+    cat = unicodedata.category(ch)
+    if cat in ('Mn', 'Mc', 'Me', 'Cf'):
+        return 0
     eaw = unicodedata.east_asian_width(ch)
-    return 2 if eaw in ("W", "F") else 1
+    if eaw in ('W', 'F'):
+        return 2
+    # Some Symbol/Other code points in the emoji blocks are not classified 'W'
+    # by Python's unicodedata even though modern terminals display them as 2-wide.
+    # Cover the Supplementary Multilingual Plane emoji ranges explicitly.
+    if cat == 'So':
+        cp = ord(ch)
+        if 0x1F000 <= cp <= 0x1FAFF:   # Mahjong … Symbols & Pictographs Extended-A
+            return 2
+    return 1
+
+def _next_cluster(s: str, i: int) -> tuple:
+    """Consume one grapheme cluster from *s* starting at index *i*.
+
+    Returns (new_index, visual_width).  Handles:
+      • ZWJ sequences (multi-person emoji, flag sequences like 🏳️‍🌈)
+      • Regional Indicator pairs (🇺🇸 = U+1F1FA U+1F1F8) — two adjacent RIs
+        form one flag glyph; only the base character's width is counted
+      • VS15 / VS16 variation selectors
+      • Unicode combining / enclosing / format characters (Mn, Mc, Me, Cf)
+
+    The cluster's visual width equals that of its base character; all absorbed
+    code points contribute zero additional columns.
+    """
+    n    = len(s)
+    base = s[i]
+    w    = _char_width(base)
+    i   += 1
+
+    # Regional Indicator pair → single emoji flag (🇺🇸, 🇬🇧, …).
+    # Two adjacent RIs together form one glyph; absorb the second RI.
+    if 0x1F1E0 <= ord(base) <= 0x1F1FF:
+        if i < n and 0x1F1E0 <= ord(s[i]) <= 0x1F1FF:
+            i += 1
+        return i, w   # flag clusters carry no further modifiers
+
+    while i < n:
+        nc  = s[i]
+        cat = unicodedata.category(nc)
+        if nc == _ZWJ:
+            i += 1                          # absorb ZWJ itself
+            if i < n and unicodedata.category(s[i]) not in ('Mn', 'Mc', 'Me', 'Cf'):
+                i += 1                      # absorb the next base glyph
+            while i < n and s[i] in (_VS16, _VS15):
+                i += 1                      # absorb any trailing VS on that glyph
+        elif nc in (_VS16, _VS15):
+            i += 1
+        elif cat in ('Mn', 'Mc', 'Me', 'Cf'):
+            i += 1
+        else:
+            break
+    return i, w
 
 def _str_visual_width(s: str) -> int:
-    """Total terminal column width of *s*, counting CJK/wide chars as 2 columns."""
-    return sum(_char_width(c) for c in s)
+    """Total terminal column width of *s*.
+
+    Wide/fullwidth East-Asian chars count as 2 columns.  ZWJ sequences,
+    variation selectors, and combining marks are folded into their base
+    glyph and contribute no extra columns.
+    """
+    total = 0
+    i     = 0
+    n     = len(s)
+    while i < n:
+        i, w  = _next_cluster(s, i)
+        total += w
+    return total
 
 def _truncate_to_width(s: str, max_cols: int) -> str:
-    """Return the longest prefix of *s* that fits within *max_cols* terminal columns."""
+    """Return the longest prefix of *s* that fits within *max_cols* terminal columns.
+
+    Never splits a grapheme cluster (ZWJ sequence, combining mark, etc.).
+    """
     cols = 0
-    for i, ch in enumerate(s):
-        cw = _char_width(ch)
+    i    = 0
+    n    = len(s)
+    while i < n:
+        start    = i
+        i, cw    = _next_cluster(s, i)
         if cols + cw > max_cols:
-            return s[:i]
+            return s[:start]
         cols += cw
     return s
 
 def _skip_visual_cols(s: str, skip: int) -> str:
-    """Return the substring of *s* that starts at visual column *skip*."""
+    """Return the substring of *s* that starts at visual column *skip*.
+
+    Advances by grapheme cluster so ZWJ sequences are never split.
+    """
     if skip <= 0:
         return s
     col = 0
-    for i, ch in enumerate(s):
+    i   = 0
+    n   = len(s)
+    while i < n:
+        start    = i
+        i, cw    = _next_cluster(s, i)
         if col >= skip:
-            return s[i:]
-        col += _char_width(ch)
+            return s[start:]
+        col += cw
     return ""
 
 def _irc_visual_pos(line: str, max_visual: int) -> int:
     """Return the raw-string index at which the visual column count reaches *max_visual*.
-    IRC control codes are zero-width; CJK/fullwidth chars count as 2 columns."""
+
+    IRC control codes are zero-width.  Non-control characters are advanced
+    by grapheme cluster so that ZWJ sequences count as a single display cell.
+    """
     vis = 0
-    i = 0
-    n = len(line)
+    i   = 0
+    n   = len(line)
     while i < n and vis < max_visual:
         ch = line[i]
         if ch in ("\x02", "\x1D", "\x1F", "\x16", "\x0F"):
@@ -386,11 +487,11 @@ def _irc_visual_pos(line: str, max_visual: int) -> int:
                     if i < n and line[i].isdigit(): i += 1
                     else: break
         else:
-            cw = _char_width(ch)
+            ni, cw = _next_cluster(line, i)
             if vis + cw > max_visual:
-                break       # this char would overflow — stop before it
+                break                   # cluster would overflow — stop before it
             vis += cw
-            i += 1
+            i    = ni
     return i
 
 # =========================
@@ -3547,6 +3648,7 @@ class TUI:
         self._anthropic_client = None                    # reuse HTTP connection pool
         self._openai_client    = None
         self._deepseek_client  = None
+        self._copilot_client   = None
 
         # Pre-compute curses attributes (avoids repeated function calls every frame)
         try:
@@ -4108,6 +4210,36 @@ class TUI:
                 return answer, tokens
             except Exception as exc:
                 self._deepseek_client = None
+                return f"[error] {exc}", "?"
+
+        if provider == "copilot":
+            if not OPENAI_AVAILABLE:
+                return ("[error] openai package not installed — "
+                        "run: pip install openai"), "?"
+            if not GITHUB_TOKEN:
+                return ("[error] GITHUB_TOKEN not set — "
+                        "set the environment variable and restart"), "?"
+            try:
+                if self._copilot_client is None:
+                    self._copilot_client = _openai_mod.AsyncOpenAI(
+                        api_key=GITHUB_TOKEN,
+                        base_url="https://api.githubcopilot.com",
+                        default_headers={
+                            "editor-version":        "eyearesee/1.0",
+                            "editor-plugin-version": "eyearesee/1.0",
+                            "copilot-integration-id": "eyearesee",
+                        })
+                resp = await self._copilot_client.chat.completions.create(
+                    model=model_id, max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                answer = (resp.choices[0].message.content
+                          if resp.choices else "(empty response)")
+                usage  = getattr(resp, "usage", None)
+                tokens = str(usage.total_tokens) if usage else "?"
+                return answer, tokens
+            except Exception as exc:
+                self._copilot_client = None
                 return f"[error] {exc}", "?"
 
         if provider == "ollama":
@@ -5635,6 +5767,8 @@ class TUI:
                     avail = "  (OPENAI_API_KEY not set)"
                 elif spec["provider"] == "deepseek" and not DEEPSEEK_API_KEY:
                     avail = "  (DEEPSEEK_API_KEY not set)"
+                elif spec["provider"] == "copilot" and not GITHUB_TOKEN:
+                    avail = "  (GITHUB_TOKEN not set)"
                 sw.add_line(f"  {chat_mark}{det_mark} {k:<8} {spec['label']:<22} [{spec['provider']}]{avail}")
             sw.add_line("  > = chat model   D = also used for AI detection")
             sw.add_line(f"  Usage: /model <key>   current: {self.ai_chat_model}")
@@ -5654,8 +5788,8 @@ class TUI:
                 f"Unknown model '{key}'. Available: {keys}  (current: {self.ai_chat_model})"))
 
     async def _slash_api(self, args, extra, line):
-        global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, OLLAMA_URL, LLAMACPP_URL
-        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "OLLAMA_URL", "LLAMACPP_URL"}
+        global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GITHUB_TOKEN, OLLAMA_URL, LLAMACPP_URL
+        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "GITHUB_TOKEN", "OLLAMA_URL", "LLAMACPP_URL"}
 
         if not args:
             sw = self._status_win()
@@ -5673,6 +5807,7 @@ class TUI:
                 ("Claude",    "ANTHROPIC_API_KEY", ANTHROPIC_API_KEY, "console.anthropic.com"),
                 ("OpenAI",    "OPENAI_API_KEY",    OPENAI_API_KEY,    "platform.openai.com"),
                 ("DeepSeek",  "DEEPSEEK_API_KEY",  DEEPSEEK_API_KEY,  "platform.deepseek.com"),
+                ("Copilot",   "GITHUB_TOKEN",       GITHUB_TOKEN,      "github.com/settings/tokens"),
                 ("Ollama",    "OLLAMA_URL",         OLLAMA_URL,        "local server — no key needed"),
                 ("llama.cpp", "LLAMACPP_URL",       LLAMACPP_URL,      "local server — no key needed"),
             ]
@@ -5706,6 +5841,9 @@ class TUI:
             elif var_name == "DEEPSEEK_API_KEY":
                 DEEPSEEK_API_KEY = value
                 self._deepseek_client = None   # force reconnect with new key
+            elif var_name == "GITHUB_TOKEN":
+                GITHUB_TOKEN = value
+                self._copilot_client = None    # force reconnect with new key
             elif var_name == "OLLAMA_URL":
                 OLLAMA_URL = value
             elif var_name == "LLAMACPP_URL":
@@ -5716,7 +5854,7 @@ class TUI:
             return
 
         await self.ui_queue.put(("status",
-            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  DEEPSEEK_API_KEY  OLLAMA_URL  LLAMACPP_URL"))
+            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  DEEPSEEK_API_KEY  GITHUB_TOKEN  OLLAMA_URL  LLAMACPP_URL"))
 
     async def _slash_mute(self, args, extra, line):
         self.mention_beep_muted = not self.mention_beep_muted
