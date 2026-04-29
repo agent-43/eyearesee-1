@@ -1892,6 +1892,10 @@ class ChatWindow:
         self.is_channel = is_channel
         self.server_id = server_id
         self.lines: deque = deque(maxlen=MAX_MESSAGES)
+        self._line_msgids: deque = deque(maxlen=MAX_MESSAGES)  # parallel msgid per line
+        self._msg_store: dict = {}   # {msgid: (nick, text_preview)} — for reply lookups
+        self._last_msgid: str = ""   # msgid of most recent incoming message
+        self._reactions: dict = {}   # {msgid: {emoji: [nick, ...]}}
         self.wrapped_cache: List[str] = []
         self.url_map: Dict[int, str] = {}  # wrapped line index -> full URL
         self._wrap_dirty = True
@@ -1900,11 +1904,12 @@ class ChatWindow:
         self._persist = True         # write new lines to disk
 
     def add_line(self, text: str, timestamp: bool = True,
-                 ts_str: Optional[str] = None) -> None:
+                 ts_str: Optional[str] = None, msgid: str = "") -> None:
         if timestamp:
             ts = ts_str if ts_str else time.strftime("[%H:%M]")
             text = f"{ts} {text}"
         self.lines.append(text)
+        self._line_msgids.append(msgid)
         self._wrap_dirty = True
         if self._persist:
             append_chat_line(self.name, text)
@@ -1945,6 +1950,7 @@ class IRCClient:
         self._chathistory_cap: str = ""          # "chathistory" or "draft/chathistory"
         self._replay_enabled: bool = False       # must be set True before /replay works
         self._label_seq: int = 0                 # monotonic label counter (labeled-response)
+        self._pending_labels: set = set()        # labels sent on outgoing msgs, awaiting echo
         self._cap_req_queue: list = []           # individual caps queued after a CAP NAK
         self._sasl_state: dict = {}              # per-mechanism state across AUTHENTICATE exchanges
         self._auth_buffer: str = ""              # accumulates chunked AUTHENTICATE data (>400 chars)
@@ -2197,6 +2203,7 @@ class IRCClient:
             self._chathistory_cap = ""
             self._current_batch_is_replay = False
             self._label_seq = 0
+            self._pending_labels.clear()
             keepalive_task: Optional[asyncio.Task] = None
             writer_task:    Optional[asyncio.Task] = None
             try:
@@ -2824,20 +2831,24 @@ class IRCClient:
     async def _irc_privmsg(self, nick, params, prefix):
         if len(params) < 2:
             return
-        # echo-message CAP causes the server to reflect our own sends back to us.
-        # We already display messages locally when sent, so skip the server echo.
-        # (With labeled-response this could be smarter, but dedup-by-nick is safe.)
-        # Compare via _irc_lower so case-mapping (rfc1459 default) is honoured.
+        tags = self._current_msg_tags
+        # labeled-response: if the echo carries a label we sent, discard it cleanly.
+        label = tags.get("label", "")
+        if label and label in self._pending_labels:
+            self._pending_labels.discard(label)
+            return
+        # Fallback nick-based echo dedup (when labeled-response not negotiated).
         if (self._irc_lower(nick) == self._irc_lower(self.nick)
                 and not self._current_batch_is_replay):
             return
         target = params[0]
         msg    = params[1]
-        tags   = self._current_msg_tags
         # server-time: prefer server-provided timestamp over local clock
         ts_str = _parse_server_time(tags["time"]) if "time" in tags else None
         # account-tag: sender's services account (if server advertises it)
-        account = tags.get("account", "")
+        account  = tags.get("account", "")
+        msgid    = tags.get("msgid", "")
+        reply_to = tags.get("+reply", "")
         is_replay = self._current_batch_is_replay
 
         # ACTION must be checked before the generic CTCP block — both use \x01
@@ -2888,7 +2899,7 @@ class IRCClient:
         # Extra fields: ts_str (server-time or None), account (account-tag or ""),
         #               is_replay (True when delivered inside a chathistory batch).
         await self.ui_queue.put(("msg", nick, target, msg, u_score, m_score, 0, 0,
-                                 is_action, ts_str, account, is_replay))
+                                 is_action, ts_str, account, is_replay, msgid, reply_to))
         if is_replay:
             return  # don't score replayed history; it's already been seen
         _t = asyncio.create_task(self._score_msg_bg(nick, target, msg, u_state, u_score, m_score))
@@ -3051,6 +3062,10 @@ class IRCClient:
         typing_state = tags.get("+typing", "")
         if typing_state in ("active", "paused", "done"):
             await self.ui_queue.put(("typing", nick, target, typing_state))
+        react    = tags.get("+react", "")
+        reply_to = tags.get("+reply", "")
+        if react and reply_to:
+            await self.ui_queue.put(("react", nick, target, reply_to, react))
 
     async def _irc_invite(self, nick, params, prefix):
         if len(params) < 2:
@@ -3218,10 +3233,13 @@ class IRCClient:
         self.send_raw(f"KICK {channel} {user} :{reason}" if reason else f"KICK {channel} {user}")
 
     def cmd_msg(self, target: str, text: str, is_action: bool = False) -> Optional[tuple]:
-        if is_action:
-            self.send_raw(f"PRIVMSG {target} :\x01ACTION {text}\x01")
+        body = f":\x01ACTION {text}\x01" if is_action else f":{text}"
+        if "labeled-response" in self._active_caps:
+            label = self._next_label()
+            self._pending_labels.add(label)
+            self.send_tagged({"label": label}, f"PRIVMSG {target} {body}")
         else:
-            self.send_raw(f"PRIVMSG {target} :{text}")
+            self.send_raw(f"PRIVMSG {target} {body}")
 
         if self.nick not in self.users:
             u = UserState(self.nick)
@@ -3586,6 +3604,7 @@ class TUI:
             _hist = load_chat_history(DEFAULT_CHANNEL)
             for _hl in _hist:
                 _dcw.lines.append(_hl)
+                _dcw._line_msgids.append("")
             if _hist:
                 _dcw._wrap_dirty = True
             _dcw.add_line(f"log channel {DEFAULT_CHANNEL} enabled", timestamp=True)
@@ -3760,6 +3779,7 @@ class TUI:
             hist = load_chat_history(name)
             for hl in hist:
                 win.lines.append(hl)
+                win._line_msgids.append("")
             if hist:
                 win._wrap_dirty = True
             self.windows.append(win)
@@ -3794,7 +3814,9 @@ class TUI:
                 s   = irc_strip_formatting(raw)
             wrapped.append(raw)
 
-        for line in win.lines:
+        _msgids = win._line_msgids
+        for _src_i, line in enumerate(win.lines):
+            _src_msgid = _msgids[_src_i] if _src_i < len(_msgids) else ""
             if not line:
                 wrapped.append("")
                 continue
@@ -3838,6 +3860,15 @@ class TUI:
                     line = line[sp:].lstrip()
                     s    = irc_strip_formatting(line)
                 wrapped.append(line)
+            # Inject a reactions summary line immediately after this message
+            if _src_msgid and _src_msgid in win._reactions:
+                _reacts = win._reactions[_src_msgid]
+                _rparts = []
+                for _emoji, _nicks in _reacts.items():
+                    _cnt = len(_nicks)
+                    _rparts.append(f"{_emoji}×{_cnt}" if _cnt > 1 else _emoji)
+                if _rparts:
+                    wrapped.append("  [" + "  ".join(_rparts) + "]")
 
         win.wrapped_cache    = wrapped
         win.url_map          = url_map
@@ -4739,6 +4770,7 @@ class TUI:
         h["part"]        = self._ev_part
         h["quit"]        = self._ev_quit
         h["typing"]      = self._ev_typing
+        h["react"]       = self._ev_react
         for k in ("whois", "kick", "mode", "status"):
             h[k] = self._ev_status_line
 
@@ -4771,6 +4803,8 @@ class TUI:
         ts_str    = _extra[0] if len(_extra) > 0 else None
         account   = _extra[1] if len(_extra) > 1 else ""
         is_replay = _extra[2] if len(_extra) > 2 else False
+        msgid     = _extra[3] if len(_extra) > 3 else ""
+        reply_to  = _extra[4] if len(_extra) > 4 else ""
         if nick.lower() in self.ignored_nicks:
             return
         if target.startswith("#"):
@@ -4783,11 +4817,25 @@ class TUI:
             win_name = nick
             is_chan   = False
         win = self.ensure_window(win_name, is_channel=is_chan)
+        # +reply: show a quoted preview of the referenced message
+        if reply_to:
+            ref = win._msg_store.get(reply_to)
+            if ref:
+                ref_nick, ref_prev = ref
+                p = ref_prev[:50] + "…" if len(ref_prev) > 50 else ref_prev
+                win.add_line(f"  ↩ {ref_nick}: {p}", timestamp=False)
         prefix_str = f"* {nick} " if is_action else f"<{nick}> "
         # Replay lines get a visual marker; account shown if account-tag active
         replay_mark = "[↑] " if is_replay else ""
         acc_mark    = f"[{account}]" if account else ""
-        win.add_line(f"{replay_mark}{prefix_str}{acc_mark}{msg}", ts_str=ts_str)
+        win.add_line(f"{replay_mark}{prefix_str}{acc_mark}{msg}", ts_str=ts_str, msgid=msgid)
+        # Store msgid for reply/react lookups; prune if over limit
+        if msgid:
+            if len(win._msg_store) >= 500:
+                del win._msg_store[next(iter(win._msg_store))]
+            preview = f"* {nick} {msg}" if is_action else msg
+            win._msg_store[msgid] = (nick, preview)
+            win._last_msgid = msgid
         our_nick = self._active_client().nick
         if (our_nick and nick.lower() != our_nick.lower()
                 and not self.mention_beep_muted
@@ -4834,6 +4882,21 @@ class TUI:
             expiry = time.monotonic() + (6.0 if state == "active" else 30.0)
             peers[nick_l] = [nick, state, expiry]
         if tgt == self.get_current_window().name.lower():
+            self._chat_dirty = True
+            self.dirty = True
+
+    async def _ev_react(self, event):
+        _, nick, target, msgid, emoji = event
+        win_name = target if target.startswith("#") else nick
+        wk = self._wk(self._active_server_id, win_name)
+        win = self.window_by_name.get(wk)
+        if win is None:
+            return
+        nicks = win._reactions.setdefault(msgid, {}).setdefault(emoji, [])
+        if nick not in nicks:
+            nicks.append(nick)
+        win._wrap_dirty = True
+        if win is self.get_current_window():
             self._chat_dirty = True
             self.dirty = True
 
@@ -5056,6 +5119,8 @@ class TUI:
         h["monitor"]      = self._slash_monitor
         h["whox"]         = self._slash_whox
         h["tagmsg"]       = self._slash_tagmsg
+        h["reply"]        = self._slash_reply
+        h["react"]        = self._slash_react
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -5452,6 +5517,10 @@ class TUI:
     async def _slash_clear(self, args, extra, line):
         win = self.get_current_window()
         win.lines.clear()
+        win._line_msgids.clear()
+        win._msg_store.clear()
+        win._reactions.clear()
+        win._last_msgid = ""
         win._wrap_dirty = True
 
     async def _slash_close(self, args, extra, line):
@@ -5881,6 +5950,8 @@ class TUI:
         _E("/query <nick> [message]",       "Open a DM window with nick; optionally send a first message")
         _E("/notice <nick> <text>",         "Send a notice (-nick- style, not shown in chat)")
         _E("/me <text>",                    "Send an action line  (* nick waves)")
+        _E("/reply <text>",                 "Reply to last message with +reply tag (IRCv3 message-tags)")
+        _E("/react <emoji>",                "React to last message with +react TAGMSG (IRCv3 message-tags)")
         _C("")
         _H("Channels")
         _E("/join <channel>",               "Join a channel (# is added automatically if omitted)")
@@ -6098,6 +6169,55 @@ class TUI:
                 tags[part.strip()] = ""
         c.cmd_tagmsg(target, tags)
         await self.ui_queue.put(("status", f"[tagmsg] sent to {target}: {tag_str}"))
+
+    async def _slash_reply(self, args, extra, line):
+        """Send a PRIVMSG with +reply tag referencing the last message in this window."""
+        slash_end = line.index(" ") + 1 if " " in line else len(line)
+        text = line[slash_end:].strip()
+        if not text:
+            await self.ui_queue.put(("status", "Usage: /reply <text>"))
+            return
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/reply: not in a chat window"))
+            return
+        if not win._last_msgid:
+            await self.ui_queue.put(("status",
+                "/reply: no msgid — server may not support message-tags"))
+            return
+        client = self._active_client()
+        client.send_tagged({"+reply": win._last_msgid}, f"PRIVMSG {win.name} :{text}")
+        ref = win._msg_store.get(win._last_msgid)
+        if ref:
+            ref_nick, ref_prev = ref
+            p = ref_prev[:50] + "…" if len(ref_prev) > 50 else ref_prev
+            win.add_line(f"  ↩ {ref_nick}: {p}", timestamp=False)
+        win.add_line(f"<{client.nick}> {text}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_react(self, args, extra, line):
+        """Send a +react TAGMSG to the last message in this window."""
+        emoji = args.strip()
+        if not emoji:
+            await self.ui_queue.put(("status", "Usage: /react <emoji>"))
+            return
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/react: not in a chat window"))
+            return
+        if not win._last_msgid:
+            await self.ui_queue.put(("status",
+                "/react: no msgid — server may not support message-tags"))
+            return
+        client = self._active_client()
+        client.cmd_tagmsg(win.name, {"+react": emoji, "+reply": win._last_msgid})
+        nicks = win._reactions.setdefault(win._last_msgid, {}).setdefault(emoji, [])
+        if client.nick not in nicks:
+            nicks.append(client.nick)
+        win._wrap_dirty = True
+        self._chat_dirty = True
+        self.dirty = True
 
     async def _slash_redraw(self, args, extra, line):
         channel = args.strip() or self.current_channel or ""
