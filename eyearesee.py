@@ -1953,6 +1953,8 @@ class IRCClient:
         self._replay_enabled: bool = False       # must be set True before /replay works
         self._label_seq: int = 0                 # monotonic label counter (labeled-response)
         self._pending_labels: set = set()        # labels sent on outgoing msgs, awaiting echo
+        self._whox_seq: int = 1                  # rotating token for WHOX queries (1–999)
+        self._whox_tokens: dict = {}             # token → requested-fields string
         self._cap_req_queue: list = []           # individual caps queued after a CAP NAK
         self._sasl_state: dict = {}              # per-mechanism state across AUTHENTICATE exchanges
         self._auth_buffer: str = ""              # accumulates chunked AUTHENTICATE data (>400 chars)
@@ -2207,6 +2209,8 @@ class IRCClient:
             self._current_batch_is_replay = False
             self._label_seq = 0
             self._pending_labels.clear()
+            self._whox_seq = 1
+            self._whox_tokens.clear()
             keepalive_task: Optional[asyncio.Task] = None
             writer_task:    Optional[asyncio.Task] = None
             try:
@@ -3178,7 +3182,25 @@ class IRCClient:
         await self.ui_queue.put(("status", f"[register] error: {msg}"))
 
     async def _irc_whox_reply(self, nick, params, prefix):  # 354 RPL_WHOSPCRPL
-        await self.ui_queue.put(("status", f"[who] {' '.join(params[1:])}"))
+        vals = params[1:]  # drop our nick (params[0])
+        token = vals[0] if vals else ""
+        fields = self._whox_tokens.get(token, "")
+        if fields:
+            # WHOX servers always return fields in this fixed order (§ WHOX spec),
+            # skipping any that weren't requested. 't' is first and already consumed.
+            FIELD_ORDER = "cuihsnfdlar"
+            FIELD_LABELS = {
+                'c': 'chan',  'u': 'user', 'i': 'ip',   'h': 'host',
+                's': 'server','n': 'nick', 'f': 'flags', 'd': 'hop',
+                'l': 'idle',  'a': 'acct', 'r': 'real',
+            }
+            ordered = [f for f in FIELD_ORDER if f in fields]
+            data = vals[1:]  # values after token
+            parts = [f"{FIELD_LABELS.get(f, f)}={data[i]}"
+                     for i, f in enumerate(ordered) if i < len(data)]
+            await self.ui_queue.put(("status", f"[who] {'  '.join(parts)}"))
+        else:
+            await self.ui_queue.put(("status", f"[who] {' '.join(vals)}"))
 
     async def _irc_isupport(self, nick, params, prefix):  # 005 RPL_ISUPPORT
         """Parse ISUPPORT tokens and extract useful server capabilities."""
@@ -3367,10 +3389,20 @@ class IRCClient:
     def cmd_who(self, target: str) -> None:
         self.send_raw(f"WHO {target}")
 
-    def cmd_whox(self, target: str, fields: str = "hnuraf", token: str = "100") -> None:
-        """Send WHOX query (extended WHO) when server advertises WHOX in ISUPPORT."""
+    def cmd_whox(self, target: str, fields: str = "tnhuafr") -> None:
+        """Send WHOX query (extended WHO) when server advertises WHOX in ISUPPORT.
+
+        't' is always injected so the 354 reply carries the token, letting
+        _irc_whox_reply map positional fields back to human-readable labels.
+        The token rotates 1–999 so concurrent queries don't collide.
+        """
         if "WHOX" in self._isupport:
             f = fields.replace(" ", "")
+            if "t" not in f:
+                f = "t" + f
+            token = str(self._whox_seq)
+            self._whox_seq = self._whox_seq % 999 + 1
+            self._whox_tokens[token] = f
             self.send_raw(f"WHO {target} %{f},{token}")
         else:
             self.send_raw(f"WHO {target}")
