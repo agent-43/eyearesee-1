@@ -5416,6 +5416,7 @@ class TUI:
         h["ml"] = h["multiline"] = self._slash_multiline
         h["redact"]       = self._slash_redact
         h["register"]     = self._slash_register
+        h["pem"]          = self._slash_pem
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -6572,6 +6573,77 @@ class TUI:
             return
         account, email, password = parts
         c.send_raw(f"REGISTER {account} {email} :{password}")
+
+    async def _slash_pem(self, args, extra, line):
+        """Generate a NIST P-256 key pair for SASL ECDSA-NIST256P-CHALLENGE.
+
+        Saves the private key to a PEM file, sends the public key to NickServ
+        with SET PUBKEY, and updates irc_config.json to use the new key.
+
+        Usage: /pem [/path/to/output.pem]
+        Default path: <script_dir>/<nick>_sasl.pem
+        """
+        if not CRYPTOGRAPHY_AVAILABLE:
+            await self.ui_queue.put(("status",
+                "[pem] requires the 'cryptography' package — pip install cryptography"))
+            return
+
+        c = self._active_client()
+        key_path = args.strip() if args.strip() else \
+            os.path.join(os.getcwd(), f"{c.nick}_sasl.pem")
+
+        # Generate ECDSA P-256 key pair.
+        try:
+            private_key = _ecdsa_ec.generate_private_key(_ecdsa_ec.SECP256R1())
+        except Exception as exc:
+            await self.ui_queue.put(("status", f"[pem] key generation failed: {exc}"))
+            return
+
+        # Persist private key as unencrypted PKCS8 PEM.
+        try:
+            from cryptography.hazmat.primitives.serialization import (
+                Encoding, PrivateFormat, PublicFormat, NoEncryption,
+            )
+            pem_bytes = private_key.private_bytes(
+                encoding=Encoding.PEM,
+                format=PrivateFormat.PKCS8,
+                encryption_algorithm=NoEncryption(),
+            )
+            with open(key_path, "wb") as _kf:
+                _kf.write(pem_bytes)
+        except Exception as exc:
+            await self.ui_queue.put(("status", f"[pem] failed to save private key: {exc}"))
+            return
+
+        # Encode public key as base64 of the uncompressed EC point (0x04 || X || Y).
+        # This is the format Atheme NickServ expects for SET PUBKEY.
+        try:
+            pub_bytes = private_key.public_key().public_bytes(
+                encoding=Encoding.X962,
+                format=PublicFormat.UncompressedPoint,
+            )
+            pub_b64 = base64.b64encode(pub_bytes).decode()
+        except Exception as exc:
+            await self.ui_queue.put(("status", f"[pem] failed to encode public key: {exc}"))
+            return
+
+        # Send public key to NickServ.
+        c.cmd_service("NickServ", f"SET PUBKEY {pub_b64}")
+
+        # Persist key path and mechanism to irc_config.json so the next launch
+        # automatically uses ECDSA without manual env-var setup.
+        try:
+            _cfg = load_irc_config()
+            _cfg["sasl_key"]       = key_path
+            _cfg["sasl_mechanism"] = "ECDSA-NIST256P-CHALLENGE"
+            save_irc_config(_cfg)
+        except Exception:
+            pass
+
+        await self.ui_queue.put(("status", f"[pem] private key saved → {key_path}"))
+        await self.ui_queue.put(("status", f"[pem] public key sent to NickServ (SET PUBKEY)"))
+        await self.ui_queue.put(("status",
+            "[pem] irc_config.json updated: sasl_mechanism=ECDSA-NIST256P-CHALLENGE"))
 
     async def _slash_redraw(self, args, extra, line):
         channel = args.strip() or self.current_channel or ""
