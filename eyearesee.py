@@ -1124,6 +1124,20 @@ AI_TELL_PHRASES = frozenset({
     "navigating the", "landscape of", "realm of",
     "leverage", "synergize", "holistic approach",
     "robust solution", "empower", "cutting-edge",
+    # Deliberative / thinking-aloud phrases (Claude 3/4, GPT-4o)
+    "let me think through", "here's my thinking",
+    "to put it another way", "to be more specific",
+    "broadly speaking", "in practical terms",
+    "at a high level", "drill down into",
+    "the key takeaway", "the main takeaway",
+    "worth unpacking", "let me unpack",
+    "when it comes to", "in real-world terms",
+    # 2026 additions — newer stylistic tics across all frontier models
+    "i think it's worth", "one thing to consider",
+    "it depends on", "the short answer is",
+    "the long answer is", "to answer directly",
+    "to give you a direct answer", "what i'd say is",
+    "here's the thing:", "the thing is,",
 })
 
 # Phrases characteristic of Llama 2 / Llama 3 / Mistral / open-source LLMs
@@ -1169,6 +1183,18 @@ LLAMA_TELL_PHRASES = frozenset({
     "my understanding is", "based on my knowledge",
     "as of my last update", "as of my knowledge",
     "as of my training", "my response to this",
+    # Additional open-source LLM openers (Qwen, Gemma, Mistral, Phi)
+    "i can certainly help", "i can help you with",
+    "let me outline", "here's a quick overview",
+    "here's a quick summary", "to break it down",
+    "step by step:", "step-by-step guide",
+    "here's what i'd suggest", "happy to elaborate",
+    "glad you asked", "great, let me",
+    "to put it simply,", "simply put,",
+    # Qwen3 / DeepSeek thinking-mode bleed-through (internal CoT leaking)
+    "let me think step by step", "thinking step by step",
+    "let me reason through", "let me work through",
+    "so first, let me", "ok, so the question",
 })
 
 # Vocabulary LLMs reach for that humans rarely use in casual IRC chat
@@ -1200,7 +1226,11 @@ _BOT_OPENER_RE = re.compile(
     r"^(?:Sure[!,]?|Absolutely[!,]?|Certainly[!,]?|Of course[!,]?|"
     r"Great[!,]?|Gladly[!,]?|Happy to help[!,]?|I'?d be happy|"
     r"I'?d be glad|Let me|Here'?s |Here are |To answer|"
-    r"Of course[,!] I'?d|I can help|I'?ll help)",
+    r"Of course[,!] I'?d|I can help|I'?ll help|"
+    r"I can certainly|Allow me|Thanks for (?:asking|the question)|"
+    r"Good (?:question|point)[!,.]?|That'?s (?:a )?(?:great|good|interesting)|"
+    r"To (?:address|answer|respond to)|I'?ll (?:break|walk|explain|outline)|"
+    r"Step(?:\s+\d+)?[:.]\s*\w)",
     re.IGNORECASE,
 )
 
@@ -1616,6 +1646,8 @@ class EnsembleAIDetector:
         """
         if self._gpt2_tok is None or self._gpt2_model is None or self._obs_model is None:
             return 0.0
+        if len(text.split()) < 5:
+            return 0.0
         try:
             enc = self._gpt2_tok(text, return_tensors="pt", truncation=True, max_length=128)
             enc = {k: v.to(self._device) for k, v in enc.items()}
@@ -1645,6 +1677,8 @@ class EnsembleAIDetector:
         If cls2 failed to load only cls1 is used.
         """
         scores: List[float] = []
+        if len(text.split()) < 5:
+            return 0.0
         try:
             enc = self._cls_tok(text, return_tensors="pt", truncation=True, max_length=128)
             enc = {k: v.to(self._device) for k, v in enc.items()}
@@ -1696,16 +1730,31 @@ class EnsembleAIDetector:
                 pass  # evicted by a concurrent thread between get() and move_to_end()
             return cached  # type: ignore[return-value]
 
+        # Reasoning-model CoT leakage: <think>...</think> tags from Qwen3 / DeepSeek-R1
+        # bleeding into chat are unambiguous AI evidence — skip all other scoring.
+        if re.search(r'</?think\b', text, re.IGNORECASE):
+            _certain: Dict[str, float] = {
+                "prob": 1.0, "heu": 1.0, "llama": 1.0, "bino": 1.0, "cls": 1.0}
+            if len(self._pred_cache) >= self._CACHE_MAX:
+                self._pred_cache.popitem(last=False)
+            self._pred_cache[text] = _certain
+            return _certain
+
         llama = self.llama_pattern_score(text)
         heu   = self._heuristic_score(text)
         bino  = self._binoculars_score(text)
         cls   = self._classifier_score(text)
 
-        # Ensemble: classifiers are the strongest ML signals; heuristics now carry
-        # more weight than before because the Llama pattern layer is precise and
-        # low-FP on IRC traffic.  Binoculars is stable but misses some open-source
-        # LLMs, so its weight is trimmed slightly.
-        prob = max(0.0, min(1.0, 0.35 * bino + 0.35 * cls + 0.30 * heu))
+        # Adaptive ensemble: ML models are unreliable on short IRC messages
+        # (< 8 words) — weight heuristics much higher there.  For long text
+        # (>= 30 words) Binoculars and the classifiers become more trustworthy.
+        n_words = len(text.split())
+        if n_words < 8:
+            prob = max(0.0, min(1.0, 0.12 * bino + 0.13 * cls + 0.75 * heu))
+        elif n_words < 30:
+            prob = max(0.0, min(1.0, 0.35 * bino + 0.35 * cls + 0.30 * heu))
+        else:
+            prob = max(0.0, min(1.0, 0.38 * bino + 0.37 * cls + 0.25 * heu))
 
         # High-confidence override: unambiguous Llama structural output in short
         # IRC messages should score high even when ML signals are uncertain.
@@ -1818,10 +1867,10 @@ class ScoringEngine:
         )
 
     def score_user(self, user_state) -> int:
-        return min(99, user_state.total_msgs // 2)
+        return int(user_state.rolling_ai_likelihood())
 
     def score_message(self, msg_state, user_state) -> int:
-        return 50
+        return int(user_state.rolling_ai_likelihood())
 
 # =========================
 # UserState + ChatWindow
@@ -3486,6 +3535,29 @@ class IRCClient:
                 if fp_sim > 0.0:
                     # Max +35 percentage points at full similarity; tapers off smoothly.
                     prob = min(1.0, prob + 0.35 * fp_sim)
+
+                # Behavioral: timing regularity — bots tend to post at very uniform
+                # intervals.  Coefficient of variation (std/mean) of inter-message
+                # gaps below 0.30 is unusual for human IRC typing; below 0.15 is
+                # near-impossible outside scripted clients.
+                if len(u_state.msg_times) >= 6:
+                    _times = list(u_state.msg_times)
+                    _mean_t = sum(_times) / len(_times)
+                    if _mean_t > 0.5:  # ignore burst-typing noise
+                        _var = sum((t - _mean_t) ** 2 for t in _times) / len(_times)
+                        _cv = (_var ** 0.5) / _mean_t
+                        if _cv < 0.15:
+                            prob = min(1.0, prob + 0.20)
+                        elif _cv < 0.30:
+                            prob = min(1.0, prob + 0.10)
+
+                # Rolling momentum: if this user is already tracking as AI across
+                # several past messages, give new messages a small confidence nudge
+                # so the rolling average crosses the suspect threshold faster.
+                _rolling_prior = u_state.rolling_ai_likelihood()
+                if _rolling_prior >= 75.0 and len(u_state.ai_scores) >= 4:
+                    prob = min(1.0, prob + 0.10)
+
                 a_score = int(prob * 100)
         except asyncio.CancelledError:
             # Task cancelled (e.g. during shutdown) — log the partial result before
