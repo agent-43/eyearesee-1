@@ -114,9 +114,9 @@ DEFAULT_NICK = "cfuser"
 DEFAULT_CHANNEL = "##anime"
 NICKSERV_PASSWORD = os.environ.get("IRC_NICKSERV_PASSWORD", "")
 # SASL mechanism and credential paths.  Supported mechanisms:
-#   PLAIN                    — password in IRC_NICKSERV_PASSWORD (default)
-#   EXTERNAL                 — TLS client certificate (IRC_SASL_CERT + IRC_SASL_KEY)
+#   PLAIN                    — password in IRC_NICKSERV_PASSWORD [default]
 #   SCRAM-SHA-256            — RFC-5802 SCRAM (password in IRC_NICKSERV_PASSWORD)
+#   EXTERNAL                 — TLS client certificate (IRC_SASL_CERT + IRC_SASL_KEY)
 #   ECDSA-NIST256P-CHALLENGE — EC challenge-response (IRC_SASL_KEY; needs 'cryptography' pkg)
 SASL_MECHANISM = os.environ.get("IRC_SASL_MECHANISM", "PLAIN").upper()
 SASL_CERT      = os.environ.get("IRC_SASL_CERT", "")   # path to PEM client certificate
@@ -231,12 +231,11 @@ def load_irc_config() -> dict:
         pass
     return {}
 
-def save_irc_config(server: str, port: int, nick: str, channel: str) -> None:
-    """Persist server/nick/channel (never the password) for next launch."""
+def save_irc_config(cfg: dict) -> None:
+    """Persist all settings to irc_config.json."""
     try:
         with open(IRC_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump({"server": server, "port": port,
-                       "nick": nick, "channel": channel}, f, indent=2)
+            json.dump(cfg, f, indent=2)
     except OSError:
         pass
 
@@ -2563,6 +2562,14 @@ class IRCClient:
     async def _sasl_scram_sha256(self, server_data: str) -> None:
         """SCRAM-SHA-256 (RFC 5802) state machine."""
         step = self._sasl_state.get("step", 0)
+
+        if step == 0 and not NICKSERV_PASSWORD:
+            await self.ui_queue.put((
+                "status",
+                "[SASL] SCRAM-SHA-256 requires IRC_NICKSERV_PASSWORD — aborting"))
+            self.send_raw("AUTHENTICATE *")
+            self._sasl_state = {}
+            return
 
         if step == 0:
             # Server sent "+" — begin exchange with client-first-message.
@@ -7151,7 +7158,10 @@ def _ensure_deps() -> bool:
 
 
 def main():
-    global DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, DEFAULT_CHANNEL, NICKSERV_PASSWORD
+    global DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, DEFAULT_CHANNEL
+    global NICKSERV_PASSWORD, SASL_MECHANISM, SASL_CERT, SASL_KEY
+    global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GITHUB_TOKEN
+    global OLLAMA_URL, LLAMACPP_URL
 
     # Ensure the pre-curses terminal output can render Unicode box-drawing
     # characters and symbols on Windows (default console codec is cp1252).
@@ -7175,16 +7185,26 @@ def main():
     print("╚══════════════════════════════════════╝")
     print("  Press Enter to accept the [default].\n")
 
-    # Pre-populate defaults from last session (server/nick/channel only).
+    # Load all settings from irc_config.json; env vars are the fallback already
+    # applied at module level.  Config file takes precedence over env vars.
     _saved = load_irc_config()
-    if _saved.get("server"):
-        DEFAULT_SERVER = _saved["server"]
-    if _saved.get("port"):
-        DEFAULT_PORT = int(_saved["port"])
-    if _saved.get("nick"):
-        DEFAULT_NICK = _saved["nick"]
-    if _saved.get("channel"):
-        DEFAULT_CHANNEL = _saved["channel"]
+
+    if _saved.get("server"):        DEFAULT_SERVER     = _saved["server"]
+    if _saved.get("port"):          DEFAULT_PORT       = int(_saved["port"])
+    if _saved.get("nick"):          DEFAULT_NICK       = _saved["nick"]
+    if _saved.get("channel"):       DEFAULT_CHANNEL    = _saved["channel"]
+    if _saved.get("sasl_mechanism"):SASL_MECHANISM     = _saved["sasl_mechanism"].upper()
+    if _saved.get("sasl_cert"):     SASL_CERT          = _saved["sasl_cert"]
+    if _saved.get("sasl_key"):      SASL_KEY           = _saved["sasl_key"]
+    if _saved.get("nickserv_password"): NICKSERV_PASSWORD = _saved["nickserv_password"]
+    if _saved.get("anthropic_api_key"): ANTHROPIC_API_KEY = _saved["anthropic_api_key"]
+    if _saved.get("openai_api_key"):    OPENAI_API_KEY    = _saved["openai_api_key"]
+    if _saved.get("deepseek_api_key"):  DEEPSEEK_API_KEY  = _saved["deepseek_api_key"]
+    if _saved.get("github_token"):      GITHUB_TOKEN      = _saved["github_token"]
+    if _saved.get("ollama_url"):        OLLAMA_URL        = _saved["ollama_url"]
+    if _saved.get("llamacpp_url"):      LLAMACPP_URL      = _saved["llamacpp_url"]
+
+    # ── IRC connection ───────────────────────────────────────────────────────────
 
     # Server — accepts host  or  host:port
     raw = input(f"  Server   [{DEFAULT_SERVER}] : ").strip()
@@ -7214,13 +7234,77 @@ def main():
         DEFAULT_CHANNEL = re.sub(r'[\x00-\x07\x09-\x1f\x7f ,]', '', DEFAULT_CHANNEL)[:50] \
                           or DEFAULT_CHANNEL
 
-    # NickServ password — hidden input, blank = skip (never saved to disk)
-    raw = getpass.getpass("  NickServ password (blank to skip) : ")
+    # ── SASL ────────────────────────────────────────────────────────────────────
+
+    _mech_hint = f"PLAIN/SCRAM-SHA-256/EXTERNAL/ECDSA-NIST256P-CHALLENGE"
+    raw = input(f"  SASL     [{SASL_MECHANISM}] ({_mech_hint}) : ").strip().upper()
+    if raw:
+        SASL_MECHANISM = raw
+
+    # NickServ / SASL password (PLAIN and SCRAM-SHA-256)
+    _pw_hint = "[configured]" if NICKSERV_PASSWORD else "blank to skip"
+    raw = getpass.getpass(f"  Password ({_pw_hint}) : ")
     if raw:
         NICKSERV_PASSWORD = raw
 
-    # Persist server/nick/channel for next launch (password deliberately excluded).
-    save_irc_config(DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, DEFAULT_CHANNEL)
+    # Cert/key paths — only relevant for EXTERNAL and ECDSA
+    if SASL_MECHANISM in ("EXTERNAL", "ECDSA-NIST256P-CHALLENGE"):
+        if SASL_MECHANISM == "EXTERNAL":
+            _cert_hint = SASL_CERT or "path to PEM cert"
+            raw = input(f"  SASL cert [{_cert_hint}] : ").strip()
+            if raw:
+                SASL_CERT = raw
+        _key_hint = SASL_KEY or "path to PEM key"
+        raw = input(f"  SASL key  [{_key_hint}] : ").strip()
+        if raw:
+            SASL_KEY = raw
+
+    # ── AI API keys ──────────────────────────────────────────────────────────────
+
+    print()
+    print("  AI API keys — press Enter to keep existing value, '-' to clear.")
+
+    def _prompt_key(label: str, current: str) -> str:
+        hint = "[configured]" if current else "blank to skip"
+        val = input(f"  {label:<22} ({hint}) : ").strip()
+        if val == "-":
+            return ""
+        return val if val else current
+
+    ANTHROPIC_API_KEY = _prompt_key("Anthropic API key", ANTHROPIC_API_KEY)
+    OPENAI_API_KEY    = _prompt_key("OpenAI API key",    OPENAI_API_KEY)
+    DEEPSEEK_API_KEY  = _prompt_key("DeepSeek API key",  DEEPSEEK_API_KEY)
+    GITHUB_TOKEN      = _prompt_key("GitHub token",      GITHUB_TOKEN)
+
+    print()
+    print("  Local inference servers (press Enter to keep).")
+    raw = input(f"  Ollama URL    [{OLLAMA_URL}] : ").strip()
+    if raw:
+        OLLAMA_URL = raw
+    raw = input(f"  llama.cpp URL [{LLAMACPP_URL}] : ").strip()
+    if raw:
+        LLAMACPP_URL = raw
+
+    # ── Persist everything to irc_config.json ───────────────────────────────────
+    _cfg: dict = {
+        "server":            DEFAULT_SERVER,
+        "port":              DEFAULT_PORT,
+        "nick":              DEFAULT_NICK,
+        "channel":           DEFAULT_CHANNEL,
+        "sasl_mechanism":    SASL_MECHANISM,
+        "nickserv_password": NICKSERV_PASSWORD,
+        "ollama_url":        OLLAMA_URL,
+        "llamacpp_url":      LLAMACPP_URL,
+    }
+    # Cert/key only written when non-empty (paths are sensitive enough to omit
+    # if unused, and writing empty strings would clutter the file).
+    if SASL_CERT:     _cfg["sasl_cert"]          = SASL_CERT
+    if SASL_KEY:      _cfg["sasl_key"]            = SASL_KEY
+    if ANTHROPIC_API_KEY: _cfg["anthropic_api_key"] = ANTHROPIC_API_KEY
+    if OPENAI_API_KEY:    _cfg["openai_api_key"]    = OPENAI_API_KEY
+    if DEEPSEEK_API_KEY:  _cfg["deepseek_api_key"]  = DEEPSEEK_API_KEY
+    if GITHUB_TOKEN:      _cfg["github_token"]       = GITHUB_TOKEN
+    save_irc_config(_cfg)
 
     print(f"\n  → {DEFAULT_SERVER}:{DEFAULT_PORT} (SSL)  nick={DEFAULT_NICK}"
           + (f"  channel={DEFAULT_CHANNEL}" if DEFAULT_CHANNEL else ""))
