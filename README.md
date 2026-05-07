@@ -1,11 +1,3 @@
-# 🤖 eyearesee — Terminal IRC Client with AI Detection
-
-**eyearesee.py** is a single-file, ~6,205-line Python 3 IRC (Internet Relay Chat) client that runs in the terminal as a curses-based Text User Interface (TUI). The name is a phonetic spelling of "I-R-C."
-
-Beyond being a fully featured IRC client, it features a unique headline feature: it scores every message with an ensemble of AI/LLM-detection models, flagging users whose chat appears machine-generated.
-
----
-
 ## 🚀 Quick Start
 
 To run the core client without installing dependencies or enabling AI detection:
@@ -13,81 +5,113 @@ To run the core client without installing dependencies or enabling AI detection:
 
 python eyearesee.py --no-ai --no-install
 
-Installation & Setup Notes
-Help: For further usage help, type /commands in the client.
-Feature Suggestions: Thank you Amigojapan for feature list suggestions! Check out his page: https://github.com/amigojapan
-Windows LLM Setup (Optional): If you wish to enable local AI detection on Windows, you can install an LLM (e.g., llama.cpp) and run the server:
+Eye Are See IRC Client 👁️
+Eye Are See is a highly advanced, feature-rich, and intelligent IRC client built in Python, designed for serious IRC users, developers, and anyone interested in analyzing communication patterns, particularly the detection of AI-generated content.
+
+It combines a powerful, modern Curses-based Terminal User Interface (TUI) with deep machine learning and linguistic analysis capabilities to give you unprecedented insight into your chat environment.
+
+✨ Features at a Glance
+🧠 Advanced AI & Bot Detection
+Ensemble AI Scoring: Uses an ensemble of large models (Anthropic Claude, OpenAI GPT, Ollama, Llama.cpp) to generate a detailed AI probability score for every message.
+Linguistic Heuristics: Combines ML predictions with classical linguistic analysis (formality, repetition, structural patterns) to create a robust, multi-layered assessment.
+Bot Fingerprinting: Learns the unique vocabulary, bigrams, and trigrams of confirmed bot users to detect similar writing styles in other users.
+Real-time Monitoring: Tracks user AI likelihood, message frequency, and typing regularity to flag suspicious behavior.
+AI Interaction Commands:
+/askai [model] <question>: Query any configured model and see the answer in the dashboard.
+/summarize [n] [model]: Generate a structured summary of the last n messages in a window using an AI model.
+/model [key]: Set or list available AI models (e.g., gpt4o, gemma, sonnet).
+Bot Management: /bot and /unbot commands to confirm or remove confirmed AI users.
+AI Toggle: /aitoggle to enable or disable all AI scoring features.
+🖥️ Advanced Terminal UI (Curses)
+Multi-Server Support: Connect and manage multiple IRC servers in parallel via /server.
+Tabbed Interface: Organize channels, status, and dashboards in a clean, navigable tab bar.
+Line Wrapping: Intelligent line wrapping that correctly handles CJK (East Asian) characters and Unicode grapheme clusters, ensuring perfect terminal display.
+URL Clicking: Left-click highlighted URLs in the chat window to open them in your default browser.
+Input History: Full history logging and Ctrl+Up/Down navigation.
+Real-time Feedback: Instantaneous input drawing for a smooth typing experience.
+⚙️ Robust IRCv3 & Network Features
+SASL Support: Secure connections via PLAIN, SCRAM-SHA-256, EXTERNAL (client certs), and ECDSA-NIST256P-CHALLENGE.
+CTCP Support: Send IRCv3 control messages (PING, VERSION, TIME, CLIENTINFO, FINGER) to the server.
+Message Tags: Full support for IRCv3 tags like MESSAGE-REDACTION, MARKREAD, and TAGMSG.
+Auto-Translation: Automatically translates CJK messages into English.
+Plugin System: Dynamically load and unload custom Python plugins to extend client functionality.
+🚀 Installation
+Eye Are See requires Python 3.8+ and relies on pip for dependency management.
+
+Prerequisites
+Ensure you have Python installed.
+
+Dependencies
+Eye Are See automatically checks for and installs necessary packages for AI detection and Curses support.
+
 bash
 
-winget install llama.cpp
-llama-server -hf ggml-org/gemma-4-E2B-it-GGUF --jinja -c 0 --host 127.0.0.1 --port 8033
-You can then use the /model command in the IRC client to utilize the local model.
-At a Glance
-Feature	Description
-Type	Asynchronous (asyncio) terminal IRC client with a curses-based text UI.
-Default Target	irc.libera.chat:6697 over SSL, channel ##anime.
-Platforms	Linux, macOS, and Windows (auto-installs windows-curses if missing).
-Auto-Bootstrap	On first run, it pip-installs missing optional dependencies and restarts itself.
-Storage	All data (logs, AI scores, history) lives next to the script, ensuring persistence even in read-only directories.
-🛠️ Core Features
-💬 IRC Client Capabilities
-eyearesee implements a near-complete IRC feature set, including:
+# Install all required dependencies (transformers, torch, anthropic, openai, etc.)
+# If you run the script, it will automatically detect missing packages and prompt you to install them.
+pip install eyearesee
+Note: The AI detection components require transformers and torch. If installation fails, please check your environment and ensure you have the necessary hardware (CPU/GPU) if you intend to use the ML features.
 
-Messaging: /msg, /query, /notice, /me
-Channel Operations: /join, /part, /topic, /kick, /invite, /names
-Operator Commands: /op, /voice, /ban, etc.
-Services: /ns (NickServ), /cs (ChanServ), /ctcp
-User Info: /whois, /whowas, /who, /away//back, /ignore
-Connection Management: /server (for parallel connections) and /reconnect.
-Notable Refinements:
+⚙️ Configuration
+Configuration is handled via environment variables, a configuration file (irc_config.json), or interactive prompts upon startup.
 
-IRCv3 Parsing: Supports message-tag parsing so server-time-tagged messages are not dropped.
-Theming: Five built-in color themes (Classic, Hacker, Ocean, Sunset, Neon) selectable with /theme.
-CJK Handling: Wide-character support ensures Japanese, Chinese, and Korean text aligns correctly in fixed-width terminal columns.
-Auto-Translation: Toggle for automatic translation of CJK messages.
-Persistence: Persistent input history (up to 500 lines) across sessions and per-window persistent chat logs.
-Formatting: Inline IRC formatting (bold, italic, underline, color codes) with a performance-optimized parse cache.
-URL Detection: Automatic detection of URLs within messages.
-🧠 The AI-Detection System (Distinguishing Feature)
-Every incoming PRIVMSG is analyzed by the EnsembleAIDetector, which combines four distinct signals to generate a holistic score.
+1. Server & Nick
+These are set interactively upon launch, or via irc_config.json.
 
-Detection Signals:
-Heuristic Score: Pattern matching against curated phrase sets, formality levels, contraction usage, capitalization, and presence of casual IRC tokens (e.g., lol, lmao, brb).
-Llama Pattern Score: Structural detection of machine-generated patterns, such as markdown lists, numbered enumerations, colon-introduced lists, abnormally long messages, and templated multi-sentence structures.
-Binoculars Score: Uses the Hans et al. (2024) cross-entropy ratio method employing two GPT-2-family models for structural analysis.
-Classifier Score: Averaged probability from two HuggingFace transformer classifiers.
-These scores are blended into a 0-100 ensemble score, with an override that boosts scores for high-confidence Llama structural patterns. Models can be disabled entirely via the --no-ai flag.
+Server: DEFAULT_SERVER (e.g., irc.libera.chat or server:host:port).
+Nick: DEFAULT_NICK.
+Channel: DEFAULT_CHANNEL (prefixed with # if omitted).
+2. SASL Credentials
+If using secure authentication, configure these via the interactive prompt or irc_config.json.
 
-Flagging: Users above a threshold (default 70) are flagged as "suspect" and highlighted.
-Detection Commands:
-/ai: Shows a full profile with a sparkline and verdict.
-/topai: Ranks users by their AI suspicion score in the current channel.
-/bot: Marks a user as confirmed AI and builds a vocabulary/n-gram fingerprint.
-/unbot: Removes the bot marking.
-Logging: Every detection is logged as a JSONL record to ai_scores.log.
-💡 LLM Integration
-The client supports sending messages to various Large Language Models via /askai and /summarize.
+IRC_SASL_MECHANISM: PLAIN, SCRAM-SHA-256, EXTERNAL, or ECDSA-NIST256P-CHALLENGE.
+IRC_NICKSERV_PASSWORD: Password for PLAIN/SCRAM mechanisms.
+IRC_SASL_CERT / IRC_SASL_KEY: Paths to PEM files for EXTERNAL or ECDSA-NIST256P-CHALLENGE.
+3. AI API Keys (Optional)
+Set these via the /api command or environment variables.
 
-Supported Backends:
+Variable	Description	Commands
+ANTHROPIC_API_KEY	Anthropic API Key	/api ANTHROPIC_API_KEY <value>
+OPENAI_API_KEY	OpenAI API Key	/api OPENAI_API_KEY <value>
+DEEPSEEK_API_KEY	DeepSeek API Key	/api DEEPSEEK_API_KEY <value>
+GITHUB_TOKEN	GitHub Copilot Token	/api GITHUB_TOKEN <value>
+OLLAMA_URL	Local Ollama Server URL	/api OLLAMA_URL <url>
+LLAMACPP_URL	Local llama.cpp Server URL	/api LLAMACPP_URL <url>
+💬 Basic Usage
+Start the client, and use the /help command for a full list of commands.
 
-Anthropic Claude (Cloud)
-OpenAI (Cloud)
-Ollama (Local)
-llama.cpp (Local)
-API keys are read from environment variables or can be set at runtime using /api. The default model is qwen3 running locally via llama.cpp.
+Core Commands:
 
-🧩 Plugin System
-The architecture supports hot-reloadable plugins via the /loadplugin command. Any Python file with a setup(api) function can register custom slash commands, extending the client's functionality easily.
+Command	Usage	Description
+/join	/join #channel	Join a channel.
+/part	/part #channel [message]	Leave a channel.
+/nick	/nick newnick	Change your nickname.
+/msg	/msg <nick> <text>	Send a private message (opens DM window).
+/query	/query <nick> [message]	Open a DM window with a nick; optionally send a first message.
+/mode	/mode <target> [modes]	Get or set channel/user modes (+o, -o, +v, -v, +h, -h, +b, -b).
+/kick	/kick <chan> <nick> [reason]	Kick a user from a channel.
+/whois	/whois <nick>	Look up user information (shown in status window).
+/server	/server [-ssl] <host> [port]	Connect to a new IRC server in parallel.
+🤖 AI & Bot Analysis Usage
+These features require the AI detection module to be enabled (/aitoggle).
 
-🏗️ Architecture
-The project is organized into ten classes and a large block of module-level utilities, ensuring clear separation of concerns:
+AI Interaction
+/askai [model] <question>: Ask a question using a specified model (e.g., /askai gpt4o "Explain quantum entanglement.").
+/summarize [n] [model]: Summarize the last n messages in the current window.
+/model [key]: View or set the AI model for future /askai and /summarize calls.
+Bot Management
+/bot <nick>: Mark a nick as a confirmed bot/AI. The client will build a linguistic fingerprint from their messages.
+/unbot <nick>: Remove the confirmed bot status and fingerprint for a user.
+/topai: View a ranked list of users in the current channel, sorted by their rolling AI score.
+📝 Persistence and Logging
+Eye Are See automatically logs detailed AI scores to ai_scores.log and maintains input history to ensure no activity is lost.
 
-IRCClient: Handles the network layer and connection management.
-TUI: Manages the curses interface and terminal display.
-ChatWindow / UserState / ServerContext: Manages per-window and per-user state tracking.
-EnsembleAIDetector: The core LLM detection engine.
-BotFingerprint / ScoringEngine: Handles confirmed-bot fingerprinting and score aggregation.
-PluginAPI / PluginManager: Implements the hot-reloadable plugin system.
-The codebase includes performance optimizations (LRU caches, O(1) lookups, chunked log reading) and defensive coding practices.
+AI Score Log (ai_scores.log): Stores every message with detailed scores (AI probability, heuristic scores, Llama patterns, classifier probabilities, etc.) for auditing and analysis.
+Chat History: Message history is persisted to disk and loaded efficiently, ensuring the chat window state is maintained across sessions.
+🛠️ Plugins
+Eye Are See supports a flexible plugin architecture.
 
+/loadplugin <path>: Load a Python plugin file.
+/unloadplugin <name>: Unload a plugin.
+/reloadplugin <name>: Reload a plugin from its source file (hot-swap).
+/plugins: List all currently loaded plugins and their available commands.
 Summary: eyearesee is an unusually ambitious single-file project: a polished, IRCv3-compliant terminal IRC client merged with a four-signal AI text detector and a multi-provider LLM chat interface, all in one script with minimal external dependencies.
