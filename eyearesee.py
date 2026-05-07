@@ -1951,6 +1951,10 @@ class ChatWindow:
         self._last_wrap_width = 0
         self.scroll_offset: int = 0  # 0 = pinned to bottom
         self._persist = True         # write new lines to disk
+        # Optional override for the on-disk log filename.  Defaults to
+        # self.name; used to disambiguate multiple windows that share a name
+        # across servers (e.g. each server's own *status* window).
+        self._log_name: str = ""
 
     def add_line(self, text: str, timestamp: bool = True,
                  ts_str: Optional[str] = None, msgid: str = "") -> None:
@@ -1961,7 +1965,7 @@ class ChatWindow:
         self._line_msgids.append(msgid)
         self._wrap_dirty = True
         if self._persist:
-            append_chat_line(self.name, text)
+            append_chat_line(self._log_name or self.name, text)
 
 # Reuse one SSL context across all connections (parsing the CA bundle is expensive).
 _SSL_CTX = ssl.create_default_context()
@@ -3506,6 +3510,13 @@ class IRCClient:
                             u_state: "UserState", u_score: int, m_score: int) -> None:
         """Run AI inference off the read loop, then push an update event."""
         if not self.scoring.ai_detector.enabled:
+            # AI detection off (--no-ai or /aitoggle), but we still want a
+            # complete audit trail in ai_scores.log.  Skip record_message so
+            # the rolling-average isn't polluted with synthetic zeros.
+            log_ai_event(
+                nick, target, msg, u_score, m_score, 0,
+                int(u_state.rolling_ai_likelihood()),
+            )
             return
         a_score = 0
         detail: Dict[str, float] = {"prob": 0.0, "heu": 0.0, "bino": 0.0, "cls": 0.0, "llama": 0.0}
@@ -3578,10 +3589,18 @@ class IRCClient:
             )
             raise
         except Exception:
-            # Inference failed for some other reason. Don't pretend
-            # the score was 0 — that would skew the rolling AI
-            # average toward 'human' and mislead the suspect heuristic.
-            # Drop this message from scoring entirely.
+            # Inference failed for some other reason (timeout, ML error, etc).
+            # Don't record_message — that would skew the rolling AI average
+            # toward 'human' and mislead the suspect heuristic — but still
+            # write the message to ai_scores.log so the audit trail is
+            # complete.  Whatever partial signals we managed to compute are
+            # preserved in `detail`; un-set fields stay at 0.0.
+            log_ai_event(
+                nick, target, msg, u_score, m_score, a_score,
+                int(u_state.rolling_ai_likelihood()),
+                heu_score=detail["heu"], bino_score=detail["bino"],
+                cls_score=detail["cls"], llama_score=detail["llama"],
+            )
             return
         u_state.record_message(msg, a_score)
         rolling_ai = int(u_state.rolling_ai_likelihood())
@@ -3796,6 +3815,11 @@ class TUI:
         _psid = self._primary_server_id
         for name in ("*status*", "*dashboard*"):
             win = ChatWindow(name, is_channel=False, server_id=_psid)
+            # *dashboard* is a synthetic view that's rebuilt by clearing
+            # in-memory lines and re-adding everything; persisting it would
+            # accumulate identical rebuild dumps in chat_logs/ for no value.
+            if name == "*dashboard*":
+                win._persist = False
             self.windows.append(win)
             self.window_by_name[name] = win
 
@@ -5941,7 +5965,9 @@ class TUI:
         # Create a dedicated status window for this server.
         sw_wk = self._wk(new_sid, "*status*")
         sw    = ChatWindow("*status*", is_channel=False, server_id=new_sid)
-        sw._persist = False
+        # Persist to a per-server filename so secondary servers' status
+        # streams aren't collapsed into the primary's _status_.log.
+        sw._log_name = f"*status*-{new_sid}"
         self.windows.append(sw)
         self.window_by_name[sw_wk] = sw
         self.current_window_index = self.windows.index(sw)
