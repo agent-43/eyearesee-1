@@ -3907,7 +3907,10 @@ class TUI:
         self._input_dirty   = True
 
         # Cached window dimensions (updated only on resize)
-        self._tw     = max(1, self.chat_win.getmaxyx()[1] - 1)   # chat text cols
+        # Compute _tw from the logical expected width, not getmaxyx(), so that a
+        # silently-failed chat_win.resize() can't leave _tw at the old oversized
+        # value and cause text/erase to bleed into the userlist area.
+        self._tw     = max(1, max(1, self.width - self.userlist_width) - 1)
         self._uw     = max(1, self.userlist_width - 2)            # userlist interior cols
         self._input_w = max(1, self.input_win.getmaxyx()[1] - 4) # input text cols
 
@@ -3995,7 +3998,7 @@ class TUI:
 
     def _chat_text_width(self) -> int:
         """Usable text columns in the chat window (leaves 1-col right margin)."""
-        return max(1, self.chat_win.getmaxyx()[1] - 1)
+        return self._tw  # always consistent with the value used for rendering
 
     def _wrap_window(self, win: ChatWindow) -> None:
         max_width = self._chat_text_width()
@@ -4621,8 +4624,10 @@ class TUI:
             self.input_win.mvwin(self.height - 4, 0)
         except curses.error:
             pass
-        # Refresh cached dimension values and force full repaint
-        self._tw             = max(1, self.chat_win.getmaxyx()[1] - 1)
+        # Refresh cached dimension values and force full repaint.
+        # Use the expected logical width (not getmaxyx) so a silently-failed
+        # resize can't leave _tw pointing at the old oversized chat window.
+        self._tw             = max(1, chat_w - 1)
         self._uw             = max(1, self.userlist_width - 2)
         self._input_w        = max(1, self.input_win.getmaxyx()[1] - 4)
         self._content_height = max(1, self.chat_height - 1)
@@ -4908,15 +4913,26 @@ class TUI:
         self._sync_draw_ctx()
 
         refreshed = []
+        _chat_refreshed = False
         if self._chat_dirty:
             self._draw_chat()
             self._chat_dirty = False
             refreshed.append(self.chat_win)
+            _chat_refreshed = True
         if self._userlist_dirty:
             if self._show_userlist:
                 self._draw_userlist()
                 refreshed.append(self.user_win)
             self._userlist_dirty = False
+        elif self._show_userlist and _chat_refreshed:
+            # Re-assert the userlist after every chat refresh even when the
+            # userlist itself hasn't changed.  chat_win.noutrefresh() writes the
+            # full chat buffer (including the blank right-margin column) to the
+            # virtual screen.  If the window was ever the wrong size (e.g. a
+            # silently-failed resize) those writes can land on top of the |
+            # border.  Calling user_win.noutrefresh() second means the userlist
+            # always wins that region, keeping the border and nicks intact.
+            refreshed.append(self.user_win)
         if self._input_dirty:
             self._draw_input()
             self._input_dirty = False
