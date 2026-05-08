@@ -6131,10 +6131,15 @@ class TUI:
                              speakers: list) -> None:
         answer, tokens = "", "?"
         try:
+            # 2000 output tokens fits the 4-section structured summary even on
+            # busy channels (200 msgs, many speakers); 800 was getting truncated
+            # mid-sentence and dropping the "Conclusions" section.  Timeout
+            # bumped to 180s to give slower local models headroom for the
+            # larger response.
             answer, tokens = await asyncio.wait_for(
-                self._call_ai(prompt, model_key, max_tokens=800), timeout=120.0)
+                self._call_ai(prompt, model_key, max_tokens=2000), timeout=180.0)
         except asyncio.TimeoutError:
-            answer, tokens = "[error] AI request timed out after 120 s", "?"
+            answer, tokens = "[error] AI request timed out after 180 s", "?"
         except Exception as exc:
             answer, tokens = f"[error] {exc}", "?"
         finally:
