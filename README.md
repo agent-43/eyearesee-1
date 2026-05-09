@@ -1,9 +1,9 @@
 ## 🚀 Quick Start
 
-To run the core client without installing dependencies or enabling AI detection:
+To run the core client without installing dependencies or enabling AI (llm) detection:
 
 
-python eyearesee.py --no-ai --no-install
+python eyearesee.py --no-ai --no-install ( all llm features will be disabled and it will install no dependencies. )
 
 Eye Are See IRC Client 👁️
 Eye Are See is a highly advanced, feature-rich, and intelligent IRC client built in Python, designed for serious IRC users, developers, and anyone interested in analyzing communication patterns, particularly the detection of AI-generated content.
