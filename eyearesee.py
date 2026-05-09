@@ -2007,6 +2007,7 @@ class IRCClient:
         self._pending_labels: set = set()        # labels sent on outgoing msgs, awaiting echo
         self._whox_seq: int = 1                  # rotating token for WHOX queries (1–999)
         self._whox_tokens: dict = {}             # token → requested-fields string
+        self._names_to_status: set = set()       # channels whose 366 should be echoed to *status*
         self._cap_req_queue: list = []           # individual caps queued after a CAP NAK
         self._sasl_state: dict = {}              # per-mechanism state across AUTHENTICATE exchanges
         self._auth_buffer: str = ""              # accumulates chunked AUTHENTICATE data (>400 chars)
@@ -3021,6 +3022,14 @@ class IRCClient:
                 cleaned.append(entry)
         await self.ui_queue.put(("names", channel, " ".join(cleaned)))
 
+    async def _irc_endofnames(self, nick, params, prefix):  # 366 RPL_ENDOFNAMES
+        # Only emit /names → *status* output when the user explicitly asked
+        # (via /slash_names).  Suppress the normal post-JOIN 366 noise.
+        channel = params[1] if len(params) > 1 else ""
+        if channel and channel in self._names_to_status:
+            self._names_to_status.discard(channel)
+            await self.ui_queue.put(("names_status", channel))
+
     async def _irc_who_reply(self, nick, params, prefix):  # 352/314
         await self.ui_queue.put(("status", f"{params[0] if params else ''} {' '.join(params[1:])}"))
 
@@ -3323,6 +3332,7 @@ class IRCClient:
         h["INVITE"]       = self._irc_invite
         h["QUIT"]         = self._irc_quit
         h["353"]          = self._irc_names
+        h["366"]          = self._irc_endofnames
         h["301"]          = self._irc_away_reply
         h["332"]          = self._irc_topic_reply
         h["331"]          = self._irc_no_topic
@@ -5041,6 +5051,7 @@ class TUI:
         h["notice"]      = self._ev_notice
         h["nick_change"] = self._ev_nick_change
         h["names"]       = self._ev_names
+        h["names_status"]= self._ev_names_status
         h["clear_users"] = self._ev_clear_users
         h["topic"]       = self._ev_topic
         h["join"]        = self._ev_join
@@ -5290,6 +5301,23 @@ class TUI:
         self._userlist_dirty = True
         self.dirty = True
 
+    async def _ev_names_status(self, event):
+        # Render channel_users[channel] to the *status* window in a compact
+        # wrapped layout.  Triggered by 366 only when the user invoked /names.
+        _, channel = event
+        users = sorted(self.channel_users.get(channel, set()), key=str.lower)
+        sw = self._status_win()
+        total = len(users)
+        sw.add_line(f"── /names {channel}  ({total} user{'s' if total != 1 else ''}) ──")
+        if not users:
+            sw.add_line("  (no users)")
+        else:
+            per_line = 6
+            for i in range(0, total, per_line):
+                sw.add_line("  " + "  ".join(f"{n:<14}" for n in users[i:i + per_line]).rstrip())
+        self._chat_dirty = True
+        self.dirty = True
+
     async def _ev_clear_users(self, event):
         for users in self.channel_users.values():
             users.clear()
@@ -5424,6 +5452,7 @@ class TUI:
         h["who"]        = self._slash_who
         h["whowas"]     = self._slash_whowas
         h["names"]      = self._slash_names
+        h["isactive"]   = self._slash_isactive
         h["ignore"]     = self._slash_ignore
         h["unignore"]   = self._slash_unignore
         h["clear"]      = self._slash_clear
@@ -5838,7 +5867,227 @@ class TUI:
             self._active_client().cmd_whowas(args)
 
     async def _slash_names(self, args, extra, line):
-        self._active_client().cmd_names(args or self.current_channel or "")
+        c = self._active_client()
+        channel = (args or self.current_channel or "").strip()
+        if not channel:
+            await self.ui_queue.put(("status",
+                "Usage: /names [channel]  (no current channel)"))
+            return
+        c._names_to_status.add(channel)
+        c.cmd_names(channel)
+
+    async def _slash_isactive(self, args, extra, line):
+        """Show what % of /names members have spoken in the channel.
+
+        Usage: /isactive [channel] [window]
+          window = N{s|m|h|d|w}  (e.g. 7d, 24h, 90m, 2w; bare N defaults to days)
+          /isactive ##anime 7d   → only counts activity in the last 7 days
+          /isactive 7d           → uses the current channel
+          /isactive ##anime      → all-time
+
+        Activity sources:
+          • UserState.total_msgs / last_msg_time  (this session, exact wall-clock)
+          • chat_logs/<channel>.log  (message-author lines: "<nick>" or "* nick")
+
+        Time-windowed log scanning has no date stamps to work with — only
+        [HH:MM] per line — so it walks backward from EOF using the file's
+        mtime as anchor, decrementing the day each time the timestamp jumps
+        forward (i.e. crosses midnight going backwards). [↑] replay lines
+        carry server-time HH:MM (not append time) so they break monotonicity
+        and are skipped during windowed walks; they're still counted all-time."""
+        # ── Parse args ───────────────────────────────────────────────────────
+        win_re = re.compile(r'^(\d+)([smhdw]?)$', re.I)
+        unit_secs = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+        def _parse_window(tok: str):
+            m = win_re.match(tok or "")
+            if not m:
+                return None
+            return float(int(m.group(1)) * unit_secs[(m.group(2) or "d").lower()])
+
+        toks = (args or "").strip().split()
+        channel = ""
+        window = None  # seconds, or None for all-time
+        if not toks:
+            channel = self.current_channel or ""
+        elif len(toks) == 1:
+            w = _parse_window(toks[0])
+            if w is not None:
+                channel = self.current_channel or ""
+                window = w
+            else:
+                channel = toks[0]
+        else:
+            channel = toks[0]
+            window = _parse_window(toks[1])
+            if window is None:
+                await self.ui_queue.put(("status",
+                    f"/isactive: bad window '{toks[1]}' — expected like 7d, 24h, 90m, 2w"))
+                return
+
+        if not channel:
+            await self.ui_queue.put(("status",
+                "Usage: /isactive [channel] [window]   window = 7d 24h 90m 2w"))
+            return
+        members = self.channel_users.get(channel, set())
+        if not members:
+            await self.ui_queue.put(("status",
+                f"/isactive: no members cached for {channel} — run /names {channel} first"))
+            return
+
+        # ── Build the "has-spoken" set from chat log + present session ───────
+        client = self._active_client()
+        members_lower = {n.lower(): n for n in members}
+        spoken_lower: set = set()
+        now_ts = time.time()
+        cutoff = (now_ts - window) if window is not None else None
+        # Present chat — anyone the IRC client has seen send a message
+        for nick, state in client.users.items():
+            nlow = nick.lower()
+            if nlow not in members_lower or state.total_msgs <= 0:
+                continue
+            if cutoff is None:
+                spoken_lower.add(nlow)
+            elif state.last_msg_time is not None and state.last_msg_time >= cutoff:
+                spoken_lower.add(nlow)
+        # Historical logs — scan for "<nick>" or "* nick" message-author lines.
+        # Optional "[↑] " replay marker and "[account]" tag may sit between
+        # the timestamp and the nick.
+        log_path = _chat_log_path(channel)
+        line_re = re.compile(r'^\[(\d{2}):(\d{2})\](\s\[↑\])?\s(?:<([^>\s]+)>|\*\s+(\S+))')
+        log_present_lower: set = set()
+        loop = asyncio.get_running_loop()
+        def _scan_all() -> set:
+            found: set = set()
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    for ln in f:
+                        m = line_re.match(ln)
+                        if not m:
+                            continue
+                        nm = (m.group(4) or m.group(5) or "").strip()
+                        low = nm.lower()
+                        if low in members_lower:
+                            found.add(low)
+                            if len(found) == len(members_lower):
+                                break
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            return found
+        def _scan_windowed(cutoff_ts: float) -> set:
+            from datetime import datetime, timedelta
+            found: set = set()
+            try:
+                mtime = os.path.getmtime(log_path)
+            except (FileNotFoundError, OSError):
+                return found
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                return found
+            except Exception:
+                return found
+            mtime_dt = datetime.fromtimestamp(mtime)
+            cur_date = mtime_dt.date()
+            # Seed prev_minutes with the file mtime so a last-line near midnight
+            # doesn't accidentally trigger a rollback on the first iteration.
+            prev_minutes = mtime_dt.hour * 60 + mtime_dt.minute
+            for ln in reversed(lines):
+                m = line_re.match(ln)
+                if not m:
+                    continue
+                # Skip CHATHISTORY replay lines: their [HH:MM] is server-time,
+                # not append time, so they'd corrupt the day-rollback walk.
+                if m.group(3):
+                    continue
+                hh = int(m.group(1)); mm = int(m.group(2))
+                cur_minutes = hh * 60 + mm
+                if cur_minutes > prev_minutes:
+                    cur_date -= timedelta(days=1)
+                prev_minutes = cur_minutes
+                line_ts = datetime.combine(
+                    cur_date, datetime.min.time().replace(hour=hh, minute=mm)
+                ).timestamp()
+                if line_ts < cutoff_ts:
+                    break
+                nm = (m.group(4) or m.group(5) or "").strip()
+                low = nm.lower()
+                if low in members_lower:
+                    found.add(low)
+                    if len(found) == len(members_lower):
+                        break
+            return found
+        try:
+            if cutoff is None:
+                log_present_lower = await loop.run_in_executor(None, _scan_all)
+            else:
+                log_present_lower = await loop.run_in_executor(
+                    None, lambda: _scan_windowed(cutoff))
+        except Exception:
+            log_present_lower = set()
+        active_lower = spoken_lower | log_present_lower
+        active_count = len(active_lower)
+        total = len(members)
+        pct = (active_count / total * 100.0) if total else 0.0
+
+        # Render the window as the largest exact unit it divides into
+        if window is None:
+            win_label = ""
+        else:
+            for unit, secs in (("w", 604800), ("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+                if window % secs == 0:
+                    win_label = f"  (last {int(window // secs)}{unit})"
+                    break
+
+        # ── Render to dashboard ─────────────────────────────────────────────
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+        bar_full = int(round(pct / 5))         # 20-cell bar, each cell = 5%
+        bar = "█" * bar_full + "░" * (20 - bar_full)
+        L(f"=== /isactive  {channel}{win_label} ===")
+        L("")
+        L(f"  Active:      {active_count} / {total} users")
+        L(f"  Percentage:  [{bar}]  {pct:5.1f}%")
+        L("")
+        L(f"  Source breakdown:")
+        L(f"    present chat (this session): {len(spoken_lower):4d}")
+        L(f"    historical logs:             {len(log_present_lower):4d}")
+        L(f"    union (counts once per nick): {active_count:4d}")
+        L("")
+        # Show the 30 most recently/likely active nicks
+        if active_lower:
+            sample = sorted(members_lower[k] for k in active_lower)[:30]
+            L(f"  Active nicks (first {len(sample)}):")
+            for i in range(0, len(sample), 6):
+                L("    " + "  ".join(f"{n:<14}" for n in sample[i:i + 6]).rstrip())
+            if active_count > len(sample):
+                L(f"    … and {active_count - len(sample)} more")
+            L("")
+        # Show inactive nicks too — they're the more interesting set for AI sweeps
+        inactive_lower = set(members_lower) - active_lower
+        if inactive_lower:
+            sample = sorted(members_lower[k] for k in inactive_lower)[:30]
+            inact_label = "no msgs in window" if window is not None else "no messages on record"
+            L(f"  Inactive nicks ({inact_label}, first {len(sample)}):")
+            for i in range(0, len(sample), 6):
+                L("    " + "  ".join(f"{n:<14}" for n in sample[i:i + 6]).rstrip())
+            if len(inactive_lower) > len(sample):
+                L(f"    … and {len(inactive_lower) - len(sample)} more")
+        L("")
+        L(f"  Denominator from /names cache for {channel}.  "
+          f"Run /names {channel} to refresh.")
+
+        self.current_window_index      = 1   # *dashboard*
+        self._chat_dirty               = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self.dirty                     = True
 
     async def _slash_ignore(self, args, extra, line):
         if args:
@@ -6292,23 +6541,26 @@ class TUI:
         _C("  ╚" + "═" * 44 + "╝")
         _C("")
         _H("Messaging")
-        _E("/msg <nick> <text>",            "Send a PM; opens and switches to the DM window")
+        _E("/msg (/m) <nick> <text>",       "Send a PM; opens and switches to the DM window")
         _E("/query <nick> [message]",       "Open a DM window with nick; optionally send a first message")
         _E("/notice <nick> <text>",         "Send a notice (-nick- style, not shown in chat)")
-        _E("/me <text>",                    "Send an action line  (* nick waves)")
+        _E("/me (/action) <text>",          "Send an action line  (* nick waves)")
         _E("/reply <text>",                 "Reply to last message with +reply tag (IRCv3 message-tags)")
         _E("/react <emoji>",                "React to last message with +react TAGMSG (IRCv3 message-tags)")
-        _E("/ml <l1> | <l2> | ...",         "Send multiline message via draft/multiline batch")
+        _E("/ml (/multiline) <l1> | <l2>…", "Send multiline message via draft/multiline batch")
         _E("/redact [reason]",              "Redact last message in this window (message-redaction)")
+        _E("/tagmsg <target> k=v[;k2=v2]",  "Send a TAGMSG with client-only tags to target")
         _C("")
         _H("Channels")
         _E("/join <channel>",               "Join a channel (# is added automatically if omitted)")
         _E("/part [channel] [message]",     "Leave a channel with an optional part message")
         _E("/topic <channel> [text]",       "View or set the channel topic")
-        _E("/names [channel]",              "List users currently in the channel")
+        _E("/names [channel]",              "List users currently in the channel — output to *status*")
+        _E("/isactive [chan] [window]",     "% of /names members who spoke in window (e.g. 7d, 24h, 90m, 2w). All-time if omitted")
         _E("/kick <chan> <nick> [reason]",  "Kick a user from the channel")
         _E("/invite <nick> [channel]",      "Invite a user to a channel")
         _E("/mode <target> [modes]",        "Get or set channel / user modes")
+        _E("/replay [n|on|off]",            "Fetch n msgs of channel history via CHATHISTORY (default 50)")
         _C("")
         _H("Operator")
         _E("/op <nick>",    "Grant operator status  (+o)")
@@ -6325,15 +6577,19 @@ class TUI:
         _E("/whois <nick>",                 "Look up user info — shown formatted in *status*")
         _E("/whowas <nick>",                "Info on a recently disconnected user")
         _E("/who <target>",                 "List users matching a pattern")
+        _E("/whox [target] [fields]",       "WHOX query for target (default current channel; fields hnuraf)")
+        _E("/monitor +|- nicks | list…",    "MONITOR nicks for online/offline (+/add, -/del, list, clear, status)")
         _E("/ignore <nick>",                "Suppress all messages from nick")
         _E("/unignore <nick>",              "Stop ignoring nick")
         _E("/away [message]",               "Set away status with optional message")
         _E("/back",                         "Remove away status")
         _C("")
-        _H("Services & CTCP")
-        _E("/ns <command>",                 "Send command to NickServ  (e.g. /ns identify pw)")
-        _E("/cs <command>",                 "Send command to ChanServ")
+        _H("Services & Account")
+        _E("/ns (/nickserv) <command>",     "Send command to NickServ  (e.g. /ns identify pw)")
+        _E("/cs (/chanserv) <command>",     "Send command to ChanServ")
         _E("/ctcp <nick> <cmd> [args]",     "Send a CTCP request  (PING VERSION TIME …)")
+        _E("/register <acct|*> <email> <pw>","Register account via draft/account-registration (* = current nick)")
+        _E("/pem [path]",                   "Generate SASL ECDSA P-256 keypair, set PUBKEY in NickServ, update config")
         _C("")
         _H("AI Detection")
         _E("/ai <nick>",                    "Full AI profile: score, idle, sparkline, verdict")
@@ -6361,11 +6617,12 @@ class TUI:
         _C("")
         _H("Windows & Navigation")
         _C("  Tab bar (above input): [1:status] [2:dash] [*3:##chat]  * = unread")
-        _E("/win <n>",    "Switch to window n; clears its unread marker")
-        _E("/close  (or /wc)", "Close current window; focus moves to previous")
-        _E("/clear",     "Clear messages in the current window")
-        _E("/theme <1-5>","Switch colour theme: Classic Hacker Ocean Sunset Neon")
-        _E("/userlist",   "Toggle the user list panel on/off")
+        _E("/win (/window) <n>", "Switch to window n; clears its unread marker")
+        _E("/close (/wc)",       "Close current window; focus moves to previous")
+        _E("/clear",             "Clear messages in the current window")
+        _E("/theme <1-5>",       "Switch colour theme: Classic Hacker Ocean Sunset Neon")
+        _E("/userlist",          "Toggle the user list panel on/off")
+        _E("/mute",              "Toggle mention beep on/off (highlight stays active)")
         _C("  Ctrl+N  next window    Tab  nick completion    PgUp/PgDn  scroll")
         _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
         _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
@@ -6378,9 +6635,9 @@ class TUI:
         _C("")
         _H("General")
         _E("/redraw [channel]",   "Force full screen repaint and reload userlist from server")
-        _E("/quit [message]", "Send quit message and exit")
-        _E("/help",           "Brief one-line command reference")
-        _E("/commands",       "This full command list")
+        _E("/quit (/exit) [msg]", "Send quit message and exit")
+        _E("/help",               "Brief one-line command reference")
+        _E("/commands",           "This full command list")
         _C("")
         self.current_window_index = 0
         self._chat_dirty = True
@@ -6395,7 +6652,7 @@ class TUI:
             "── Channels ──────────────────────────────────────────────",
             "  /join <chan>  /part [chan] [msg]  /topic <chan> [text]",
             "  /kick <chan> <nick> [reason]  /invite <nick> [chan]",
-            "  /names [chan]  /mode <target> [modes]",
+            "  /names [chan]  /isactive [chan] [window]  /mode <target> [modes]",
             "── Operator ──────────────────────────────────────────────",
             "  /op /deop /voice /devoice /hop /dehop  /ban /unban",
             "── Users ─────────────────────────────────────────────────",
