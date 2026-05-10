@@ -21,12 +21,11 @@ The remaining ~71% is the IRC protocol stack (full IRCv3), curses TUI, plugin sy
 eyearesee is a 7,710-line Python curses-based IRCv3 client with integrated AI detection. It connects to IRC (default irc.libera.chat:6697), supports SASL auth (PLAIN, SCRAM-SHA-256, EXTERNAL, ECDSA-NIST256P-CHALLENGE), full IRCv3 capabilities (message-tags, server-time, echo-message, batch, chathistory, multiline, read-marker, typing indicators, account-registration), CTCP, multi-server via /server, and has a tabbed TUI with userlist, channel history persistence, and CJK auto-translation.
 Its distinguishing feature is an ensemble AI detector that scores every incoming message on a 0–100 AI-likelihood scale using: heuristic formality/pattern analysis, Binoculars cross-entropy ratio (GPT-2/distilGPT-2), RoBERTa classifiers (ChatGPT-focused + general), optional LLM-based classification (via Claude/OpenAI/Ollama/llama.cpp), and bot fingerprinting with n-gram similarity. A dashboard shows ranked suspects, per-user AI profiles with sparklines and session breakdowns, and channel activity stats. It also supports /askai and /summarize using any configured provider, a Python plugin system, and persistent JSONL audit logging.
 
-
 # Summary: 
 eyearesee is an unusually ambitious single-file project: a polished, IRCv3-compliant terminal IRC client merged with a four-signal AI text detector and a multi-provider LLM chat interface, all in one script with minimal external dependencies.
 
 ## Dependencies Required 
-(auto-installed if missing):
+(auto-installed if missing unless you pass --no-install):
 - windows-curses — curses for Windows (required on Windows)
 - transformers — HuggingFace models (AI detection)
 - torch — PyTorch (AI detection)
