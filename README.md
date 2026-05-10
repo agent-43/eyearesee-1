@@ -33,4 +33,5 @@ eyearesee is an unusually ambitious single-file project: a polished, IRCv3-compl
 - openai — OpenAI/DeepSeek/Copilot API client
 Optional:
 - cryptography — only needed for SASL ECDSA-NIST256P-CHALLENG
+
 On startup, _ensure_deps() auto-installs missing packages via pip (skipped with --no-install). The script refuses to run if windows-curses is missing and installs it automatically.
