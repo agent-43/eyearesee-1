@@ -9,6 +9,7 @@ import logging
 import socket
 import subprocess
 import sys
+import threading
 import unicodedata
 import urllib.parse
 import urllib.request
@@ -1425,6 +1426,9 @@ class EnsembleAIDetector:
         self._cls2_tok   = None
         self._device = "cpu"
         self._pred_cache: OrderedDict = OrderedDict()  # text → Dict[str,float], LRU
+        # predict_detailed runs on _ML_EXECUTOR (multiple worker threads), so
+        # OrderedDict mutations need a lock to keep the linked list consistent.
+        self._pred_cache_lock = threading.Lock()
 
         if disabled:
             return
@@ -1721,22 +1725,24 @@ class EnsembleAIDetector:
         if not text:
             return _zero
 
-        cached = self._pred_cache.get(text)
-        if cached is not None:
-            try:
-                self._pred_cache.move_to_end(text)
-            except KeyError:
-                pass  # evicted by a concurrent thread between get() and move_to_end()
-            return cached  # type: ignore[return-value]
+        with self._pred_cache_lock:
+            cached = self._pred_cache.get(text)
+            if cached is not None:
+                try:
+                    self._pred_cache.move_to_end(text)
+                except KeyError:
+                    pass
+                return cached  # type: ignore[return-value]
 
         # Reasoning-model CoT leakage: <think>...</think> tags from Qwen3 / DeepSeek-R1
         # bleeding into chat are unambiguous AI evidence — skip all other scoring.
         if re.search(r'</?think\b', text, re.IGNORECASE):
             _certain: Dict[str, float] = {
                 "prob": 1.0, "heu": 1.0, "llama": 1.0, "bino": 1.0, "cls": 1.0}
-            if len(self._pred_cache) >= self._CACHE_MAX:
-                self._pred_cache.popitem(last=False)
-            self._pred_cache[text] = _certain
+            with self._pred_cache_lock:
+                if len(self._pred_cache) >= self._CACHE_MAX:
+                    self._pred_cache.popitem(last=False)
+                self._pred_cache[text] = _certain
             return _certain
 
         llama = self.llama_pattern_score(text)
@@ -1763,9 +1769,10 @@ class EnsembleAIDetector:
         result: Dict[str, float] = {
             "prob": prob, "heu": heu, "llama": llama, "bino": bino, "cls": cls}
 
-        if len(self._pred_cache) >= self._CACHE_MAX:
-            self._pred_cache.popitem(last=False)   # O(1) FIFO eviction
-        self._pred_cache[text] = result
+        with self._pred_cache_lock:
+            if len(self._pred_cache) >= self._CACHE_MAX:
+                self._pred_cache.popitem(last=False)   # O(1) FIFO eviction
+            self._pred_cache[text] = result
         return result
 
     def predict_prob(self, text: str) -> float:
@@ -3287,10 +3294,10 @@ class IRCClient:
         # Announce the network name the first time we see it.
         # The flag lives on the instance, not in _isupport, so it
         # doesn't shadow real ISUPPORT tokens.
-        if "NETWORK" in self._isupport and not self._network_announced:
+        network = self._isupport.get("NETWORK")
+        if isinstance(network, str) and not self._network_announced:
             self._network_announced = True
-            await self.ui_queue.put(("status",
-                f"Network: {self._isupport['NETWORK']}"))
+            await self.ui_queue.put(("status", f"Network: {network}"))
 
     async def _irc_no_such_nick(self, nick, params, prefix):  # 401 ERR_NOSUCHNICK
         target = params[1] if len(params) > 1 else params[0] if params else "?"
@@ -3401,11 +3408,23 @@ class IRCClient:
         self.send_raw(f"KICK {channel} {user} :{reason}" if reason else f"KICK {channel} {user}")
 
     def cmd_msg(self, target: str, text: str, is_action: bool = False) -> Optional[tuple]:
-        if "\n" in text and not is_action and "draft/multiline" in self._active_caps:
-            return self._cmd_msg_multiline(target, text)
+        if "\n" in text and not is_action:
+            if "draft/multiline" in self._active_caps:
+                return self._cmd_msg_multiline(target, text)
+            # Fallback: send each line as its own PRIVMSG. send_raw strips
+            # newlines, so without this branch every line after the first
+            # would be silently joined to the previous one.
+            lines = [ln for ln in text.split("\n") if ln]
+            if not lines:
+                return None
+            for ln in lines[:-1]:
+                self.send_raw(f"PRIVMSG {target} :{ln}")
+            text = lines[-1]
         body = f":\x01ACTION {text}\x01" if is_action else f":{text}"
         if "labeled-response" in self._active_caps:
             label = self._next_label()
+            if len(self._pending_labels) >= 10000:
+                self._pending_labels.clear()
             self._pending_labels.add(label)
             self.send_tagged({"label": label}, f"PRIVMSG {target} {body}")
         else:
@@ -5160,7 +5179,7 @@ class TUI:
             self._sorted_users.pop(win_name, None)
             self._userlist_dirty = True
         # A sent message implicitly clears any typing indicator for that nick.
-        tgt_peers = self._typing_peers.get(win_name.lower(), {})
+        tgt_peers = self._typing_peers.setdefault(win_name.lower(), {})
         if tgt_peers.pop(nick.lower(), None) is not None:
             pass  # _chat_dirty already set below
         self._chat_dirty = True
@@ -5771,12 +5790,16 @@ class TUI:
 
     async def _slash_msg(self, args, extra, line):
         if args and extra:
-            self._active_client().cmd_msg(args, extra)
-            win = self.ensure_window(args, is_channel=False)
-            win.add_line(f"<{self._active_client().nick}> {extra}")
+            result = self._active_client().cmd_msg(args, extra)
+            is_chan = args.startswith("#")
+            win = self.ensure_window(args, is_channel=is_chan)
             self.current_window_index = self.windows.index(win)
             self.current_channel = args
             self._unread_windows.discard(args)
+            if result:
+                await self.ui_queue.put(result)
+            else:
+                win.add_line(f"<{self._active_client().nick}> {extra}")
             self._chat_dirty = self._userlist_dirty = self._input_dirty = True
             self.dirty = True
         else:
@@ -5794,8 +5817,11 @@ class TUI:
             if is_new:
                 win.add_line(f"** Query with {args} opened **", timestamp=False)
             if extra:
-                self._active_client().cmd_msg(args, extra)
-                win.add_line(f"<{self._active_client().nick}> {extra}")
+                result = self._active_client().cmd_msg(args, extra)
+                if result:
+                    await self.ui_queue.put(result)
+                else:
+                    win.add_line(f"<{self._active_client().nick}> {extra}")
         else:
             await self.ui_queue.put(("status", "Usage: /query <nick> [message]"))
 
@@ -6107,16 +6133,29 @@ class TUI:
         win._reactions.clear()
         win._last_msgid = ""
         win._unread_from = -1
+        win.scroll_offset = 0
         win._wrap_dirty = True
+        self._chat_dirty = True
+        self.dirty = True
 
     async def _slash_close(self, args, extra, line):
         win = self.get_current_window()
         if win.name not in ("*status*", "*dashboard*"):
             self._unread_windows.discard(win.name)
+            idx = self.current_window_index
             self.windows.remove(win)
             wk = self._wk(win.server_id or self._primary_server_id, win.name)
             self.window_by_name.pop(wk, None)
-            self.current_window_index = max(0, self.current_window_index - 1)
+            # After removal, windows after `idx` shift down by 1, so staying at
+            # `idx` lands on the next window. Drop to last only if we were last.
+            self.current_window_index = min(idx, len(self.windows) - 1)
+            log_key = win._log_name or win.name
+            handle = _chat_log_handles.pop(log_key, None)
+            if handle and not handle.closed:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
             new_win = self.get_current_window()
             if new_win.name not in ("*status*", "*dashboard*"):
                 self.current_channel = new_win.name
@@ -7192,9 +7231,7 @@ class TUI:
                 self.dirty = True
 
         elif ch == 9:    # Tab — nick completion
-            prev_len = len(self.input_buffer)
             self.do_nick_complete()
-            self.input_cursor += len(self.input_buffer) - prev_len
 
         elif ch == 3:    # Ctrl+C
             raise SystemExit
