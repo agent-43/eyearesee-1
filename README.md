@@ -1,6 +1,6 @@
 ## 🚀 Quick Start
 
-To run the core client without installing dependencies or enabling AI (llm) detection:
+To run the core client without installing dependencies or enabling AI (LLM) detection:
 
 python eyearesee.py --no-ai --no-install ( all llm features will be disabled and it will install no dependencies. )
 
