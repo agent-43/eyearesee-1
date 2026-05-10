@@ -1,3 +1,9 @@
+## 🚀 Quick Start
+
+To run the core client without installing dependencies or enabling AI (llm) detection:
+
+python eyearesee.py --no-ai --no-install ( all llm features will be disabled and it will install no dependencies. )
+
 ## What do you mean by AI?
 ~29% of the code (2,254 of 7,710 lines) is dedicated to AI/LLM functionality. Breakdown:
 - 9.6% — AI Detection ensemble (heuristics, Binoculars, RoBERTa classifiers, LLM-based classification)
@@ -10,12 +16,6 @@
 - 0.7% — AI config (model registry, API keys, thread pools)
 - 0.5% — AI deps & startup (--no-ai, auto-install transformers/torch)
 The remaining ~71% is the IRC protocol stack (full IRCv3), curses TUI, plugin system, CJK translation, and general infrastructure.
-
-## 🚀 Quick Start
-
-To run the core client without installing dependencies or enabling AI (llm) detection:
-
-python eyearesee.py --no-ai --no-install ( all llm features will be disabled and it will install no dependencies. )
 
 ## Explained 
 eyearesee is a 7,710-line Python curses-based IRCv3 client with integrated AI detection. It connects to IRC (default irc.libera.chat:6697), supports SASL auth (PLAIN, SCRAM-SHA-256, EXTERNAL, ECDSA-NIST256P-CHALLENGE), full IRCv3 capabilities (message-tags, server-time, echo-message, batch, chathistory, multiline, read-marker, typing indicators, account-registration), CTCP, multi-server via /server, and has a tabbed TUI with userlist, channel history persistence, and CJK auto-translation.
