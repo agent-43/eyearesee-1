@@ -23,3 +23,14 @@ Its distinguishing feature is an ensemble AI detector that scores every incoming
 
 
 Summary: eyearesee is an unusually ambitious single-file project: a polished, IRCv3-compliant terminal IRC client merged with a four-signal AI text detector and a multi-provider LLM chat interface, all in one script with minimal external dependencies.
+
+## Dependencies Required 
+(auto-installed if missing):
+- windows-curses — curses for Windows (required on Windows)
+- transformers — HuggingFace models (AI detection)
+- torch — PyTorch (AI detection)
+- anthropic — Claude API client (/askai, /summarize)
+- openai — OpenAI/DeepSeek/Copilot API client
+Optional:
+- cryptography — only needed for SASL ECDSA-NIST256P-CHALLENGE
+
