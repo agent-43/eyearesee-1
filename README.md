@@ -1,3 +1,15 @@
+~29% of the code (2,254 of 7,710 lines) is dedicated to AI/LLM functionality. Breakdown:
+- 9.6% — AI Detection ensemble (heuristics, Binoculars, RoBERTa classifiers, LLM-based classification)
+- 6.0% — AI Integration (/askai, /summarize, /model, /api, provider clients)
+- 5.8% — AI slash commands & dashboard (suspects view, AI profiles, /topai, /bot, etc.)
+- 4.4% — AI logging & history (JSONL audit trail, per-nick history loading)
+- 2.2% — AI tell phrases / word lists (IRC_CASUAL_WORDS, AI_TELL_PHRASES, LLAMA_TELL_PHRASES, FORMAL_WORDS)
+- 1.2% — Bot fingerprinting (BotFingerprint class)
+- 1.0% — Ollama/llama.cpp HTTP clients
+- 0.7% — AI config (model registry, API keys, thread pools)
+- 0.5% — AI deps & startup (--no-ai, auto-install transformers/torch)
+The remaining ~71% is the IRC protocol stack (full IRCv3), curses TUI, plugin system, CJK translation, and general infrastructure.
+
 ## 🚀 Quick Start
 
 To run the core client without installing dependencies or enabling AI (llm) detection:
