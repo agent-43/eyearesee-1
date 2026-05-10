@@ -2462,9 +2462,13 @@ class IRCClient:
         "chghost", "server-time", "echo-message", "userhost-in-names",
         "message-tags", "batch", "labeled-response", "invite-notify",
         "account-tag", "standard-replies", "setname",
+        "cap-notify", "extended-monitor", "draft/pre-away",
+        "draft/no-implicit-names",
+        "draft/relaymsg", "draft/channel-rename",
         "chathistory", "draft/chathistory",
         "draft/multiline", "message-redaction", "read-marker",
         "draft/account-registration",
+        "znc.in/self-message",
     )
 
     async def _irc_cap(self, nick, params, prefix):
@@ -3215,6 +3219,32 @@ class IRCClient:
             # invite-notify: someone else in the channel was invited
             await self.ui_queue.put(("status", f"*** {nick} invited {invitee} to {channel}"))
 
+    async def _irc_relaymsg(self, nick, params, prefix):
+        """draft/relaymsg: bridges deliver foreign-network messages with a
+        rendered nickname distinct from the bridge bot's own nick."""
+        if len(params) < 3:
+            return
+        target        = params[0]
+        rendered_nick = params[1]
+        msg           = params[2]
+        await self._irc_privmsg(rendered_nick, [target, msg], prefix)
+
+    async def _irc_rename(self, nick, params, prefix):
+        """draft/channel-rename: server notifies that a channel was renamed."""
+        if len(params) < 2:
+            return
+        old_chan = params[0]
+        new_chan = params[1]
+        reason   = params[2] if len(params) > 2 else ""
+        if old_chan in self.joined_channels:
+            self.joined_channels.discard(old_chan)
+            self.joined_channels.add(new_chan)
+        if self.current_channel == old_chan:
+            self.current_channel = new_chan
+        suffix = f" ({reason})" if reason else ""
+        await self.ui_queue.put(("status", f"*** {old_chan} renamed to {new_chan}{suffix}"))
+        await self.ui_queue.put(("rename", old_chan, new_chan, reason))
+
     async def _irc_fail(self, nick, params, prefix):
         await self.ui_queue.put(("status", f"[FAIL] {' '.join(params)}"))
 
@@ -3355,6 +3385,8 @@ class IRCClient:
         h["TAGMSG"]       = self._irc_tagmsg
         h["REDACT"]       = self._irc_redact
         h["MARKREAD"]     = self._irc_markread
+        h["RELAYMSG"]     = self._irc_relaymsg
+        h["RENAME"]       = self._irc_rename
         h["FAIL"]         = self._irc_fail
         h["WARN"]         = self._irc_warn
         h["NOTE"]         = self._irc_note
