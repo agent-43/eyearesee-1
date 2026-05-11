@@ -1977,17 +1977,16 @@ def forecast_aware_anomaly(entries: list[Entry], user: str, z: float = 2.5,
             daily[e.ts.date()] += 1
     if not daily:
         return {"user": user, "anomalies": [], "note": "insufficient data"}
-    if not base.get("forecast"):
-        # fall back to standard anomaly
-        return detect_anomalies(entries, user, z)
+    if not base.predictions:
+        anomalies = detect_anomalies(entries, user, z)
+        return {"user": user, "anomalies": [{"date": str(a.ts), "score": a.z_score} for a in anomalies], "forecast_based": False}
+    forecast_map = {str(p[0]): p[1] for p in base.predictions}
     anomalies = []
-    forecast_map = {f["date"]: f.get("predicted", 0) for f in base["forecast"] if isinstance(f, dict)}
-    today = datetime.now().date()
     for date_key, actual in sorted(daily.items()):
-        expected = forecast_map.get(str(date_key), forecast_map.get(date_key, None))
+        expected = forecast_map.get(str(date_key))
         if expected is not None:
             dev = abs(actual - expected)
-            if dev > z * (base.get("rmse", 1) or 1):
+            if dev > z * (statistics.mean([abs(a - v) for v in forecast_map.values() if v > 0]) or 1):
                 anomalies.append({"date": str(date_key), "actual": actual, "expected": expected})
     return {"user": user, "anomalies": anomalies, "forecast_based": True}
 
@@ -2098,8 +2097,10 @@ def session_response_times(entries: list[Entry], user_a: str, user_b: str,
     sessions = detect_sessions(entries, user_a, gap_minutes)
     results = []
     for sess in sessions:
-        a_entries = [e for e in sess.entries if line_matches_user(e, user_a)]
-        b_entries = [e for e in sess.entries if line_matches_user(e, user_b)]
+        a_entries = [e for e in entries if e.ts and sess.start <= e.ts <= sess.end
+                     and line_matches_user(e, user_a)]
+        b_entries = [e for e in entries if e.ts and sess.start <= e.ts <= sess.end
+                     and line_matches_user(e, user_b)]
         if not a_entries or not b_entries:
             continue
         a_times = sorted([e.ts for e in a_entries if e.ts])
@@ -2168,17 +2169,27 @@ def _safe_parse_ts(ts_str: str) -> datetime | None:
 # ---------- Template-based filtering (feature g) ------------------------------
 
 def filter_by_template(entries: list[Entry], template_id: str) -> list[Entry]:
-    """Filter entries matching a specific template ID (heuristic: first template line)."""
-    tmpls = extract_templates(entries, top_n=100)
-    tmpl = next((t for t in tmpls if t.id == template_id), None)
-    if not tmpl:
-        return []
-    pattern = re.escape(tmpl.pattern).replace(r"\{\*\}", ".*")
+    """Filter entries matching a specific template ID."""
+    tmpls = extract_log_templates(entries, top_n=200)
     try:
-        rx = re.compile(pattern)
-    except re.error:
+        idx = int(template_id)
+        if idx < 1 or idx > len(tmpls):
+            return []
+        pattern, _, sample = tmpls[idx - 1]
+    except (ValueError, IndexError):
         return []
-    return [e for e in entries if rx.search(e.raw or "")]
+    # Match by splitting template on placeholders and checking each literal segment
+    parts = pattern.split("{}")
+    # Remove empty leading/trailing parts
+    parts = [p for p in parts if p.strip()]
+    if not parts:
+        return [e for e in entries if e.raw]
+    results = []
+    for e in entries:
+        text = e.text or e.raw or ""
+        if all(p in text for p in parts):
+            results.append(e)
+    return results
 
 # ---------- Drift monitoring (feature h) --------------------------------------
 
@@ -2263,8 +2274,11 @@ def auto_tag_user(entries: list[Entry], user: str, llm_url: str, llm_model: str,
         f"(e.g. 'high-volume', 'error-prone', 'night-owl', 'support-focused', 'bot-like').\n"
         f"Return only comma-separated tags, no explanation.\n\n{text}"
     )
-    result = llm_complete(llm_url, llm_model, prompt, max_tokens=100, cache=cache)
-    return result.strip() if result else "(no response)"
+    try:
+        result = call_llm_cached(llm_url, llm_model, "", prompt, cache=cache)
+        return result.strip() if result else "(no response)"
+    except Exception as exc:
+        return f"(error: {exc})"
 
 def auto_tag_bulk(entries: list[Entry], llm_url: str, llm_model: str,
                   max_chunk_chars: int = 12000, cache: LLMCache | None = None,
@@ -6820,25 +6834,4 @@ def main(argv: list[str] | None = None) -> int:
         startup_cmds: list[str] = []
         if args.show_commands:
             startup_cmds.append("commands")
-        startup_cmds.extend(args.cmd)
-
-        if startup_cmds:
-            print(shell.intro, end="")
-            for c in startup_cmds:
-                print(f"{shell.prompt}{c}")
-                if shell.onecmd(c):
-                    return 0
-                shell._refresh_prompt()
-            shell.cmdloop(intro="")
-        else:
-            shell.cmdloop()
-    except KeyboardInterrupt:
-        print()
-    finally:
-        if state.llm_cache:
-            state.llm_cache.save()
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        startup_cmds.exte
