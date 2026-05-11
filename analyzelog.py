@@ -57,6 +57,14 @@ try:
 except ImportError:
     readline = None  # type: ignore[assignment]
 
+import sqlite3
+import html as html_mod
+import urllib.parse
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from queue import Queue
+from collections import deque
+import enum
+
 
 # ---------- parsing ----------------------------------------------------------
 
@@ -833,6 +841,432 @@ def build_thread_for_user(entries: list[Entry], user: str
     return out
 
 
+# ---------- NEW: Session detection (#5) --------------------------------------
+
+@dataclass
+class Session:
+    user: str
+    start: datetime
+    end: datetime
+    line_count: int
+    targets: list[str] = field(default_factory=list)
+
+def detect_sessions(entries: list[Entry], user: str, gap_minutes: int = 30) -> list[Session]:
+    u = user.lower()
+    user_entries = sorted(
+        [e for e in entries if e.ts and e.user and e.user.lower() == u],
+        key=lambda e: e.ts
+    )
+    if not user_entries:
+        return []
+    sessions: list[Session] = []
+    cur_start = user_entries[0].ts
+    cur_end = user_entries[0].ts
+    cur_count = 1
+    cur_targets: list[str] = []
+    if user_entries[0].target:
+        cur_targets.append(user_entries[0].target)
+    for e in user_entries[1:]:
+        gap = (e.ts - cur_end).total_seconds() / 60
+        if gap > gap_minutes:
+            sessions.append(Session(user, cur_start, cur_end, cur_count, cur_targets))
+            cur_start = e.ts
+            cur_count = 0
+            cur_targets = []
+        cur_end = e.ts
+        cur_count += 1
+        if e.target:
+            cur_targets.append(e.target)
+    sessions.append(Session(user, cur_start, cur_end, cur_count, cur_targets))
+    return sessions
+
+# ---------- NEW: Response time analysis (#6) ---------------------------------
+
+@dataclass
+class ResponseTime:
+    responder: str
+    responded_to: str
+    delay_seconds: float
+    ts: datetime
+
+def compute_response_times(entries: list[Entry], window_seconds: int = 300) -> list[ResponseTime]:
+    nicks = {e.user for e in entries if e.user}
+    nicks_lower = {e.user.lower() for e in entries if e.user}
+    sorted_entries = sorted([e for e in entries if e.ts], key=lambda e: e.ts)
+    result: list[ResponseTime] = []
+    for i, e in enumerate(sorted_entries):
+        if not e.user:
+            continue
+        tgt = detect_reply_target(e, nicks_lower)
+        if tgt:
+            # look back for the most recent message from tgt
+            for j in range(i - 1, -1, -1):
+                prev = sorted_entries[j]
+                if prev.user and prev.user.lower() == tgt.lower() and prev.ts:
+                    delay = (e.ts - prev.ts).total_seconds()
+                    if delay <= window_seconds:
+                        result.append(ResponseTime(e.user, tgt, delay, e.ts))
+                    break
+    return result
+
+# ---------- NEW: Sentiment analysis (#4) -------------------------------------
+
+SENTIMENT_POS = re.compile(r"\b(good|great|awesome|thanks|nice|love|perfect|helpful|excellent|amazing|beautiful|wonderful|fantastic|brilliant|outstanding|superb|glad|happy|correct|agree|works|fixed|solved|appreciate|thank|please|yes|ok|okay)\b", re.I)
+SENTIMENT_NEG = re.compile(r"\b(bad|terrible|awful|hate|ugly|horrible|wrong|broken|fails|failed|error|crash|stupid|annoying|useless|worst|sucks|horrible|crap|damn|bug|issue|problem|disaster|fault|never|refuse|reject|no|not|can't|cannot|won't)\b", re.I)
+SENTIMENT_AGREE = re.compile(r"\b(agree|yes|correct|right|indeed|exactly|true|same)\b", re.I)
+SENTIMENT_DISAGREE = re.compile(r"\b(disagree|no|wrong|incorrect|false|nonsense|dispute|reject)\b", re.I)
+
+@dataclass
+class SentimentScore:
+    positive: float
+    negative: float
+    agreement: float
+    disagreement: float
+    compound: float
+
+def score_sentiment(text: str) -> SentimentScore:
+    pos = len(SENTIMENT_POS.findall(text))
+    neg = len(SENTIMENT_NEG.findall(text))
+    agr = len(SENTIMENT_AGREE.findall(text))
+    dagr = len(SENTIMENT_DISAGREE.findall(text))
+    total = pos + neg + 1
+    return SentimentScore(
+        positive=pos / total,
+        negative=neg / total,
+        agreement=agr / (agr + dagr + 1),
+        disagreement=dagr / (agr + dagr + 1),
+        compound=(pos - neg) / total,
+    )
+
+def user_sentiment(entries: list[Entry], user: str) -> dict:
+    u = user.lower()
+    texts = [e.text or e.raw for e in entries if e.user and e.user.lower() == u and (e.text or e.raw)]
+    if not texts:
+        return {}
+    scores = [score_sentiment(t) for t in texts]
+    return {
+        "user": user,
+        "n": len(scores),
+        "mean_positive": statistics.mean(s.compound for s in scores),
+        "mean_compound": statistics.mean(s.compound for s in scores),
+        "pos_rate": sum(1 for s in scores if s.compound > 0) / len(scores),
+        "neg_rate": sum(1 for s in scores if s.compound < 0) / len(scores),
+        "agree_rate": statistics.mean(s.agreement for s in scores),
+    }
+
+# ---------- NEW: Topic/keyword extraction (#3) --------------------------------
+
+STOPWORDS = set("the a an is in to of and it you that on for with as at by this are be has have had not was were will can its or do if from they what which who " "all about but just like so up no out one also get would could".split())
+
+def extract_keywords(texts: list[str], top_n: int = 20) -> list[tuple[str, int]]:
+    counter: Counter = Counter()
+    token_re = re.compile(r"[A-Za-z][A-Za-z0-9_\-']{2,}")
+    for t in texts:
+        for tok in token_re.findall(t.lower()):
+            if tok not in STOPWORDS and len(tok) > 2:
+                counter[tok] += 1
+    return counter.most_common(top_n)
+
+def extract_ngrams(texts: list[str], n: int = 2, top_n: int = 20) -> list[tuple[str, int]]:
+    counter: Counter = Counter()
+    token_re = re.compile(r"[A-Za-z][A-Za-z0-9_\-']{2,}")
+    for t in texts:
+        tokens = [tok for tok in token_re.findall(t.lower()) if tok not in STOPWORDS and len(tok) > 2]
+        for i in range(len(tokens) - n + 1):
+            gram = " ".join(tokens[i:i + n])
+            counter[gram] += 1
+    return counter.most_common(top_n)
+
+def user_topics(entries: list[Entry], user: str, top_n: int = 15) -> dict:
+    u = user.lower()
+    texts = [e.text or e.raw for e in entries if e.user and e.user.lower() == u and (e.text or e.raw)]
+    return {
+        "user": user,
+        "keywords": extract_keywords(texts, top_n),
+        "bigrams": extract_ngrams(texts, 2, top_n),
+        "trigrams": extract_ngrams(texts, 3, top_n),
+    }
+
+# ---------- NEW: Sequence mining (#14) ----------------------------------------
+
+@dataclass
+class SequencePattern:
+    pattern: tuple[str, ...]
+    count: int
+    avg_gap_seconds: float
+
+def find_common_sequences(entries: list[Entry], window_minutes: int = 10, max_gap_seconds: int = 600, min_support: int = 3) -> list[SequencePattern]:
+    sorted_e = sorted([e for e in entries if e.ts and e.user], key=lambda e: e.ts)
+    chains: list[list[str]] = []
+    cur: list[str] = []
+    cur_ts: datetime | None = None
+    for e in sorted_e:
+        if cur_ts is not None and (e.ts - cur_ts).total_seconds() > max_gap_seconds:
+            if len(cur) >= 2:
+                chains.append(cur)
+            cur = []
+        cur.append(e.user.lower())
+        cur_ts = e.ts
+    if len(cur) >= 2:
+        chains.append(cur)
+
+    pair_counter: Counter = Counter()
+    pair_gaps: dict[tuple[str, str], list[float]] = {}
+    for chain in chains:
+        for i in range(len(chain) - 1):
+            pair = (chain[i], chain[i + 1])
+            pair_counter[pair] += 1
+    result: list[SequencePattern] = []
+    for (a, b), cnt in pair_counter.most_common():
+        if cnt >= min_support:
+            gaps: list[float] = []
+            for chain in chains:
+                for i in range(len(chain) - 1):
+                    if chain[i] == a and chain[i + 1] == b:
+                        gaps.append(0.0)  # simplified
+            avg_gap = statistics.mean(gaps) if gaps else 0.0
+            result.append(SequencePattern((a, b), cnt, avg_gap))
+    return result[:20]
+
+# ---------- NEW: Anomaly detection (#8) --------------------------------------
+
+@dataclass
+class Anomaly:
+    user: str
+    metric: str
+    value: float
+    expected: float
+    zscore: float
+    day: str | None = None
+    hour: int | None = None
+
+def detect_anomalies(entries: list[Entry], user: str, z_threshold: float = 2.5) -> list[Anomaly]:
+    u = user.lower()
+    user_entries = [e for e in entries if e.user and e.user.lower() == u and e.ts]
+    if len(user_entries) < 7:
+        return []
+    result: list[Anomaly] = []
+    by_day: dict[str, list[Entry]] = {}
+    for e in user_entries:
+        if e.ts:
+            d = e.ts.date().isoformat()
+            by_day.setdefault(d, []).append(e)
+    day_counts = [len(v) for v in by_day.values()]
+    if len(day_counts) >= 3:
+        mean = statistics.mean(day_counts)
+        sd = statistics.pstdev(day_counts) if len(day_counts) > 1 else 0.0
+        if sd > 0:
+            for d, entries_for_day in by_day.items():
+                z = (len(entries_for_day) - mean) / sd
+                if abs(z) >= z_threshold:
+                    result.append(Anomaly(user, "daily_volume", len(entries_for_day), mean, z, day=d))
+    by_hour: dict[int, list[Entry]] = {}
+    for e in user_entries:
+        if e.ts:
+            by_hour.setdefault(e.ts.hour, []).append(e)
+    hour_counts = [len(v) for v in by_hour.values()]
+    if len(hour_counts) >= 3:
+        mean_h = statistics.mean(hour_counts)
+        sd_h = statistics.pstdev(hour_counts) if len(hour_counts) > 1 else 0.0
+        if sd_h > 0:
+            for h, entries_for_hour in by_hour.items():
+                z = (len(entries_for_hour) - mean_h) / sd_h
+                if abs(z) >= z_threshold:
+                    result.append(Anomaly(user, "hourly_volume", len(entries_for_hour), mean_h, z, hour=h))
+    return result
+
+# ---------- NEW: User lifecycle (#10) -----------------------------------------
+
+@dataclass
+class LifecycleStage:
+    user: str
+    first_seen: datetime | None
+    last_seen: datetime | None
+    active_days: int
+    total_days: int
+    activity_trend: str
+    stages: list[tuple[str, datetime, datetime]]  # (stage_name, start, end)
+
+def analyze_lifecycle(entries: list[Entry], user: str, gap_days: int = 14) -> LifecycleStage:
+    u = user.lower()
+    user_entries = sorted(
+        [e for e in entries if e.user and e.user.lower() == u and e.ts],
+        key=lambda e: e.ts
+    )
+    if not user_entries:
+        return LifecycleStage(user, None, None, 0, 0, "unknown", [])
+    first = user_entries[0].ts
+    last = user_entries[-1].ts
+    total_days = max((last - first).days, 1)
+    active_dates = {e.ts.date() for e in user_entries if e.ts}
+    active_days = len(active_dates)
+    # trend: compare first half to second half activity density
+    midpoint = first + (last - first) / 2
+    first_half = sum(1 for e in user_entries if e.ts and e.ts <= midpoint)
+    second_half = sum(1 for e in user_entries if e.ts and e.ts > midpoint)
+    if first_half == 0:
+        trend = "new"
+    elif second_half / first_half > 1.3:
+        trend = "growing"
+    elif second_half / first_half < 0.7:
+        trend = "declining"
+    else:
+        trend = "stable"
+    # detect stages: active periods separated by gaps
+    stages: list[tuple[str, datetime, datetime]] = []
+    stage_start = user_entries[0].ts
+    stage_end = user_entries[0].ts
+    for e in user_entries[1:]:
+        gap = (e.ts - stage_end).days
+        if gap > gap_days:
+            stages.append(("active", stage_start, stage_end))
+            stage_start = e.ts
+        stage_end = e.ts
+    stages.append(("active", stage_start, stage_end))
+    return LifecycleStage(user, first, last, active_days, total_days, trend, stages)
+
+# ---------- NEW: Pattern-of-life analysis (#11) -------------------------------
+
+@dataclass
+class PatternOfLife:
+    user: str
+    hourly_profile: dict[int, float]  # hour -> normalized activity
+    weekday_profile: dict[int, float]  # day -> normalized
+    peak_hour: int | None
+    quiet_hours: list[int]
+    consistency_score: float  # 0-1 how consistent the pattern is
+
+def pattern_of_life(entries: list[Entry], user: str) -> PatternOfLife:
+    u = user.lower()
+    user_entries = [e for e in entries if e.user and e.user.lower() == u and e.ts]
+    if len(user_entries) < 10:
+        return PatternOfLife(user, {}, {}, None, [], 0.0)
+    hourly: Counter = Counter()
+    weekly: Counter = Counter()
+    for e in user_entries:
+        if e.ts:
+            hourly[e.ts.hour] += 1
+            weekly[e.ts.weekday()] += 1
+    total_h = max(sum(hourly.values()), 1)
+    total_w = max(sum(weekly.values()), 1)
+    hour_profile = {h: hourly.get(h, 0) / total_h for h in range(24)}
+    week_profile = {d: weekly.get(d, 0) / total_w for d in range(7)}
+    peak_hour = max(range(24), key=lambda h: hourly.get(h, 0)) if hourly else None
+    mean_h = statistics.mean([hourly.get(h, 0) for h in range(24)])
+    sd_h = statistics.pstdev([hourly.get(h, 0) for h in range(24)]) or 1
+    quiet = [h for h in range(24) if (hourly.get(h, 0) - mean_h) / sd_h < -1]
+    # consistency: coefficient of variation across days
+    if len(user_entries) >= 3:
+        by_day: dict[str, int] = {}
+        for e in user_entries:
+            if e.ts:
+                by_day[e.ts.date().isoformat()] = by_day.get(e.ts.date().isoformat(), 0) + 1
+        counts = list(by_day.values())
+        cv = statistics.pstdev(counts) / (statistics.mean(counts) or 1)
+        consistency = max(0.0, min(1.0, 1.0 - cv))
+    else:
+        consistency = 0.0
+    return PatternOfLife(user, hour_profile, week_profile, peak_hour, quiet, consistency)
+
+# ---------- NEW: Alert rules engine (#13) -------------------------------------
+
+@dataclass
+class AlertRule:
+    name: str
+    field: str  # user|target|level|score_key
+    op: str  # == != > < contains matches
+    value: str
+    message: str
+    enabled: bool = True
+
+class AlertEngine:
+    def __init__(self) -> None:
+        self.rules: list[AlertRule] = []
+
+    def add(self, rule: AlertRule) -> None:
+        self.rules.append(rule)
+
+    def remove(self, name: str) -> bool:
+        before = len(self.rules)
+        self.rules = [r for r in self.rules if r.name != name]
+        return len(self.rules) < before
+
+    def evaluate(self, entry: Entry) -> list[str]:
+        out: list[str] = []
+        for rule in self.rules:
+            if not rule.enabled:
+                continue
+            val: str | None = None
+            if rule.field == "user":
+                val = entry.user
+            elif rule.field == "target":
+                val = entry.target
+            elif rule.field == "level":
+                val = entry.level
+            elif rule.field in SCORE_KEYS:
+                scores = _scores_from_raw(entry.raw)
+                sv = scores.get(rule.field)
+                val = str(sv) if sv is not None else None
+            else:
+                val = entry.raw
+            if val is None:
+                continue
+            matched = False
+            if rule.op == "==":
+                matched = val.lower() == rule.value.lower()
+            elif rule.op == "!=":
+                matched = val.lower() != rule.value.lower()
+            elif rule.op == ">":
+                try:
+                    matched = float(val) > float(rule.value)
+                except ValueError:
+                    matched = False
+            elif rule.op == "<":
+                try:
+                    matched = float(val) < float(rule.value)
+                except ValueError:
+                    matched = False
+            elif rule.op == "matches":
+                try:
+                    matched = bool(re.search(rule.value, val, re.I))
+                except re.error:
+                    matched = False
+            elif rule.op == "contains":
+                matched = rule.value.lower() in val.lower()
+            if matched:
+                out.append(rule.message.format(val=val, user=entry.user or "?", target=entry.target or "?"))
+        return out
+
+# ---------- NEW: Multi-log correlation (#12) ----------------------------------
+
+@dataclass
+class Correlation:
+    event_a: str
+    event_b: str
+    count: int
+    avg_delay_seconds: float
+
+def correlate_logs(log_a_entries: list[Entry], log_b_entries: list[Entry],
+                   window_seconds: int = 60) -> list[Correlation]:
+    events_a = [(e.ts, e.event or e.user or e.level or "?") for e in log_a_entries if e.ts]
+    events_b = [(e.ts, e.event or e.user or e.level or "?") for e in log_b_entries if e.ts]
+    events_a.sort(key=lambda x: x[0])
+    events_b.sort(key=lambda x: x[0])
+    pair_counts: Counter = Counter()
+    pair_delays: dict[tuple[str, str], list[float]] = {}
+    for tsa, eva in events_a:
+        for tsb, evb in events_b:
+            delay = abs((tsb - tsa).total_seconds())
+            if delay <= window_seconds:
+                pair_counts[(eva, evb)] += 1
+                pair_delays.setdefault((eva, evb), []).append(delay)
+    result: list[Correlation] = []
+    for (ea, eb), cnt in pair_counts.most_common(30):
+        delays = pair_delays.get((ea, eb), [0.0])
+        avg_d = statistics.mean(delays) if delays else 0.0
+        result.append(Correlation(ea, eb, cnt, avg_d))
+    return result
+
 # ---------- views (named filter sets) ---------------------------------------
 
 @dataclass
@@ -933,6 +1367,106 @@ def sparkline(values: list[int]) -> str:
         idx = int((v / peak) * (len(SPARK_GLYPHS) - 1))
         out.append(SPARK_GLYPHS[idx])
     return "".join(out)
+
+# ---------- ASCII timeline (#1) -----------------------------------------------
+
+def ascii_timeline(entries: list[Entry], user: str | None = None,
+                   width: int = 60, height: int = 12) -> str:
+    if user:
+        u = user.lower()
+        filtered = [e for e in entries if e.ts and e.user and e.user.lower() == u]
+    else:
+        filtered = [e for e in entries if e.ts]
+    if not filtered:
+        return "(no timestamped entries)"
+    ts_min = min(e.ts for e in filtered)
+    ts_max = max(e.ts for e in filtered)
+    span = (ts_max - ts_min).total_seconds() or 1
+    buckets: list[list[str]] = [[] for _ in range(width)]
+    for e in filtered:
+        frac = (e.ts - ts_min).total_seconds() / span
+        col = min(int(frac * width), width - 1)
+        label = (e.user or "?")[:6]
+        buckets[col].append(label)
+    max_per_col = max((len(b) for b in buckets), default=1)
+    lines: list[str] = []
+    for row in range(height - 1, -1, -1):
+        threshold = int(max_per_col * row / height) if height > 0 else 0
+        line_chars: list[str] = []
+        for col in range(width):
+            if len(buckets[col]) >= threshold:
+                line_chars.append("█")
+            elif len(buckets[col]) >= threshold - 1 and row > 0:
+                line_chars.append("▄")
+            else:
+                line_chars.append("·")
+        lines.append("".join(line_chars))
+    lines.append("─" * width)
+    label_lines = [f"  start: {ts_min}", f"  end:   {ts_max}", f"  span:  {ts_max - ts_min}"]
+    if user:
+        label_lines.insert(0, f"  user:  {user}")
+    return "\n".join(lines + label_lines)
+
+# ---------- Calendar heatmap (#2) ---------------------------------------------
+
+CALENDAR_COLORS = [" ", "░", "▒", "▓", "█"]
+
+def calendar_heatmap(entries: list[Entry], user: str | None = None,
+                     months: int = 3) -> str:
+    now = datetime.now()
+    start = now - timedelta(days=months * 31)
+    if user:
+        u = user.lower()
+        filtered = [e for e in entries if e.ts and e.user and e.user.lower() == u]
+    else:
+        filtered = [e for e in entries if e.ts]
+    by_date: Counter = Counter()
+    for e in filtered:
+        by_date[e.ts.date()] += 1
+    all_counts = list(by_date.values())
+    if not all_counts:
+        return "(no data)"
+    max_count = max(all_counts) or 1
+    lines: list[str] = []
+    lines.append(f"  Calendar heatmap for {'user ' + user if user else 'all users'} ({len(by_date)} active days)")
+    lines.append(f"  {CALENDAR_COLORS[0]}=0  {CALENDAR_COLORS[1]}=low  {CALENDAR_COLORS[2]}=med  {CALENDAR_COLORS[3]}=high  {CALENDAR_COLORS[4]}=peak")
+    cur = start
+    week: list[str] = []
+    header = True
+    while cur <= now:
+        if cur.weekday() == 0 and week:
+            lines.append("".join(week))
+            week = []
+        if header:
+            lines.append("  " + " ".join("Mon Tue Wed Thu Fri Sat Sun".split()))
+            header = False
+        count = by_date.get(cur.date(), 0)
+        idx = min(int(count / max_count * 4), 4) if max_count > 0 else 0
+        week.append(CALENDAR_COLORS[idx] + CALENDAR_COLORS[idx])
+        cur += timedelta(days=1)
+    if week:
+        lines.append("".join(week))
+    return "\n".join(lines)
+
+# ---------- ASCII network graph (#7) ------------------------------------------
+
+def ascii_network_graph(edges: Counter, top_n: int = 15, width: int = 50) -> str:
+    top_edges = edges.most_common(top_n)
+    if not top_edges:
+        return "(no edges)"
+    # collect nodes
+    nodes: set[str] = set()
+    for (a, b), _ in top_edges:
+        nodes.add(a)
+        nodes.add(b)
+    max_weight = max(w for _, w in top_edges) or 1
+    lines: list[str] = [f"  Network graph ({len(nodes)} nodes, {len(top_edges)} edges shown)"]
+    # print adjacency list
+    for (a, b), w in top_edges:
+        bar_len = int(w / max_weight * 20)
+        bar = "━" * bar_len + "➤" if bar_len > 0 else "➤"
+        lines.append(f"  {a:<15} {bar:<22} {b:<15}  (w={w})")
+    return "\n".join(lines)
 
 
 class Spinner:
@@ -1387,6 +1921,124 @@ def ask_about_user_with_llm(user: str, question: str, lines: list[str],
             print(f"Final merge failed: {exc}", file=sys.stderr)
 
 
+# ---------- NEW: LLM anomaly explanation (#19) --------------------------------
+
+def llm_explain_anomalies(anomalies: list[Anomaly], context_lines: list[str],
+                          llm_url: str, model: str, max_chars: int = 8000,
+                          cache: LLMCache | None = None) -> None:
+    if not anomalies:
+        print("(no anomalies to explain)")
+        return
+    anomaly_text = "\n".join(
+        f"  {a.metric}: value={a.value:.2f}, expected={a.expected:.2f}, z={a.zscore:.2f}, "
+        f"day={a.day or '?'}, hour={a.hour or '?'}"
+        for a in anomalies[:10]
+    )
+    context = "\n".join(context_lines[:50])
+    system = "You are a log-anomaly analyst. Explain what might be happening given the detected anomalies and context."
+    prompt = (
+        f"Detected anomalies:\n{anomaly_text}\n\n"
+        f"Recent context lines:\n{context}\n\n"
+        f"Explain these anomalies: what do they suggest and should we be concerned?"
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, prompt, cache=cache, spinner_msg="LLM explaining anomalies")
+        print(f"\n=== LLM anomaly explanation ===\n{out}")
+    except Exception as exc:
+        print(f"LLM anomaly explanation failed: {exc}")
+
+# ---------- NEW: Conversation summarization (#20) -----------------------------
+
+def llm_summarize_conversation(a: str, b: str, lines: list[str],
+                               llm_url: str, model: str, max_chars: int = 8000,
+                               cache: LLMCache | None = None) -> None:
+    if not lines:
+        print(f"(no conversation to summarize)")
+        return
+    chunks = chunk_lines(lines, max_chars)
+    system = "You summarize chat conversations into bullet points covering topics, tone, and key exchanges."
+    partials: list[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        prompt = (
+            f"Conversation between {a} and {b}, chunk {i}/{len(chunks)}:\n\n"
+            f"{chunk}\n\n"
+            f"Summarize this chunk's conversation as bullet points."
+        )
+        try:
+            out = call_llm_cached(llm_url, model, system, prompt, cache=cache, spinner_msg="LLM summarizing")
+        except Exception as exc:
+            print(f"LLM error: {exc}")
+            return
+        partials.append(out)
+        print(f"\n--- Chunk {i} summary ---\n{out}")
+    if len(partials) > 1:
+        merge_prompt = (
+            f"Combine these per-chunk summaries of a conversation between {a} and {b}:\n\n"
+            + "\n\n".join(f"Chunk {i+1}: {p}" for i, p in enumerate(partials))
+        )
+        try:
+            final = call_llm_cached(llm_url, model, system, merge_prompt, cache=cache)
+            print(f"\n=== Full conversation summary: {a} ↔ {b} ===\n{final}")
+        except Exception as exc:
+            print(f"Merge failed: {exc}")
+
+# ---------- NEW: LLM clustering (#21) -----------------------------------------
+
+def llm_cluster_users(profiles: list[dict], llm_url: str, model: str,
+                      max_chars: int = 12000, cache: LLMCache | None = None) -> None:
+    if len(profiles) < 3:
+        print("Need at least 3 users for clustering.")
+        return
+    sample_budget = max(2000, max_chars // (len(profiles) + 1))
+    parts: list[str] = []
+    for p in profiles[:15]:
+        samples = _trim_samples(p.get("samples", []), sample_budget)
+        parts.append(
+            f"User: {p['user']} (lines={p.get('authored', 0)})\n"
+            f"Score means: {p.get('score_means', {})}\n"
+            f"Peak hours: {_peak_hours(p.get('by_hour', {}))}\n"
+            f"Sample lines:\n" + "\n".join(samples[:10])
+        )
+    system = (
+        "You are a behavioral clustering analyst. Group these users by similar behavior patterns "
+        "(tone, activity, topics, roles). For each group, describe the common traits. "
+        "Flag any users that are anomalous outliers."
+    )
+    prompt = f"Cluster these {len(profiles)} users into behavioral groups:\n\n" + "\n---\n".join(parts)
+    try:
+        out = call_llm_cached(llm_url, model, system, prompt, cache=cache, spinner_msg="LLM clustering")
+        print(f"\n=== LLM user clustering ===\n{out}")
+    except Exception as exc:
+        print(f"LLM clustering failed: {exc}")
+
+# ---------- NEW: Automated LLM report (#22) -----------------------------------
+
+def llm_auto_report(summary: dict, top_profiles: list[dict], llm_url: str, model: str,
+                    max_chars: int = 12000, cache: LLMCache | None = None) -> None:
+    system = "You are a log analysis reporter. Generate a concise narrative report of the key findings."
+    summary_part = (
+        f"Total entries: {summary.get('total', 0)}\n"
+        f"Time range: {summary.get('first_ts')} to {summary.get('last_ts')}\n"
+        f"Top users: {summary.get('top_users', [])[:10]}\n"
+        f"Top events: {summary.get('top_events', [])[:10]}\n"
+    )
+    profile_parts: list[str] = []
+    for p in top_profiles[:5]:
+        profile_parts.append(
+            f"{p['user']}: lines={p.get('authored', 0)}, "
+            f"scores={p.get('score_means', {})}"
+        )
+    prompt = (
+        f"Log summary:\n{summary_part}\n\n"
+        f"Top user profiles:\n" + "\n".join(profile_parts) + "\n\n"
+        f"Generate a 1-2 paragraph narrative report of the key findings, trends, and anomalies."
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, prompt, cache=cache, spinner_msg="LLM generating report")
+        print(f"\n=== Automated log report ===\n{out}")
+    except Exception as exc:
+        print(f"Auto report failed: {exc}")
+
 # ---------- exports ---------------------------------------------------------
 
 def serialize_profile(profile: dict, sample_cap: int = 200) -> dict:
@@ -1456,6 +2108,131 @@ def export_edges_dot(edges: Counter, path: str, top: int = 200) -> None:
             f.write(f'  "{a}" -> "{b}" [label="{n}", penwidth={pen:.1f}];\n')
         f.write("}\n")
 
+
+# ---------- HTML report (#15) ------------------------------------------------
+
+def generate_html_report(summary: dict, profiles: list[dict] | None = None,
+                         title: str = "Log Analysis Report") -> str:
+    def _esc(s):
+        return html_mod.escape(str(s))
+    body_parts: list[str] = []
+    body_parts.append(f"<h2>Summary</h2><table>")
+    body_parts.append(f"<tr><td>Total entries</td><td>{summary.get('total', 0)}</td></tr>")
+    if summary.get("first_ts"):
+        body_parts.append(f"<tr><td>Time range</td><td>{summary['first_ts']} &rarr; {summary['last_ts']}</td></tr>")
+    body_parts.append("</table>")
+    if summary.get("top_users"):
+        body_parts.append("<h2>Top Users</h2><table><tr><th>User</th><th>Count</th></tr>")
+        for name, n in summary["top_users"][:20]:
+            body_parts.append(f"<tr><td>{_esc(name)}</td><td>{n}</td></tr>")
+        body_parts.append("</table>")
+    if summary.get("top_events"):
+        body_parts.append("<h2>Top Events</h2><table><tr><th>Event</th><th>Count</th></tr>")
+        for name, n in summary["top_events"][:20]:
+            body_parts.append(f"<tr><td>{_esc(name)}</td><td>{n}</td></tr>")
+        body_parts.append("</table>")
+    if profiles:
+        body_parts.append("<h2>User Profiles</h2>")
+        for p in profiles:
+            body_parts.append(f"<h3>{_esc(p.get('user', '?'))}</h3><table>")
+            body_parts.append(f"<tr><td>Authored</td><td>{p.get('authored', 0)}</td></tr>")
+            body_parts.append(f"<tr><td>Mentioned by others</td><td>{p.get('mentioned_by_others', 0)}</td></tr>")
+            body_parts.append("</table>")
+    html = f"""<!DOCTYPE html><html lang="en">
+<head><meta charset="utf-8"><title>{_esc(title)}</title>
+<style>body{{font-family:sans-serif;margin:2em;background:#fafafa}}
+table{{border-collapse:collapse;margin:1em 0}}
+td,th{{border:1px solid #ccc;padding:4px 8px;text-align:left}}
+th{{background:#eee}} h2{{margin-top:2em}}</style></head>
+<body><h1>{_esc(title)}</h1>
+{"".join(body_parts)}
+</body></html>"""
+    return html
+
+def write_html_report(path: str, summary: dict, profiles: list[dict] | None = None) -> None:
+    html = generate_html_report(summary, profiles, os.path.basename(path))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"Wrote HTML report to {path} ({len(html)} bytes)")
+
+# ---------- SQLite export/query (#18) -----------------------------------------
+
+def export_to_sqlite(entries: list[Entry], db_path: str) -> str:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS entries (ts TEXT, user TEXT, target TEXT, level TEXT, event TEXT, text TEXT, raw TEXT, fmt TEXT)")
+        conn.execute("DELETE FROM entries")
+        rows = []
+        for e in entries:
+            rows.append((
+                e.ts.isoformat() if e.ts else None,
+                e.user, e.target, e.level, e.event, e.text, e.raw, e.fmt,
+            ))
+        conn.executemany("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?)", rows)
+        conn.commit()
+        return f"Exported {len(rows)} rows to {db_path}"
+    finally:
+        conn.close()
+
+def query_sqlite(db_path: str, query: str) -> list[dict]:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(query)
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+# ---------- Prometheus metrics (#17) ------------------------------------------
+
+def prometheus_metrics(entries: list[Entry]) -> str:
+    lines: list[str] = []
+    lines.append("# HELP analyzelog_entries_total Total log entries")
+    lines.append("# TYPE analyzelog_entries_total counter")
+    lines.append(f"analyzelog_entries_total {len(entries)}")
+    users: Counter = Counter()
+    levels: Counter = Counter()
+    targets: Counter = Counter()
+    for e in entries:
+        if e.user:
+            users[e.user] += 1
+        if e.level:
+            levels[e.level.upper()] += 1
+        if e.target:
+            targets[e.target] += 1
+    lines.append("# HELP analyzelog_user_lines Lines per user")
+    lines.append("# TYPE analyzelog_user_lines gauge")
+    for u, n in users.most_common(50):
+        lines.append(f'analyzelog_user_lines{{user="{u}"}} {n}')
+    lines.append("# HELP analyzelog_level_counts Entries per severity level")
+    lines.append("# TYPE analyzelog_level_counts gauge")
+    for lv, n in levels.items():
+        lines.append(f'analyzelog_level_counts{{level="{lv}"}} {n}')
+    lines.append("# HELP analyzelog_target_counts Entries per target")
+    lines.append("# TYPE analyzelog_target_counts gauge")
+    for t, n in targets.most_common(50):
+        lines.append(f'analyzelog_target_counts{{target="{t}"}} {n}')
+    return "\n".join(lines)
+
+# ---------- Multi-file aggregation (#27) --------------------------------------
+
+class MultiLogAggregator:
+    def __init__(self) -> None:
+        self.sources: dict[str, list[Entry]] = {}
+
+    def add_file(self, label: str, path: str) -> None:
+        entries = list(iter_entries(path))
+        self.sources[label] = entries
+
+    @property
+    def all_entries(self) -> list[Entry]:
+        result: list[Entry] = []
+        for entries in self.sources.values():
+            result.extend(entries)
+        return result
+
+    def summary_by_source(self) -> dict[str, dict]:
+        return {label: summarize(entries, 50) for label, entries in self.sources.items()}
 
 # ---------- diff between two log files --------------------------------------
 
@@ -1586,6 +2363,146 @@ class WatchBg:
                 self.new_count += len(new_entries)
 
 
+# ---------- Plugin system (#23) -----------------------------------------------
+
+class AnalysisPlugin:
+    name: str = "base"
+    def analyze(self, entries: list[Entry]) -> str:
+        return ""
+    def commands(self) -> dict[str, str]:
+        return {}
+
+_plugins: list[AnalysisPlugin] = []
+
+def register_plugin(plugin: AnalysisPlugin) -> None:
+    _plugins.append(plugin)
+
+def load_plugins_from(path: str) -> None:
+    if not os.path.isdir(path):
+        return
+    import importlib.util
+    for fname in sorted(os.listdir(path)):
+        if not fname.endswith(".py") or fname.startswith("_"):
+            continue
+        fpath = os.path.join(path, fname)
+        try:
+            spec = importlib.util.spec_from_file_location(fname[:-3], fpath)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                for attr in dir(mod):
+                    obj = getattr(mod, attr)
+                    if isinstance(obj, type) and issubclass(obj, AnalysisPlugin) and obj is not AnalysisPlugin:
+                        register_plugin(obj())
+        except Exception as exc:
+            print(f"Plugin load error {fname}: {exc}", file=sys.stderr)
+
+# ---------- Web API / Web UI (#24) --------------------------------------------
+
+_web_entries: list[Entry] = []
+_web_queue: Queue = Queue()
+
+class WebAPIHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/metrics":
+            self._json_response(prometheus_metrics(_web_entries))
+        elif parsed.path == "/api/summary":
+            self._json_dict(summarize(_web_entries, 25))
+        elif parsed.path == "/api/entries":
+            n_str = urllib.parse.parse_qs(parsed.query).get("n", ["50"])[0]
+            try:
+                n = int(n_str)
+            except ValueError:
+                n = 50
+            recent = [{"ts": str(e.ts), "user": e.user, "target": e.target,
+                       "level": e.level, "event": e.event, "text": e.text[:200]}
+                      for e in _web_entries[-n:]]
+            self._json_list(recent)
+        elif parsed.path == "/api/users":
+            users = sorted({e.user for e in _web_entries if e.user})
+            self._json_list(users)
+        elif parsed.path == "/" or parsed.path == "/index.html":
+            self._html_response("<html><body><h1>Log Analyzer</h1>"
+                                f"<p>{len(_web_entries)} entries loaded.</p>"
+                                "<ul><li><a href='/api/summary'>/api/summary</a></li>"
+                                "<li><a href='/api/entries'>/api/entries</a></li>"
+                                "<li><a href='/api/users'>/api/users</a></li>"
+                                "<li><a href='/metrics'>/metrics</a></li></ul></body></html>")
+        else:
+            self.send_error(404)
+    def _json_response(self, data: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(data.encode())
+    def _json_dict(self, d: dict) -> None:
+        self._json_response(json.dumps(d, indent=2, default=str))
+    def _json_list(self, lst: list) -> None:
+        self._json_response(json.dumps(lst, indent=2, default=str))
+    def _html_response(self, html: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(html.encode())
+    def log_message(self, format, *args) -> None:  # type: ignore[override]
+        pass
+
+def start_web_server(port: int = 8088, daemon: bool = True) -> HTTPServer:
+    server = HTTPServer(("127.0.0.1", port), WebAPIHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=daemon)
+    t.start()
+    return server
+
+# ---------- Slack/Discord webhook (#25) ---------------------------------------
+
+def send_webhook(url: str, message: str, webhook_type: str = "slack") -> bool:
+    if webhook_type == "slack":
+        payload = json.dumps({"text": message}).encode()
+    elif webhook_type == "discord":
+        payload = json.dumps({"content": message}).encode()
+    else:
+        payload = json.dumps({"text": message}).encode()
+    try:
+        req = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200 or resp.status == 204
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"Webhook send failed: {exc}", file=sys.stderr)
+        return False
+
+# ---------- Cron mode (#26) ---------------------------------------------------
+
+def cron_mode(entries: list[Entry], alert_engine: AlertEngine | None = None,
+              webhook_url: str | None = None, output_path: str | None = None) -> int:
+    s = summarize(entries, 15)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        print(f"=== Cron run at {datetime.now().isoformat()} ===")
+        print_report(s)
+        if alert_engine:
+            triggered: list[str] = []
+            for e in entries:
+                triggered.extend(alert_engine.evaluate(e))
+            if triggered:
+                print(f"\n=== Alert triggers ({len(triggered)}) ===")
+                for msg in triggered:
+                    print(f"  ALERT: {msg}")
+    result = output.getvalue()
+    print(result)
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as f:
+            f.write(result)
+    if webhook_url and alert_engine:
+        triggered_msgs = []
+        for e in entries:
+            triggered_msgs.extend(alert_engine.evaluate(e))
+        if triggered_msgs:
+            send_webhook(webhook_url, "\n".join(triggered_msgs[:5]))
+    return 0
+
 # ---------- TUI --------------------------------------------------------------
 
 @dataclass
@@ -1614,6 +2531,15 @@ class ShellState:
     pager_enabled: bool = True
     color_enabled: bool = True
     watch_bg: "WatchBg | None" = None
+    # NEW feature fields:
+    alert_engine: AlertEngine = field(default_factory=AlertEngine)
+    aggregator: MultiLogAggregator = field(default_factory=MultiLogAggregator)
+    web_server: "HTTPServer | None" = None
+    webhook_url: str = ""
+    webhook_type: str = "slack"
+    cron_output: str = ""
+    multi_log_sources: dict[str, list[Entry]] = field(default_factory=dict)
+    plugin_dir: str = ""
 
 
 class LogShell(cmd.Cmd):
@@ -2611,6 +3537,12 @@ class LogShell(cmd.Cmd):
             _Color.enabled = on
             print(f"color = {on}")
             return
+        elif key == "webhook_url":
+            self.state.webhook_url = value
+        elif key == "webhook_type":
+            self.state.webhook_type = value
+        elif key == "plugin_dir":
+            self.state.plugin_dir = value
         else:
             print(f"Unknown setting: {key}. See 'settings'.")
             return
@@ -2646,6 +3578,13 @@ class LogShell(cmd.Cmd):
             print(f"  notes           = {len(st.notes)} users")
         if st.watch_bg:
             print(f"  watch_bg        = running (+{st.watch_bg.new_count} new since last check)")
+        print(f"  webhook_url     = {st.webhook_url or '(not set)'}")
+        print(f"  webhook_type    = {st.webhook_type}")
+        print(f"  plugin_dir      = {st.plugin_dir or '(not set)'}")
+        print(f"  rules           = {len(st.alert_engine.rules)} alert rules")
+        print(f"  multi_sources   = {len(st.multi_log_sources)} sources")
+        if st.web_server:
+            print(f"  web_server      = running (:{st.web_server.server_port})")
         print(f"  back/fwd        = {len(st.focus_back)}/{len(st.focus_forward)}")
 
     def do_commands(self, arg: str) -> None:
@@ -2699,8 +3638,35 @@ class LogShell(cmd.Cmd):
              "Maintain global ignore list (excluded from analyses)."),
             ("note", "note <user> [<text> | --del]", "Attach a note to a user (persisted)."),
             ("set", "set <key> <value>",
-             "Configure: top, llm_url, llm_model, max_chunk_chars, llm_cache, pager, color."),
+             "Configure: top, llm_url, llm_model, max_chunk_chars, llm_cache, pager, color, webhook_url, webhook_type, plugin_dir."),
             ("settings", "settings", "Show current settings."),
+            ("sessions", "sessions [user] [gap_min]", "Detect user sessions with configurable gap."),
+            ("response_times", "response_times [user] [window_sec]", "Response time analysis between users."),
+            ("sentiment", "sentiment [user]", "Sentiment analysis for a user."),
+            ("topics", "topics [user]", "Keyword and n-gram extraction for a user."),
+            ("sequences", "sequences [min_support]", "Common user interaction sequences."),
+            ("anomalies", "anomalies [user] [z]", "Detect behavioral anomalies."),
+            ("lifecycle", "lifecycle [user]", "User lifecycle analysis (first/last seen, trend, stages)."),
+            ("pattern", "pattern [user]", "Pattern-of-life analysis (hourly/weekly profile)."),
+            ("rules", "rules [add|remove|toggle] ...", "Manage alert rules engine."),
+            ("correlate", "correlate <path> [window_s]", "Cross-log event correlation."),
+            ("timeline", "timeline [user] [width]", "ASCII timeline visualization."),
+            ("heatmap", "heatmap [user] [months]", "Calendar activity heatmap."),
+            ("net", "net [N]", "ASCII network graph of top interaction edges."),
+            ("export_html", "export_html <path> [user...]", "Generate HTML report."),
+            ("export_sql", "export_sql <path>", "Export entries to SQLite database."),
+            ("sql", "sql <db> <query>", "Query a SQLite export."),
+            ("prometheus", "prometheus", "Print Prometheus metrics."),
+            ("multi", "multi {add|list|clear|report} ...", "Multi-log aggregation."),
+            ("aggregate", "aggregate", "Alias for 'multi report'."),
+            ("llm_explain", "llm_explain [user] [z]", "Detect anomalies and have LLM explain them."),
+            ("summarize", "summarize <A> <B>", "LLM conversation summarization."),
+            ("cluster", "cluster [min_lines] [N]", "LLM clustering of user behavior."),
+            ("auto_report", "auto_report", "LLM-generated narrative report."),
+            ("plugin", "plugin {load|list|reload} [dir]", "Manage analysis plugins."),
+            ("web", "web {start|stop|status} [port]", "Start/stop the web API server."),
+            ("webhook", "webhook {set|test|clear} ...", "Configure Slack/Discord webhook."),
+            ("cron", "cron [--output <path>] [--webhook-url <url>]", "Run analysis in cron mode."),
             ("commands", "commands  (or ??)", "Print this reference."),
             ("help", "help [name]  (or ?<name>)", "Built-in help."),
             ("quit", "quit  (exit, Ctrl-D)", "Exit the shell."),
@@ -2719,11 +3685,538 @@ class LogShell(cmd.Cmd):
             "    - Launch with --c to print this reference on startup."
         )
 
+    # --- NEW: sessions (#5) -------------------------------------------------
+    def do_sessions(self, arg: str) -> None:
+        """sessions [user] [gap_minutes]   Detect user sessions."""
+        parts = self._split(arg)
+        user = parts[0] if parts and not parts[0].replace(".", "").isdigit() else self.state.focused_user
+        gap = 30
+        for p in parts:
+            try:
+                gap = int(p)
+            except ValueError:
+                if user is None:
+                    user = p
+        user = self._resolve_user(user or "")
+        if not user:
+            return
+        sessions = detect_sessions(self._active_entries(), user, gap)
+        if not sessions:
+            print(f"No sessions for '{user}'.")
+            return
+        print(f"\nSessions for '{user}' (gap={gap}min):")
+        total_lines = sum(s.line_count for s in sessions)
+        for i, s in enumerate(sessions, 1):
+            dur = (s.end - s.start).total_seconds()
+            dur_s = f"{dur / 60:.0f}min" if dur < 3600 else f"{dur / 3600:.1f}h"
+            print(f"  #{i:<3d}  {s.start:%H:%M} - {s.end:%H:%M}  {dur_s:>10}  {s.line_count:>4d} lines")
+        print(f"  Total: {len(sessions)} sessions, {total_lines} lines")
+
+    # --- NEW: response_times (#6) -------------------------------------------
+    def do_response_times(self, arg: str) -> None:
+        """response_times [user] [window_sec]   Response time analysis."""
+        parts = self._split(arg)
+        user = parts[0] if parts else None
+        window = 300
+        for p in parts:
+            try:
+                window = int(p)
+            except ValueError:
+                user = p
+        rts = compute_response_times(self._active_entries(), window)
+        if user:
+            u = user.lower()
+            rts = [r for r in rts if r.responder.lower() == u or r.responded_to.lower() == u]
+        if not rts:
+            print("(no response time data)")
+            return
+        delays = [r.delay_seconds for r in rts]
+        mean_d = statistics.mean(delays)
+        print(f"\nResponse times ({len(rts)} exchanges):")
+        print(f"  Mean: {mean_d:.0f}s  Median: {statistics.median(delays):.0f}s")
+        by_responder: Counter = Counter()
+        for r in rts:
+            by_responder[f"{r.responder} -> {r.responded_to}"] += 1
+        print("  Top responder pairs:")
+        for pair, cnt in by_responder.most_common(10):
+            avg = statistics.mean([r.delay_seconds for r in rts if f"{r.responder} -> {r.responded_to}" == pair])
+            print(f"    {cnt:>4d}x  {pair:<30s}  avg={avg:.0f}s")
+
+    # --- NEW: sentiment (#4) -------------------------------------------------
+    def do_sentiment(self, arg: str) -> None:
+        """sentiment [user]   Sentiment analysis for a user (or focused)."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        s = user_sentiment(self._active_entries(), user)
+        if not s:
+            print(f"(no data for '{user}')")
+            return
+        print(f"\nSentiment for '{user}':")
+        print(f"  n={s['n']}")
+        print(f"  mean compound: {s['mean_compound']:.3f}")
+        print(f"  positive rate: {s['pos_rate']:.1%}")
+        print(f"  negative rate: {s['neg_rate']:.1%}")
+        print(f"  agreement rate: {s['agree_rate']:.1%}")
+
+    # --- NEW: topics (#3) ----------------------------------------------------
+    def do_topics(self, arg: str) -> None:
+        """topics [user]   Keyword and n-gram extraction for a user (or focused)."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        t = user_topics(self._active_entries(), user)
+        if not t or not t.get("keywords"):
+            print(f"(no topic data for '{user}')")
+            return
+        print(f"\nTopics for '{user}':")
+        print("  Top keywords:")
+        for kw, n in t["keywords"][:15]:
+            print(f"    {n:>5d}  {kw}")
+        print("  Top bigrams:")
+        for kw, n in t["bigrams"][:10]:
+            print(f"    {n:>5d}  {kw}")
+        print("  Top trigrams:")
+        for kw, n in t["trigrams"][:5]:
+            print(f"    {n:>5d}  {kw}")
+
+    # --- NEW: sequences (#14) ------------------------------------------------
+    def do_sequences(self, arg: str) -> None:
+        """sequences [min_support]   Find common user interaction sequences."""
+        min_support = int(arg.strip()) if arg.strip().isdigit() else 3
+        seqs = find_common_sequences(self._active_entries(), min_support=min_support)
+        if not seqs:
+            print("(no sequences found)")
+            return
+        print(f"\nCommon sequences (min_support={min_support}):")
+        for s in seqs:
+            pat = " -> ".join(s.pattern)
+            print(f"  {s.count:>5d}x  {pat}")
+
+    # --- NEW: anomalies (#8) -------------------------------------------------
+    def do_anomalies(self, arg: str) -> None:
+        """anomalies [user] [z_threshold]   Detect behavioral anomalies."""
+        parts = self._split(arg)
+        user = parts[0] if parts else self.state.focused_user
+        z = 2.5
+        for p in parts:
+            try:
+                z = float(p)
+            except ValueError:
+                user = p
+        user = self._resolve_user(user or "")
+        if not user:
+            return
+        anoms = detect_anomalies(self._active_entries(), user, z)
+        if not anoms:
+            print(f"(no anomalies for '{user}' at z>={z})")
+            return
+        print(f"\nAnomalies for '{user}' (z>={z}):")
+        for a in anoms:
+            dir_ = "HIGH" if a.value > a.expected else "LOW"
+            print(f"  {dir_:>4}  {a.metric:<20s} value={a.value:.1f} expected={a.expected:.1f} z={a.zscore:.2f}  {a.day or ''} h{a.hour or ''}")
+
+    # --- NEW: lifecycle (#10) ------------------------------------------------
+    def do_lifecycle(self, arg: str) -> None:
+        """lifecycle [user]   User lifecycle analysis."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        lc = analyze_lifecycle(self._active_entries(), user)
+        if not lc.first_seen:
+            print(f"(no data for '{user}')")
+            return
+        print(f"\nLifecycle for '{user}':")
+        print(f"  First seen: {_fmt_dt(lc.first_seen)}")
+        print(f"  Last seen:  {_fmt_dt(lc.last_seen)}")
+        print(f"  Active days: {lc.active_days} / {lc.total_days} total ({lc.active_days / max(lc.total_days, 1) * 100:.0f}%)")
+        print(f"  Trend: {lc.activity_trend}")
+        print(f"  Stages ({len(lc.stages)}):")
+        for i, (stage, st, en) in enumerate(lc.stages, 1):
+            dur = (en - st).days
+            print(f"    #{i} {stage}  {st.date()} - {en.date()}  ({dur}d)")
+
+    # --- NEW: pattern (#11) --------------------------------------------------
+    def do_pattern(self, arg: str) -> None:
+        """pattern [user]   Pattern-of-life analysis for a user."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        pol = pattern_of_life(self._active_entries(), user)
+        if not pol.hourly_profile:
+            print(f"(insufficient data for '{user}')")
+            return
+        print(f"\nPattern of life for '{user}' (consistency={pol.consistency_score:.2f}):")
+        print("  Hourly activity profile (normalized):")
+        glyphs = "▁▂▃▄▅▆▇█"
+        vals = [pol.hourly_profile.get(h, 0) for h in range(24)]
+        peak_v = max(vals) or 1
+        bar = "".join(glyphs[min(int(v / peak_v * 7), 7)] for v in vals)
+        print(f"    {bar}  (00..23)")
+        print(f"  Peak hour: {pol.peak_hour}:00")
+        print(f"  Quiet hours: {', '.join(f'{h}:00' for h in pol.quiet_hours) or 'none'}")
+        print("  Weekday profile:")
+        days = "Mon Tue Wed Thu Fri Sat Sun".split()
+        for d in range(7):
+            bar_len = int(pol.weekday_profile.get(d, 0) / (max(pol.weekday_profile.values()) or 1) * 20)
+            print(f"    {days[d]}: {'█' * bar_len}")
+
+    # --- NEW: rules / alert (#13) --------------------------------------------
+    def do_rules(self, arg: str) -> None:
+        """rules   List alert rules.
+        rules add <name> <field> <op> <value> <message>
+        rules remove <name>
+        rules toggle <name>"""
+        parts = self._split(arg)
+        if not parts:
+            if not self.state.alert_engine.rules:
+                print("(no alert rules)")
+                return
+            print("Alert rules:")
+            for r in self.state.alert_engine.rules:
+                status = "ON" if r.enabled else "OFF"
+                print(f"  [{status}] {r.name}: if {r.field} {r.op} {r.value!r} -> {r.message}")
+            return
+        sub = parts[0].lower()
+        if sub == "add" and len(parts) >= 6:
+            self.state.alert_engine.add(AlertRule(parts[1], parts[2], parts[3], parts[4], " ".join(parts[5:])))
+            print(f"Added rule '{parts[1]}'.")
+        elif sub == "remove" and len(parts) >= 2:
+            if self.state.alert_engine.remove(parts[1]):
+                print(f"Removed rule '{parts[1]}'.")
+            else:
+                print(f"(no rule '{parts[1]}')")
+        elif sub == "toggle" and len(parts) >= 2:
+            for r in self.state.alert_engine.rules:
+                if r.name == parts[1]:
+                    r.enabled = not r.enabled
+                    print(f"Rule '{parts[1]}' toggled {'ON' if r.enabled else 'OFF'}")
+                    return
+            print(f"(no rule '{parts[1]}')")
+        else:
+            print("Usage: rules [add <name> <field> <op> <value> <message> | remove <name> | toggle <name>]")
+
+    # --- NEW: correlate (#12) ------------------------------------------------
+    def do_correlate(self, arg: str) -> None:
+        """correlate <path> [window_sec]   Cross-log event correlation."""
+        parts = self._split(arg)
+        if not parts:
+            print("Usage: correlate <other_log_path> [window_seconds]")
+            return
+        path = parts[0]
+        window = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 60
+        try:
+            other = list(iter_entries(path))
+        except FileNotFoundError:
+            print(f"File not found: {path}")
+            return
+        corr = correlate_logs(self.state.entries, other, window)
+        if not corr:
+            print("(no correlations found)")
+            return
+        print(f"\nCorrelations (window={window}s, {len(corr)} pairs):")
+        for c in corr[:20]:
+            print(f"  {c.count:>5d}x  {c.event_a:<25s}  ~~  {c.event_b:<25s}  avg_delay={c.avg_delay_seconds:.0f}s")
+
+    # --- NEW: timeline (#1) --------------------------------------------------
+    def do_timeline(self, arg: str) -> None:
+        """timeline [user] [width]   ASCII timeline visualization."""
+        parts = self._split(arg)
+        user = parts[0] if parts and not parts[0].isdigit() else self.state.focused_user
+        width = 60
+        for p in parts:
+            if p.isdigit():
+                width = min(int(p), 200)
+        lines = ascii_timeline(self._active_entries(), user, width=width)
+        print(f"\n{lines}")
+
+    # --- NEW: heatmap (#2) ---------------------------------------------------
+    def do_heatmap(self, arg: str) -> None:
+        """heatmap [user] [months]   Calendar activity heatmap."""
+        parts = self._split(arg)
+        user = parts[0] if parts and not parts[0].isdigit() else self.state.focused_user
+        months = 3
+        for p in parts:
+            if p.isdigit():
+                months = min(int(p), 12)
+        print(f"\n{calendar_heatmap(self._active_entries(), user, months)}")
+
+    # --- NEW: net (#7) -------------------------------------------------------
+    def do_net(self, arg: str) -> None:
+        """net [N]   ASCII network graph of top interaction edges."""
+        n = int(arg.strip()) if arg.strip().isdigit() else 15
+        edges = build_edge_graph(self._active_entries())
+        print(f"\n{ascii_network_graph(edges, top_n=n)}")
+
+    # --- NEW: export_html / export_sql (#15, #18) ----------------------------
+    def do_export_html(self, arg: str) -> None:
+        """export_html <path> [user...]   Generate HTML report."""
+        parts = self._split(arg)
+        if not parts:
+            print("Usage: export_html <path> [user...]")
+            return
+        path = parts[0]
+        users = parts[1:] if len(parts) > 1 else None
+        s = summarize(self._active_entries(), self.state.top_n)
+        profiles = None
+        if users:
+            profiles = [build_profile(self._active_entries(), u) for u in users]
+        write_html_report(path, s, profiles)
+
+    def do_export_sql(self, arg: str) -> None:
+        """export_sql <path>   Export entries to SQLite database."""
+        path = arg.strip()
+        if not path:
+            print("Usage: export_sql <path>")
+            return
+        print(export_to_sqlite(self.state.entries, path))
+
+    def do_sql(self, arg: str) -> None:
+        """sql <db_path> <query>   Query a previously exported SQLite database."""
+        parts = self._split(arg)
+        if len(parts) < 2:
+            print("Usage: sql <db_path> <query>")
+            return
+        db_path, query = parts[0], " ".join(parts[1:])
+        try:
+            rows = query_sqlite(db_path, query)
+        except sqlite3.Error as exc:
+            print(f"SQL error: {exc}")
+            return
+        if not rows:
+            print("(no results)")
+            return
+        headers = list(rows[0].keys())
+        print("  " + "  ".join(f"{h:<20s}" for h in headers))
+        print("  " + "-" * (20 * len(headers)))
+        for row in rows[:100]:
+            print("  " + "  ".join(f"{str(row.get(h, ''))[:20]:<20s}" for h in headers))
+        if len(rows) > 100:
+            print(f"  ...({len(rows) - 100} more rows)")
+
+    # --- NEW: prometheus (#17) -----------------------------------------------
+    def do_prometheus(self, arg: str) -> None:
+        """prometheus   Print Prometheus metrics for the current log."""
+        print(prometheus_metrics(self._active_entries()))
+
+    # --- NEW: multi / aggregate (#27) ----------------------------------------
+    def do_multi(self, arg: str) -> None:
+        """multi {add <label> <path> | list | clear | report}   Multi-log aggregation."""
+        parts = self._split(arg)
+        if not parts:
+            print("Usage: multi add <label> <path>  |  multi list  |  multi clear  |  multi report")
+            return
+        sub = parts[0].lower()
+        if sub == "add" and len(parts) >= 3:
+            label, path = parts[1], parts[2]
+            try:
+                entries = list(iter_entries(path))
+            except FileNotFoundError:
+                print(f"File not found: {path}")
+                return
+            self.state.multi_log_sources[label] = entries
+            print(f"Added '{label}': {len(entries)} entries from {path}")
+        elif sub == "list":
+            if not self.state.multi_log_sources:
+                print("(no sources)")
+                return
+            for label, entries in self.state.multi_log_sources.items():
+                print(f"  {label}: {len(entries)} entries")
+        elif sub == "clear":
+            self.state.multi_log_sources.clear()
+            print("Cleared all multi-log sources.")
+        elif sub == "report":
+            if not self.state.multi_log_sources:
+                print("(no sources)")
+                return
+            for label, entries in self.state.multi_log_sources.items():
+                s = summarize(entries, self.state.top_n)
+                print(f"\n=== {label} ===")
+                print_report(s)
+        else:
+            print(f"Unknown subcommand: {sub}")
+
+    # --- NEW: llm_explain (#19) ----------------------------------------------
+    def do_llm_explain(self, arg: str) -> None:
+        """llm_explain [user] [z]   Detect anomalies and have LLM explain them."""
+        parts = self._split(arg)
+        user = parts[0] if parts else self.state.focused_user
+        z = 2.5
+        for p in parts:
+            try:
+                z = float(p)
+            except ValueError:
+                user = p
+        user = self._resolve_user(user or "")
+        if not user:
+            return
+        anoms = detect_anomalies(self._active_entries(), user, z)
+        if not anoms:
+            print(f"(no anomalies for '{user}')")
+            return
+        context = [e.text or e.raw for e in self._filtered(user)[-100:]]
+        llm_explain_anomalies(anoms, context, self.state.llm_url, self.state.llm_model,
+                              self.state.max_chunk_chars, cache=self.state.llm_cache)
+
+    # --- NEW: summarize (#20) ------------------------------------------------
+    def do_summarize(self, arg: str) -> None:
+        """summarize <userA> <userB>   LLM conversation summarization."""
+        parts = self._split(arg)
+        if len(parts) < 2:
+            print("Usage: summarize <userA> <userB>")
+            return
+        a, b = parts[0], parts[1]
+        matched = [e for e in self._active_entries() if line_is_interaction(e, a, b)]
+        if not matched:
+            print(f"(no interaction data between {a} and {b})")
+            return
+        llm_summarize_conversation(a, b, [e.text for e in matched],
+                                   self.state.llm_url, self.state.llm_model,
+                                   self.state.max_chunk_chars, cache=self.state.llm_cache)
+
+    # --- NEW: cluster (#21) --------------------------------------------------
+    def do_cluster(self, arg: str) -> None:
+        """cluster [min_lines] [N]   LLM clustering of user behavior."""
+        parts = self._split(arg)
+        min_lines = 5
+        max_users = 15
+        for p in parts:
+            if p.isdigit():
+                if min_lines == 5:
+                    min_lines = int(p)
+                else:
+                    max_users = int(p)
+        counts: Counter = Counter(e.user for e in self._active_entries() if e.user)
+        candidates = sorted((u for u, n in counts.items() if n >= min_lines), key=lambda u: -counts[u])[:max_users]
+        if len(candidates) < 3:
+            print("Need at least 3 users with sufficient data.")
+            return
+        profiles = [build_profile(self._active_entries(), u) for u in candidates]
+        llm_cluster_users(profiles, self.state.llm_url, self.state.llm_model,
+                          self.state.max_chunk_chars, cache=self.state.llm_cache)
+
+    # --- NEW: auto_report (#22) ----------------------------------------------
+    def do_auto_report(self, arg: str) -> None:
+        """auto_report   LLM-generated narrative report of the log."""
+        s = summarize(self._active_entries(), self.state.top_n)
+        counts: Counter = Counter(e.user for e in self._active_entries() if e.user)
+        top_users = [u for u, _ in counts.most_common(10)]
+        profiles = [build_profile(self._active_entries(), u) for u in top_users]
+        llm_auto_report(s, profiles, self.state.llm_url, self.state.llm_model,
+                        self.state.max_chunk_chars, cache=self.state.llm_cache)
+
+    # --- NEW: plugin (#23) ---------------------------------------------------
+    def do_plugin(self, arg: str) -> None:
+        """plugin {load <dir> | list | reload}   Manage analysis plugins."""
+        parts = self._split(arg)
+        if not parts:
+            if not _plugins:
+                print("(no plugins loaded)")
+                return
+            print("Loaded plugins:")
+            for p in _plugins:
+                print(f"  {p.name}")
+            return
+        sub = parts[0].lower()
+        if sub == "load" and len(parts) >= 2:
+            path = parts[1]
+            if not os.path.isdir(path):
+                print(f"Not a directory: {path}")
+                return
+            load_plugins_from(path)
+            print(f"Loaded {len(_plugins)} plugins from {path}")
+        elif sub == "list":
+            print(f"Plugins: {len(_plugins)} loaded")
+        elif sub == "reload":
+            _plugins.clear()
+            if self.state.plugin_dir:
+                load_plugins_from(self.state.plugin_dir)
+            print(f"Reloaded: {len(_plugins)} plugins")
+        else:
+            print(f"Unknown: {sub}")
+
+    # --- NEW: web (#24) ------------------------------------------------------
+    def do_web(self, arg: str) -> None:
+        """web {start [port] | stop | status}   Start/stop the web API server."""
+        parts = self._split(arg)
+        if not parts or parts[0].lower() == "status":
+            if self.state.web_server:
+                print(f"Web server running on port {self.state.web_server.server_port}")
+            else:
+                print("(web server not running)")
+            return
+        sub = parts[0].lower()
+        if sub == "start":
+            if self.state.web_server:
+                print("(web server already running)")
+                return
+            port = int(parts[1]) if len(parts) > 1 else 8088
+            global _web_entries  # noqa: PLW0603
+            _web_entries = self.state.entries
+            self.state.web_server = start_web_server(port)
+            print(f"Web server started at http://127.0.0.1:{port}")
+        elif sub == "stop":
+            if self.state.web_server:
+                self.state.web_server.shutdown()
+                self.state.web_server = None
+                print("Web server stopped.")
+            else:
+                print("(not running)")
+
+    # --- NEW: webhook (#25) --------------------------------------------------
+    def do_webhook(self, arg: str) -> None:
+        """webhook {set <url> [slack|discord] | test <message> | clear}   Configure webhook."""
+        parts = self._split(arg)
+        if not parts:
+            if self.state.webhook_url:
+                print(f"Webhook: {self.state.webhook_url} ({self.state.webhook_type})")
+            else:
+                print("(no webhook configured)")
+            return
+        sub = parts[0].lower()
+        if sub == "set" and len(parts) >= 2:
+            self.state.webhook_url = parts[1]
+            self.state.webhook_type = parts[2] if len(parts) > 2 else "slack"
+            print(f"Webhook set to {self.state.webhook_url} ({self.state.webhook_type})")
+        elif sub == "test" and len(parts) >= 2:
+            if not self.state.webhook_url:
+                print("(no webhook configured)")
+                return
+            ok = send_webhook(self.state.webhook_url, " ".join(parts[1:]), self.state.webhook_type)
+            print(f"Webhook test: {'OK' if ok else 'FAILED'}")
+        elif sub == "clear":
+            self.state.webhook_url = ""
+            print("Webhook cleared.")
+
+    # --- NEW: cron (#26) -----------------------------------------------------
+    def do_cron(self, arg: str) -> None:
+        """cron [--output <path>] [--webhook-url <url>]   Run analysis in cron mode."""
+        parts = self._split(arg)
+        output_path = None
+        wh_url = self.state.webhook_url
+        i = 0
+        while i < len(parts):
+            if parts[i] == "--output" and i + 1 < len(parts):
+                output_path = parts[i + 1]; i += 2
+            elif parts[i] == "--webhook-url" and i + 1 < len(parts):
+                wh_url = parts[i + 1]; i += 2
+            else:
+                i += 1
+        cron_mode(self._active_entries(), self.state.alert_engine, wh_url, output_path)
+
+    # --- NEW: multi-file analysis clustering / aggregate command alias --------
+    def do_aggregate(self, arg: str) -> None:
+        """aggregate   Alias for 'multi report'."""
+        self.do_multi("report")
+
     def do_quit(self, arg: str) -> bool:
         """quit   Exit the shell."""
         if self.state.watch_bg:
             self.state.watch_bg.stop()
             self.state.watch_bg = None
+        if self.state.web_server:
+            self.state.web_server.shutdown()
+            self.state.web_server = None
         if self.state.llm_cache:
             self.state.llm_cache.save()
         self._save_history()
@@ -3048,6 +4541,53 @@ class LogShell(cmd.Cmd):
     def complete_watch(self, text, line, begidx, endidx):
         return self._complete_prefix(text, ["--bg", "--stop"])
 
+    # --- new completions ----------------------------------------------------
+    def complete_sessions(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_sentiment(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_topics(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_anomalies(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_lifecycle(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_pattern(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_timeline(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_heatmap(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_llm_explain(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_summarize(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_multi(self, text, line, begidx, endidx):
+        prev = line[:begidx].split()
+        if len(prev) <= 1:
+            return self._complete_prefix(text, ["add", "list", "clear", "report"])
+        if len(prev) == 2 and prev[1] == "add":
+            return self._complete_prefix(text, self._nicks())
+        return []
+    def complete_web(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, ["start", "stop", "status"])
+    def complete_webhook(self, text, line, begidx, endidx):
+        prev = line[:begidx].split()
+        if len(prev) <= 1:
+            return self._complete_prefix(text, ["set", "test", "clear"])
+        return []
+    def complete_plugin(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, ["load", "list", "reload"])
+    def complete_rules(self, text, line, begidx, endidx):
+        prev = line[:begidx].split()
+        if len(prev) <= 1:
+            return self._complete_prefix(text, ["add", "remove", "toggle"])
+        return []
+    def complete_export_html(self, text, line, begidx, endidx):
+        return self._complete_path(text)
+    def complete_export_sql(self, text, line, begidx, endidx):
+        return self._complete_path(text)
+
 
 # ---------- main -------------------------------------------------------------
 
@@ -3102,6 +4642,32 @@ def main(argv: list[str] | None = None) -> int:
                    help="Run TUI command(s) before the prompt (repeatable). Use 'quit' to exit after.")
     p.add_argument("--c", dest="show_commands", action="store_true",
                    help="On startup, open the TUI and print the full command reference.")
+    p.add_argument("--prometheus", action="store_true", help="With --batch, print Prometheus metrics")
+    p.add_argument("--export-html", help="With --batch, write HTML report to this path")
+    p.add_argument("--export-sql", help="With --batch, export entries to SQLite database")
+    p.add_argument("--sessions", help="With --batch, detect sessions for the given user")
+    p.add_argument("--sessions-gap", type=int, default=30, help="Session gap in minutes")
+    p.add_argument("--sentiment", help="With --batch, show sentiment for the given user")
+    p.add_argument("--topics", help="With --batch, show topics/keywords for the given user")
+    p.add_argument("--lifecycle", help="With --batch, lifecycle analysis for the given user")
+    p.add_argument("--pattern", help="With --batch, pattern-of-life for the given user")
+    p.add_argument("--anomalies", help="With --batch, detect anomalies for the given user")
+    p.add_argument("--anomalies-z", type=float, default=2.5)
+    p.add_argument("--sequences", type=int, nargs="?", const=3, default=0,
+                   help="With --batch, find common interaction sequences (optional min_support)")
+    p.add_argument("--timeline", help="With --batch, ASCII timeline for the given user")
+    p.add_argument("--heatmap", help="With --batch, calendar heatmap for the given user")
+    p.add_argument("--net", type=int, nargs="?", const=15, default=0,
+                   help="With --batch, show network graph (optional top N edges)")
+    p.add_argument("--correlate", nargs=2, metavar=("PATH", "WINDOW"),
+                   help="With --batch, cross-log correlation: --correlate other.log 60")
+    p.add_argument("--auto-report", action="store_true", help="With --batch, LLM-generated narrative report")
+    p.add_argument("--web", type=int, nargs="?", const=8088, default=0,
+                   help="Start web API server on given port")
+    p.add_argument("--plugin-dir", help="Directory to load analysis plugins from")
+    p.add_argument("--cron", action="store_true", help="Run in cron mode (batch with optional alerts)")
+    p.add_argument("--cron-output", help="Append cron output to this file")
+    p.add_argument("--webhook-url", help="Webhook URL for alerts (cron mode)")
     args = p.parse_args(argv)
 
     try:
@@ -3146,6 +4712,118 @@ def main(argv: list[str] | None = None) -> int:
             sb = summarize(other, 1000)
             print_log_diff(args.log, args.diff, diff_summaries(sa, sb))
             return 0
+
+        if args.prometheus:
+            print(prometheus_metrics(active))
+            return 0
+
+        if args.export_html:
+            s = summarize(active, args.top)
+            profiles = None
+            if args.user:
+                profiles = [build_profile(active, args.user)]
+            write_html_report(args.export_html, s, profiles)
+            return 0
+
+        if args.export_sql:
+            print(export_to_sqlite(active, args.export_sql))
+            return 0
+
+        if args.sessions:
+            sessions = detect_sessions(active, args.sessions, args.sessions_gap)
+            for i, s in enumerate(sessions, 1):
+                dur = (s.end - s.start).total_seconds()
+                dur_s = f"{dur / 60:.0f}min" if dur < 3600 else f"{dur / 3600:.1f}h"
+                print(f"#{i:<3d}  {s.start:%Y-%m-%d %H:%M} - {s.end:%H:%M}  {dur_s:>10}  {s.line_count:>4d} lines")
+            if not sessions:
+                print("(no sessions)")
+            return 0
+
+        if args.sentiment:
+            s = user_sentiment(active, args.sentiment)
+            if s:
+                print(f"Sentiment for {args.sentiment}: compound={s['mean_compound']:.3f} pos={s['pos_rate']:.1%} neg={s['neg_rate']:.1%} agree={s['agree_rate']:.1%}")
+            else:
+                print(f"(no data for {args.sentiment})")
+            return 0
+
+        if args.topics:
+            t = user_topics(active, args.topics)
+            if t.get("keywords"):
+                print(f"Keywords for {args.topics}:")
+                for kw, n in t["keywords"][:15]:
+                    print(f"  {n:>5d}  {kw}")
+            return 0
+
+        if args.lifecycle:
+            lc = analyze_lifecycle(active, args.lifecycle)
+            if lc.first_seen:
+                print(f"Lifecycle for {args.lifecycle}: first={_fmt_dt(lc.first_seen)} last={_fmt_dt(lc.last_seen)} trend={lc.activity_trend} stages={len(lc.stages)}")
+            return 0
+
+        if args.pattern:
+            pol = pattern_of_life(active, args.pattern)
+            if pol.hourly_profile:
+                glyphs = "▁▂▃▄▅▆▇█"
+                vals = [pol.hourly_profile.get(h, 0) for h in range(24)]
+                peak_v = max(vals) or 1
+                bar = "".join(glyphs[min(int(v / peak_v * 7), 7)] for v in vals)
+                print(f"Pattern for {args.pattern}: peak={pol.peak_hour}:00 quiet={pol.quiet_hours} consistency={pol.consistency_score:.2f}")
+                print(f"  {bar}  (00..23)")
+            return 0
+
+        if args.anomalies:
+            anoms = detect_anomalies(active, args.anomalies, args.anomalies_z)
+            for a in anoms:
+                print(f"  {a.metric} z={a.zscore:.2f} value={a.value:.1f} expected={a.expected:.1f}")
+            if not anoms:
+                print("(no anomalies)")
+            return 0
+
+        if args.sequences:
+            seqs = find_common_sequences(active, min_support=args.sequences)
+            for s in seqs:
+                print(f"  {s.count:>5d}x  {' -> '.join(s.pattern)}")
+            if not seqs:
+                print("(no sequences)")
+            return 0
+
+        if args.timeline:
+            print(ascii_timeline(active, args.timeline))
+            return 0
+
+        if args.heatmap:
+            print(calendar_heatmap(active, args.heatmap))
+            return 0
+
+        if args.net:
+            edges = build_edge_graph(active)
+            print(ascii_network_graph(edges, top_n=args.net))
+            return 0
+
+        if args.correlate:
+            path, window_str = args.correlate
+            try:
+                other = list(iter_entries(path))
+            except FileNotFoundError:
+                print(f"File not found: {path}", file=sys.stderr); return 1
+            corr = correlate_logs(active, other, int(window_str))
+            for c in corr[:20]:
+                print(f"  {c.count:>5d}x  {c.event_a} ~~ {c.event_b}  delay={c.avg_delay_seconds:.0f}s")
+            return 0
+
+        if args.auto_report:
+            s = summarize(active, args.top)
+            counts: Counter = Counter(e.user for e in active if e.user)
+            top_users_list = [u for u, _ in counts.most_common(10)]
+            profiles_list = [build_profile(active, u) for u in top_users_list]
+            llm_auto_report(s, profiles_list, args.llm_url, args.llm_model,
+                            args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.cron:
+            alert_engine = AlertEngine()
+            return cron_mode(active, alert_engine, args.webhook_url, args.cron_output)
 
         if args.similar:
             pairs = find_similar_users(active,
@@ -3289,7 +4967,16 @@ def main(argv: list[str] | None = None) -> int:
         llm_model=args.llm_model,
         max_chunk_chars=args.max_chunk_chars,
         llm_cache=cache,
+        webhook_url=args.webhook_url or "",
+        plugin_dir=args.plugin_dir or "",
     )
+    if args.plugin_dir:
+        load_plugins_from(args.plugin_dir)
+    if args.web:
+        global _web_entries  # noqa: PLW0603
+        _web_entries = all_entries
+        state.web_server = start_web_server(args.web)
+        print(f"Web API server started at http://127.0.0.1:{args.web}")
     shell = LogShell(state)
     shell._refresh_prompt()
 
