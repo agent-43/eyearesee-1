@@ -50,7 +50,7 @@ import urllib.error
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 try:
     import readline  # type: ignore[import-not-found]
@@ -84,6 +84,18 @@ try:
     STATSMODELS_OK = True
 except ImportError:
     STATSMODELS_OK = False
+
+try:
+    import curses
+    CURSES_OK = True
+except ImportError:
+    CURSES_OK = False
+
+try:
+    import pyperclip as _pyperclip
+    PYPERCLIP_OK = True
+except ImportError:
+    PYPERCLIP_OK = False
 
 
 # ---------- parsing ----------------------------------------------------------
@@ -1754,6 +1766,620 @@ def pareto_analysis(entries: list[Entry], category: str = "users",
             top_80_count += 1
     return ParetoResult(category, items, top_80_count)
 
+# ---------- Dashboard mode (#16) - curses real-time TUI -----------------------
+
+_DASH_REFRESH_SEC = 2.0
+
+def _dashboard_curses(stdscr, entries_access, alert_engine, log_path) -> None:
+    if not CURSES_OK:
+        return
+    curses.curs_set(0)
+    curses.use_default_colors()
+    stdscr.nodelay(True)
+    last_refresh = 0.0
+    pause = False
+    while True:
+        now = time.time()
+        if now - last_refresh >= _DASH_REFRESH_SEC and not pause:
+            last_refresh = now
+            try:
+                stdscr.erase()
+                maxy, maxx = stdscr.getmaxyx()
+                if maxy < 10 or maxx < 30:
+                    stdscr.addstr(0, 0, "Terminal too small")
+                    stdscr.refresh()
+                    continue
+                entries = entries_access()
+                col_w = maxx // 3
+                # Left panel: top users
+                users: Counter = Counter()
+                for e in entries:
+                    if e.user:
+                        users[e.user] += 1
+                top_users = users.most_common(15)
+                header = f"DASHBOARD  {log_path}  ({len(entries)} entries)"
+                stdscr.attron(curses.A_BOLD)
+                stdscr.addstr(0, 0, header[:maxx-1])
+                stdscr.attroff(curses.A_BOLD)
+                stdscr.addstr(1, 0, "─" * min(maxx-1, 60))
+                stdscr.addstr(2, 0, "TOP USERS", curses.A_BOLD)
+                row = 3
+                for i, (u, c) in enumerate(top_users):
+                    if row >= maxy - 2:
+                        break
+                    label = f" {i+1:2d} {c:>5d}  {u[:col_w-12]}"
+                    stdscr.addstr(row, 0, label[:col_w-1])
+                    row += 1
+                # Middle panel: hourly histogram
+                mid_x = col_w
+                hist: Counter = Counter()
+                for e in entries:
+                    if e.ts:
+                        hist[e.ts.hour] += 1
+                stdscr.addstr(2, mid_x, "HOURLY ACTIVITY", curses.A_BOLD)
+                max_h = max(hist.values()) or 1
+                row = 3
+                for h in range(24):
+                    if row >= maxy - 2:
+                        break
+                    cnt = hist.get(h, 0)
+                    bar_w = int(cnt / max_h * (col_w - 8))
+                    stdscr.addstr(row, mid_x, f"{h:02d} {'█' * bar_w:<{col_w-8}} {cnt}")
+                    row += 1
+                # Right panel: alerts + recent flagged
+                right_x = mid_x * 2
+                stdscr.addstr(2, right_x, "ALERTS / FLAGGED", curses.A_BOLD)
+                alerts = []
+                if alert_engine:
+                    for rule in alert_engine.rules:
+                        if rule.enabled:
+                            alerts.append(f" {rule.name}: {rule.message[:30]}")
+                row = 3
+                for a in alerts[:maxy-6]:
+                    if row >= maxy - 2:
+                        break
+                    stdscr.addstr(row, right_x, a[:maxx-right_x-1])
+                    row += 1
+                # Bottom bar
+                status = " PAUSED" if pause else " LIVE"
+                stdscr.attron(curses.A_REVERSE)
+                stdscr.addstr(maxy-1, 0, f" {status}  [Q]uit [P]ause [R]efresh  ".ljust(maxx-1))
+                stdscr.attroff(curses.A_REVERSE)
+                stdscr.refresh()
+            except curses.error:
+                pass
+        # Key handling
+        try:
+            key = stdscr.getch()
+        except curses.error:
+            key = -1
+        if key == ord("q") or key == ord("Q"):
+            break
+        elif key == ord("p") or key == ord("P"):
+            pause = not pause
+        elif key == ord("r") or key == ord("R"):
+            last_refresh = 0.0
+        elif key == ord("d"):
+            _dashboard_drill(stdscr, entries, entries_access)
+        elif key != -1:
+            pass
+        time.sleep(0.1)
+
+def _dashboard_drill(stdscr, entries, entries_access) -> None:
+    """Sub-screen: pick a user to drill into."""
+    users = sorted({e.user for e in entries if e.user})
+    if not users:
+        return
+    curses.curs_set(0)
+    curses.use_default_colors()
+    sel = 0
+    offset = 0
+    max_vis = 20
+    while True:
+        try:
+            stdscr.erase()
+            maxy, maxx = stdscr.getmaxyx()
+            stdscr.addstr(0, 0, "SELECT USER (up/down, enter to drill, q back)", curses.A_BOLD)
+            visible = users[offset:offset+max_vis]
+            for i, u in enumerate(visible):
+                attr = curses.A_REVERSE if i == sel - offset else 0
+                stdscr.addstr(2 + i, 2, f" {u[:maxx-4]} ", attr)
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key == ord("q"):
+                break
+            elif key == curses.KEY_UP and sel > 0:
+                sel -= 1
+                if sel < offset:
+                    offset = max(0, offset - 1)
+            elif key == curses.KEY_DOWN and sel < len(users) - 1:
+                sel += 1
+                if sel - offset >= max_vis:
+                    offset = min(len(users) - max_vis, offset + 1)
+            elif key == ord("\n") or key == ord("\r"):
+                _dashboard_user_detail(stdscr, users[sel], entries_access)
+                curses.curs_set(0)
+        except curses.error:
+            break
+
+def _dashboard_user_detail(stdscr, user, entries_access) -> None:
+    user_entries = [e for e in entries_access() if e.user and e.user.lower() == user.lower()]
+    if not user_entries:
+        return
+    curses.curs_set(0)
+    curses.use_default_colors()
+    offset = 0
+    rows = 15
+    while True:
+        try:
+            stdscr.erase()
+            maxy, maxx = stdscr.getmaxyx()
+            stdscr.addstr(0, 0, f"USER: {user}  ({len(user_entries)} lines) [q] back", curses.A_BOLD)
+            visible = user_entries[offset:offset+rows]
+            for i, e in enumerate(visible):
+                ts = e.dt or e.ts
+                text = e.text or e.raw[:80]
+                line = f" {ts:%H:%M} {text[:maxx-14]}"
+                stdscr.addstr(2 + i, 0, line[:maxx-1])
+            stdscr.addstr(maxy-1, 0, " ↑↓ scroll  q back", curses.A_REVERSE)
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key == ord("q"):
+                break
+            elif key == curses.KEY_UP and offset > 0:
+                offset -= 1
+            elif key == curses.KEY_DOWN and offset < len(user_entries) - rows:
+                offset += 1
+        except curses.error:
+            break
+
+def run_dashboard(entries, alert_engine, log_path="ai_scores.log") -> None:
+    if not CURSES_OK:
+        print("curses not available; install via 'pip install windows-curses' on Windows")
+        return
+    entries_shared = entries
+    def _access():
+        return entries_shared
+    try:
+        curses.wrapper(lambda stdscr: _dashboard_curses(stdscr, _access, alert_engine, log_path))
+    except KeyboardInterrupt:
+        pass
+
+# ---------- Watch-mode alerting (feature a) -----------------------------------
+
+# Global holder for shell state access from callbacks
+_current_shell: dict[str, Any] = {}
+def _set_current_shell(shell) -> None:
+    _current_shell["shell"] = shell
+
+def watch_with_alerts(log_path: str, engine: AlertEngine, webhook_url: str = "", webhook_type: str = "slack",
+                      poll: float = 2.0) -> None:
+    def cb(new_entries: list[Entry]) -> None:
+        for entry in new_entries:
+            alerts = engine.evaluate(entry)
+            if alerts:
+                for msg in alerts:
+                    print(f"\r ALERT: {msg}")
+                if webhook_url:
+                    send_webhook(webhook_url, "\n".join(alerts), webhook_type)
+    watch_loop(log_path, cb, poll=poll)
+
+# ---------- Forecast-aware anomaly (feature b) --------------------------------
+
+def forecast_aware_anomaly(entries: list[Entry], user: str, z: float = 2.5,
+                           forecast_days: int = 7) -> dict:
+    """Detect anomalies using forecasted baseline instead of simple mean."""
+    base = forecast_activity(entries, user, forecast_days)
+    user_entries = [e for e in entries if line_matches_user(e, user)]
+    daily: Counter = Counter()
+    for e in user_entries:
+        if e.ts:
+            daily[e.ts.date()] += 1
+    if not daily:
+        return {"user": user, "anomalies": [], "note": "insufficient data"}
+    if not base.get("forecast"):
+        # fall back to standard anomaly
+        return detect_anomalies(entries, user, z)
+    anomalies = []
+    forecast_map = {f["date"]: f.get("predicted", 0) for f in base["forecast"] if isinstance(f, dict)}
+    today = datetime.now().date()
+    for date_key, actual in sorted(daily.items()):
+        expected = forecast_map.get(str(date_key), forecast_map.get(date_key, None))
+        if expected is not None:
+            dev = abs(actual - expected)
+            if dev > z * (base.get("rmse", 1) or 1):
+                anomalies.append({"date": str(date_key), "actual": actual, "expected": expected})
+    return {"user": user, "anomalies": anomalies, "forecast_based": True}
+
+# ---------- Alert fatigue scoring (feature c) ---------------------------------
+
+@dataclass
+class AlertFatigueScore:
+    rule_name: str
+    fires_total: int
+    fires_last_hour: int
+    signal_rate: float  # 0-1, lower = more fatigued
+    suggestion: str
+
+def alert_fatigue_scores(engine: AlertEngine, recent_entries: list[Entry],
+                         window_hours: int = 1) -> list[AlertFatigueScore]:
+    now = datetime.now()
+    window_ago = now - timedelta(hours=window_hours)
+    recent_set = [e for e in recent_entries if e.ts and e.ts >= window_ago]
+    scores: list[AlertFatigueScore] = []
+    for rule in engine.rules:
+        if not rule.enabled:
+            continue
+        total = 0
+        last_hour = 0
+        for e in recent_set:
+            vals = []
+            if rule.field == "user":
+                vals = [e.user]
+            elif rule.field in SCORE_KEYS:
+                sv = _scores_from_raw(e.raw).get(rule.field)
+                if sv is not None:
+                    vals = [str(sv)]
+            else:
+                vals = [e.raw]
+            for v in vals:
+                if v is None:
+                    continue
+                try:
+                    if rule.op == "==" and v.lower() == rule.value.lower():
+                        total += 1
+                        if e.ts and e.ts >= window_ago:
+                            last_hour += 1
+                    elif rule.op == ">" and float(v) > float(rule.value):
+                        total += 1
+                        if e.ts and e.ts >= window_ago:
+                            last_hour += 1
+                except (ValueError, TypeError):
+                    pass
+        total_fires = total
+        hourly_rate = last_hour / max(1, window_hours)
+        signal_rate = max(0.0, 1.0 - min(1.0, hourly_rate / 10.0))
+        if signal_rate < 0.3:
+            suggestion = "Consider raising threshold or disabling"
+        elif signal_rate < 0.7:
+            suggestion = "Monitor; may need tuning"
+        else:
+            suggestion = "Healthy signal rate"
+        scores.append(AlertFatigueScore(rule.name, total_fires, last_hour, signal_rate, suggestion))
+    return scores
+
+# ---------- Drill-down HTML report (feature d) --------------------------------
+
+def write_html_report_drilldown(path: str, summary: dict, profiles: list[dict] | None = None) -> None:
+    """Enhanced HTML report with collapsible user sections."""
+    html_parts = ['<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">',
+                  '<title>Log Analysis Report</title>',
+                  '<style>body{font-family:sans-serif;margin:20px}',
+                  '.section{cursor:pointer;background:#f0f0f0;padding:8px;margin:4px 0;border-radius:4px}',
+                  '.section:hover{background:#e0e0e0}',
+                  '.content{display:none;padding:8px;border-left:3px solid #ccc;margin:0 0 8px 8px}',
+                  '.active .content{display:block}',
+                  'table{border-collapse:collapse;width:100%}',
+                  'td,th{border:1px solid #ddd;padding:6px;text-align:left}',
+                  '</style>',
+                  '<script>function toggle(e){e.classList.toggle("active")}</script>',
+                  '</head><body>']
+    html_parts.append(f"<h1>Log Analysis Report</h1>")
+    html_parts.append(f"<p>Total entries: {summary.get('total', 0):,}</p>")
+    # Collapsible sections
+    for title, data_key in [("Users", "users"), ("Targets/Channels", "targets"),
+                             ("Events", "events"), ("Levels", "levels")]:
+        items = summary.get(data_key, {})
+        if items:
+            html_parts.append(f'<div class="section" onclick="toggle(this)">▸ <b>{title}</b> ({len(items)})</div>')
+            html_parts.append(f'<div class="content">')
+            html_parts.append("<table><tr><th>Name</th><th>Count</th></tr>")
+            for name, count in sorted(items.items(), key=lambda x: -x[1])[:30]:
+                html_parts.append(f"<tr><td>{html_mod.escape(name)}</td><td>{count}</td></tr>")
+            html_parts.append("</table></div>")
+    # Profiles
+    if profiles:
+        for prof in profiles:
+            user = prof.get("user", "?")
+            html_parts.append(f'<div class="section" onclick="toggle(this)">▸ <b>Profile: {html_mod.escape(user)}</b></div>')
+            html_parts.append(f'<div class="content"><pre>{html_mod.escape(json.dumps(prof, indent=2, default=str))}</pre></div>')
+    html_parts.append("</body></html>")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(html_parts))
+    except OSError as exc:
+        print(f"Error writing HTML: {exc}", file=sys.stderr)
+
+# ---------- Session-aware metrics (feature e) ---------------------------------
+
+def session_response_times(entries: list[Entry], user_a: str, user_b: str,
+                           gap_minutes: int = 30) -> list[dict]:
+    """Compute response times grouped by session."""
+    sessions = detect_sessions(entries, user_a, gap_minutes)
+    results = []
+    for sess in sessions:
+        a_entries = [e for e in sess.entries if line_matches_user(e, user_a)]
+        b_entries = [e for e in sess.entries if line_matches_user(e, user_b)]
+        if not a_entries or not b_entries:
+            continue
+        a_times = sorted([e.ts for e in a_entries if e.ts])
+        b_times = sorted([e.ts for e in b_entries if e.ts])
+        if not a_times or not b_times:
+            continue
+        for at in a_times:
+            future = [bt for bt in b_times if bt > at]
+            if future:
+                delay = (future[0] - at).total_seconds()
+                results.append({"session_start": str(sess.start), "responder": user_b,
+                                "delay_seconds": delay, "type": "a_to_b"})
+        for bt in b_times:
+            future = [at for at in a_times if at > bt]
+            if future:
+                delay = (future[0] - bt).total_seconds()
+                results.append({"session_start": str(sess.start), "responder": user_a,
+                                "delay_seconds": delay, "type": "b_to_a"})
+    return results
+
+# ---------- Influence chain tracking (feature f) ------------------------------
+
+def influence_chains(entries: list[Entry], seed_user: str, max_hops: int = 3,
+                     window_seconds: int = 300) -> list[list[dict]]:
+    """Trace multi-hop reply chains: A→B→C within a time window per hop."""
+    hop_map: dict[str, list[Entry]] = {}
+    for e in entries:
+        if e.target:
+            hop_map.setdefault(e.target.lower(), []).append(e)
+    chains: list[list[dict]] = []
+    def _walk(current_user: str, depth: int, chain: list, visited: set) -> None:
+        if depth >= max_hops:
+            return
+        replied = hop_map.get(current_user.lower(), [])
+        for re in replied:
+            if re.user and re.user.lower() not in visited and re.ts:
+                next_user = re.user
+                chain.append({"user": next_user, "ts": str(re.ts), "text": (re.text or re.raw)[:100]})
+                visited.add(next_user.lower())
+                _walk(next_user, depth + 1, chain, visited)
+                if len(chain) >= 2:
+                    chains.append(list(chain))
+                chain.pop()
+                visited.discard(next_user.lower())
+    _walk(seed_user, 0, [], {seed_user.lower()})
+    # Filter by window
+    filtered = []
+    for chain in chains:
+        ok = True
+        for i in range(1, len(chain)):
+            t0 = _safe_parse_ts(chain[i-1]["ts"])
+            t1 = _safe_parse_ts(chain[i]["ts"])
+            if t0 and t1 and abs((t1 - t0).total_seconds()) > window_seconds:
+                ok = False
+                break
+        if ok:
+            filtered.append(chain)
+    return filtered
+
+def _safe_parse_ts(ts_str: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(ts_str)
+    except (ValueError, TypeError):
+        return None
+
+# ---------- Template-based filtering (feature g) ------------------------------
+
+def filter_by_template(entries: list[Entry], template_id: str) -> list[Entry]:
+    """Filter entries matching a specific template ID (heuristic: first template line)."""
+    tmpls = extract_templates(entries, top_n=100)
+    tmpl = next((t for t in tmpls if t.id == template_id), None)
+    if not tmpl:
+        return []
+    pattern = re.escape(tmpl.pattern).replace(r"\{\*\}", ".*")
+    try:
+        rx = re.compile(pattern)
+    except re.error:
+        return []
+    return [e for e in entries if rx.search(e.raw or "")]
+
+# ---------- Drift monitoring (feature h) --------------------------------------
+
+def drift_detection(entries: list[Entry], user: str,
+                    window_a_days: int = 7, window_b_days: int = 7,
+                    gap_days: int = 0) -> dict:
+    """Compare pattern-of-life profiles across two time windows to detect drift."""
+    now = datetime.now()
+    # Window B = most recent
+    wb_end = now
+    wb_start = now - timedelta(days=window_b_days)
+    # Window A = before the gap
+    wa_end = wb_start - timedelta(days=gap_days)
+    wa_start = wa_end - timedelta(days=window_a_days)
+    entries_a = apply_time_filter(entries, wa_start, wa_end)
+    entries_b = apply_time_filter(entries, wb_start, wb_end)
+    a_user = [e for e in entries_a if line_matches_user(e, user)]
+    b_user = [e for e in entries_b if line_matches_user(e, user)]
+    if not a_user or not b_user:
+        return {"user": user, "drift_detected": False, "note": "insufficient data in both windows"}
+    pol_a = pattern_of_life(a_user, user) if a_user else None
+    pol_b = pattern_of_life(b_user, user) if b_user else None
+    if not pol_a or not pol_b:
+        return {"user": user, "drift_detected": False, "note": "could not compute profile"}
+    # Compare hourly profiles
+    drift_score = 0.0
+    max_val = 0.0
+    for h in range(24):
+        va = pol_a.hourly_profile.get(h, 0)
+        vb = pol_b.hourly_profile.get(h, 0)
+        drift_score += abs(va - vb)
+        max_val = max(max_val, abs(va - vb))
+    avg = drift_score / 24
+    return {"user": user, "drift_score": round(drift_score, 3),
+            "avg_hourly_delta": round(avg, 3),
+            "max_hourly_delta": round(max_val, 3),
+            "drift_detected": drift_score > 0.5 or max_val > 0.2}
+
+# ---------- Behavioral profile persistence (feature i) ------------------------
+
+def save_profile(user: str, entries: list[Entry], path: str) -> str:
+    """Compute and save a user profile to JSON."""
+    prof = build_profile(entries, user)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(prof, f, indent=2, default=str)
+        return f"Profile for {user} saved to {path}"
+    except OSError as exc:
+        return f"Error saving profile: {exc}"
+
+def load_profile(path: str) -> dict | None:
+    """Load a saved profile from JSON."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Error loading profile: {exc}", file=sys.stderr)
+        return None
+
+def compare_saved_profiles(paths: list[str]) -> list[dict]:
+    """Compare multiple saved profiles."""
+    profiles = []
+    for p in paths:
+        prof = load_profile(p)
+        if prof:
+            profiles.append(prof)
+    return profiles
+
+# ---------- Auto-tagging (feature j) -----------------------------------------
+
+def auto_tag_user(entries: list[Entry], user: str, llm_url: str, llm_model: str,
+                  max_chunk_chars: int = 12000, cache: LLMCache | None = None) -> str:
+    """Use LLM to auto-tag a user based on their log lines."""
+    user_entries = [e for e in entries if line_matches_user(e, user)]
+    if not user_entries:
+        return f"(no data for {user})"
+    text = "\n".join(e.text or e.raw for e in user_entries[:50])
+    if len(text) > max_chunk_chars:
+        text = text[:max_chunk_chars]
+    prompt = (
+        f"Analyze the following log lines from user '{user}' and assign 3-5 short tags "
+        f"(e.g. 'high-volume', 'error-prone', 'night-owl', 'support-focused', 'bot-like').\n"
+        f"Return only comma-separated tags, no explanation.\n\n{text}"
+    )
+    result = llm_complete(llm_url, llm_model, prompt, max_tokens=100, cache=cache)
+    return result.strip() if result else "(no response)"
+
+def auto_tag_bulk(entries: list[Entry], llm_url: str, llm_model: str,
+                  max_chunk_chars: int = 12000, cache: LLMCache | None = None,
+                  top_n: int = 10) -> dict[str, str]:
+    """Auto-tag top N users by activity."""
+    users: Counter = Counter()
+    for e in entries:
+        if e.user:
+            users[e.user] += 1
+    top = [u for u, _ in users.most_common(top_n)]
+    result: dict[str, str] = {}
+    for u in top:
+        result[u] = auto_tag_user(entries, u, llm_url, llm_model, max_chunk_chars, cache)
+    return result
+
+# ---------- Recurrence breach alert (feature k) -------------------------------
+
+def check_recurrence_breach(entries: list[Entry], user: str,
+                            recent_days: int = 3) -> dict:
+    """Check if a user breaks their established recurrence pattern."""
+    patterns = detect_recurrence(entries, user)
+    if not patterns:
+        return {"user": user, "breach": False, "note": "no pattern established"}
+    now = datetime.now()
+    window_start = now - timedelta(days=recent_days)
+    recent = [e for e in entries if e.ts and e.ts >= window_start and line_matches_user(e, user)]
+    breaches = []
+    for pat in patterns:
+        period = pat.pattern_type
+        if period == "daily":
+            counts: Counter = Counter()
+            for e in recent:
+                if e.ts:
+                    counts[e.ts.date()] += 1
+            expected = sum(counts.values()) / max(1, len(counts))
+            for d, c in sorted(counts.items()):
+                if expected > 0 and c < expected * 0.3:
+                    breaches.append({"date": str(d), "count": c, "expected": round(expected, 1), "period": "daily"})
+        elif period == "weekly":
+            wd_counts: Counter = Counter()
+            for e in recent:
+                if e.ts:
+                    wd_counts[e.ts.weekday()] += 1
+            expected_wd = sum(wd_counts.values()) / max(1, len(wd_counts))
+            for wd, c in sorted(wd_counts.items()):
+                if expected_wd > 0 and c < expected_wd * 0.3:
+                    breaches.append({"weekday": wd, "count": c, "expected": round(expected_wd, 1), "period": "weekly"})
+        elif period == "hourly" and pat.description:
+            h_counts: Counter = Counter()
+            for e in recent:
+                if e.ts:
+                    h_counts[e.ts.hour] += 1
+            import re as _re_h2
+            m = _re_h2.search(r"(\d+):00", pat.description)
+            if m:
+                peak_h = int(m.group(1))
+                if h_counts.get(peak_h, 0) < max(1, sum(h_counts.values()) // max(1, len(h_counts))):
+                    breaches.append({"hour": peak_h, "expected_peak": peak_h, "period": "hourly", "note": "reduced peak activity"})
+    if breaches:
+        return {"user": user, "breach": True, "breaches": breaches[:10], "patterns": [p.pattern_type for p in patterns]}
+    return {"user": user, "breach": False, "patterns": [p.pattern_type for p in patterns]}
+
+# ---------- Config persistence (feature l) ------------------------------------
+
+_SHELL_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".analyzelog_config.json")
+
+def save_shell_config(state: "ShellState") -> None:
+    data: dict[str, Any] = {
+        "webhook_url": state.webhook_url,
+        "webhook_type": state.webhook_type,
+        "plugin_dir": state.plugin_dir,
+        "top_n": state.top_n,
+        "llm_url": state.llm_url,
+        "llm_model": state.llm_model,
+        "max_chunk_chars": state.max_chunk_chars,
+        "rules": [],
+        "ignore_set": sorted(state.ignore_set),
+        "aliases": state.aliases,
+        "notes": state.notes,
+    }
+    for rule in state.alert_engine.rules:
+        data["rules"].append({
+            "name": rule.name, "field": rule.field, "op": rule.op,
+            "value": rule.value, "message": rule.message, "enabled": rule.enabled,
+        })
+    try:
+        with open(_SHELL_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+    except OSError:
+        pass
+
+def load_shell_config(state: "ShellState") -> None:
+    try:
+        with open(_SHELL_CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    state.webhook_url = data.get("webhook_url", state.webhook_url)
+    state.webhook_type = data.get("webhook_type", state.webhook_type)
+    state.plugin_dir = data.get("plugin_dir", state.plugin_dir)
+    state.top_n = data.get("top_n", state.top_n)
+    state.llm_url = data.get("llm_url", state.llm_url)
+    state.llm_model = data.get("llm_model", state.llm_model)
+    state.max_chunk_chars = data.get("max_chunk_chars", state.max_chunk_chars)
+    for r in data.get("rules", []):
+        state.alert_engine.add(AlertRule(
+            name=r.get("name", "?"), field=r.get("field", "user"),
+            op=r.get("op", "=="), value=r.get("value", ""),
+            message=r.get("message", ""), enabled=r.get("enabled", True),
+        ))
+    state.ignore_set.update(data.get("ignore_set", []))
+    state.aliases.update(data.get("aliases", {}))
+    state.notes.update(data.get("notes", {}))
+
+
 # ---------- views (named filter sets) ---------------------------------------
 
 @dataclass
@@ -3027,6 +3653,12 @@ class ShellState:
     cron_output: str = ""
     multi_log_sources: dict[str, list[Entry]] = field(default_factory=dict)
     plugin_dir: str = ""
+    # Dashboard + 12 new features:
+    dashboard_running: bool = False
+    auto_tag_cache: dict[str, str] = field(default_factory=dict)
+    profile_dir: str = ""
+    template_filter: str = ""
+    saved_profiles: dict[str, str] = field(default_factory=dict)
 
 
 class LogShell(cmd.Cmd):
@@ -4164,6 +4796,23 @@ class LogShell(cmd.Cmd):
             ("recurrence", "recurrence [user]", "Detect periodic patterns (weekly/daily/hourly)."),
             ("churn", "churn [user]", "Predict churn risk for a user."),
             ("pareto", "pareto [users|events|targets|levels]", "Pareto analysis (80/20 rule)."),
+            ("dashboard", "dashboard", "Launch curses real-time dashboard."),
+            ("watch_alert", "watch_alert [poll_sec]", "Tail log with alert-engine evaluation + webhook."),
+            ("forecast_anomaly", "forecast_anomaly <user> [z] [days]", "Anomaly detection using forecast baseline."),
+            ("alert_fatigue", "alert_fatigue [window_h]", "Alert fatigue scores for each rule."),
+            ("export_html_drilldown", "export_html_drilldown <path> [user...]", "Collapsible HTML report."),
+            ("session_times", "session_times <A> <B> [gap]", "Response times per session."),
+            ("influence", "influence <seed> [hops] [win_s]", "Trace multi-hop reply chains."),
+            ("template_filter", "template_filter <id>", "Filter current view by template ID."),
+            ("drift", "drift <user> [wa_days] [wb_days] [gap]", "Detect behavioral drift across windows."),
+            ("save_profile", "save_profile <user> <path>", "Compute and save user profile to JSON."),
+            ("load_profile", "load_profile <path>", "Load and display a saved profile."),
+            ("compare_profiles", "compare_profiles <path1> <path2> ...", "Compare saved profiles."),
+            ("auto_tag", "auto_tag [user]", "LLM-based auto-tagging of a user."),
+            ("auto_tag_bulk", "auto_tag_bulk [N]", "Auto-tag top N users by activity."),
+            ("recurrence_breach", "recurrence_breach <user> [days]", "Check recurrence pattern breach."),
+            ("save_config", "save_config", "Persist current shell config to disk."),
+            ("load_config", "load_config", "Reload shell config from disk."),
             ("commands", "commands  (or ??)", "Print this reference."),
             ("help", "help [name]  (or ?<name>)", "Built-in help."),
             ("quit", "quit  (exit, Ctrl-D)", "Exit the shell."),
@@ -4877,8 +5526,237 @@ class LogShell(cmd.Cmd):
         if len(p.items) > 25:
             print(f"  ...({len(p.items) - 25} more)")
 
+    # --- Dashboard mode (#16) -------------------------------------------------
+    def do_dashboard(self, arg: str) -> None:
+        """dashboard   Launch curses real-time dashboard."""
+        run_dashboard(self.state.entries, self.state.alert_engine, self.state.log_path)
+
+    # --- Watch-mode alerting (feature a) --------------------------------------
+    def do_watch_alert(self, arg: str) -> None:
+        """watch_alert [poll_sec]   Tail log with alert-engine evaluation + webhook."""
+        poll = float(arg.strip()) if arg.strip() else 2.0
+        print(f"Watching {self.state.log_path} with alerts. Ctrl-C to stop.")
+        watch_with_alerts(self.state.log_path, self.state.alert_engine,
+                          self.state.webhook_url, self.state.webhook_type, poll)
+
+    # --- Forecast-aware anomaly (feature b) -----------------------------------
+    def do_forecast_anomaly(self, arg: str) -> None:
+        """forecast_anomaly <user> [z] [forecast_days]   Anomaly detection using forecast baseline."""
+        parts = arg.strip().split()
+        if not parts:
+            print("Usage: forecast_anomaly <user> [z] [forecast_days]")
+            return
+        user = parts[0]
+        z = float(parts[1]) if len(parts) > 1 else 2.5
+        fdays = int(parts[2]) if len(parts) > 2 else 7
+        result = forecast_aware_anomaly(self.state.entries, user, z, fdays)
+        if result.get("anomalies"):
+            print(f"\nForecast-based anomalies for {user}:")
+            for a in result["anomalies"]:
+                print(f"  {a['date']}: actual={a['actual']} expected={a['expected']:.1f}")
+        else:
+            print(f"No forecast-based anomalies for {user}")
+
+    # --- Alert fatigue scoring (feature c) ------------------------------------
+    def do_alert_fatigue(self, arg: str) -> None:
+        """alert_fatigue [window_hours]   Compute alert fatigue scores for each rule."""
+        window = int(arg.strip()) if arg.strip() else 1
+        scores = alert_fatigue_scores(self.state.alert_engine, self.state.entries, window)
+        if not scores:
+            print("(no alert rules defined)")
+            return
+        print(f"\nAlert fatigue scores (last {window}h window):")
+        for s in scores:
+            bar = "█" * int(s.signal_rate * 20)
+            print(f"  {s.rule_name:<20s}  fires={s.fires_total:<5d}  rate={s.signal_rate:.0%}  {bar:<20s}  {s.suggestion}")
+
+    # --- Drill-down HTML report (feature d) -----------------------------------
+    def do_export_html_drilldown(self, arg: str) -> None:
+        """export_html_drilldown <path> [user...]   Collapsible HTML report."""
+        parts = arg.strip().split()
+        if not parts:
+            print("Usage: export_html_drilldown <path> [user...]")
+            return
+        path = parts[0]
+        users = parts[1:] or [self.state.focused_user] if self.state.focused_user else []
+        s = summarize(self._active_entries(), self.state.top_n)
+        profiles = [build_profile(self._active_entries(), u) for u in users if u] if users else None
+        write_html_report_drilldown(path, s, profiles)
+        print(f"Drill-down HTML report written to {path}")
+
+    # --- Session-aware metrics (feature e) ------------------------------------
+    def do_session_times(self, arg: str) -> None:
+        """session_times <user_a> <user_b> [gap_min]   Response times per session."""
+        parts = arg.strip().split()
+        if len(parts) < 2:
+            print("Usage: session_times <user_a> <user_b> [gap_min]")
+            return
+        ua, ub = parts[0], parts[1]
+        gap = int(parts[2]) if len(parts) > 2 else 30
+        results = session_response_times(self.state.entries, ua, ub, gap)
+        if not results:
+            print("(no session data)")
+            return
+        print(f"\nSession-aware response times ({ua} <-> {ub}):")
+        for r in results[:20]:
+            print(f"  [{r['session_start']}] {r['responder']} responded in {r['delay_seconds']:.0f}s")
+        if len(results) > 20:
+            print(f"  ...({len(results) - 20} more)")
+
+    # --- Influence chain tracking (feature f) ----------------------------------
+    def do_influence(self, arg: str) -> None:
+        """influence <seed_user> [max_hops] [window_s]   Trace multi-hop reply chains."""
+        parts = arg.strip().split()
+        if not parts:
+            print("Usage: influence <seed_user> [max_hops] [window_s]")
+            return
+        user = parts[0]
+        hops = int(parts[1]) if len(parts) > 1 else 3
+        win = int(parts[2]) if len(parts) > 2 else 300
+        chains = influence_chains(self.state.entries, user, hops, win)
+        if not chains:
+            print(f"(no chains found for {user})")
+            return
+        print(f"\nInfluence chains from {user} ({len(chains)} chains):")
+        for i, ch in enumerate(chains[:20], 1):
+            labels = [c["user"] for c in ch]
+            print(f"  #{i:3d}  {' -> '.join(labels)}")
+        if len(chains) > 20:
+            print(f"  ...({len(chains) - 20} more)")
+
+    # --- Template-based filtering (feature g) ---------------------------------
+    def do_template_filter(self, arg: str) -> None:
+        """template_filter <template_id>   Filter current view by template ID."""
+        tid = arg.strip()
+        if not tid:
+            print("Usage: template_filter <template_id>")
+            return
+        self.state.template_filter = tid
+        filtered = filter_by_template(self._active_entries(), tid)
+        if not filtered:
+            print(f"(no entries match template {tid})")
+            return
+        print(f"\nEntries matching template '{tid}' ({len(filtered)}):")
+        for e in filtered[:30]:
+            print(f"  {e.raw[:200]}")
+        if len(filtered) > 30:
+            print(f"  ...({len(filtered) - 30} more)")
+
+    # --- Drift monitoring (feature h) -----------------------------------------
+    def do_drift(self, arg: str) -> None:
+        """drift <user> [window_a_days] [window_b_days] [gap_days]   Detect behavioral drift."""
+        parts = arg.strip().split()
+        if not parts:
+            print("Usage: drift <user> [window_a_days] [window_b_days] [gap_days]")
+            return
+        user = parts[0]
+        wa = int(parts[1]) if len(parts) > 1 else 7
+        wb = int(parts[2]) if len(parts) > 2 else 7
+        gap = int(parts[3]) if len(parts) > 3 else 0
+        result = drift_detection(self.state.entries, user, wa, wb, gap)
+        print(f"\nDrift analysis for {user}:")
+        if result.get("drift_detected"):
+            print(f"  DRIFT DETECTED: score={result['drift_score']}")
+            print(f"  avg hourly delta={result['avg_hourly_delta']}  max={result['max_hourly_delta']}")
+        elif result.get("note"):
+            print(f"  {result['note']}")
+        else:
+            print(f"  No significant drift (score={result.get('drift_score', '?')})")
+
+    # --- Behavioral profile persistence (feature i) ---------------------------
+    def do_save_profile(self, arg: str) -> None:
+        """save_profile <user> <path>   Compute and save a user profile to JSON."""
+        parts = arg.strip().split()
+        if len(parts) < 2:
+            print("Usage: save_profile <user> <path>")
+            return
+        user, path = parts[0], parts[1]
+        msg = save_profile(user, self._active_entries(), path)
+        print(msg)
+
+    def do_load_profile(self, arg: str) -> None:
+        """load_profile <path>   Load and display a saved profile."""
+        path = arg.strip()
+        if not path:
+            print("Usage: load_profile <path>")
+            return
+        prof = load_profile(path)
+        if prof:
+            print(f"\nLoaded profile from {path}:")
+            print(json.dumps(prof, indent=2, default=str)[:2000])
+
+    def do_compare_profiles(self, arg: str) -> None:
+        """compare_profiles <path1> <path2> [...]   Compare saved profiles."""
+        paths = arg.strip().split()
+        if len(paths) < 2:
+            print("Usage: compare_profiles <path1> <path2> [...]")
+            return
+        profiles = compare_saved_profiles(paths)
+        if len(profiles) < 2:
+            print("(could not load enough profiles)")
+            return
+        print(f"\nComparing {len(profiles)} saved profiles:")
+        for p in profiles:
+            user = p.get("user") or p.get("nick") or "?"
+            sm = p.get("score_means", {})
+            scores = " ".join(f"{k}={v:.3f}" for k, v in sm.items() if isinstance(v, float))
+            print(f"  {user:<20s}  lines={p.get('authored', '?'):>6s}  {scores}")
+
+    # --- Auto-tagging (feature j) ---------------------------------------------
+    def do_auto_tag(self, arg: str) -> None:
+        """auto_tag [user]   LLM-based auto-tagging of a user (uses focused_user if no arg)."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        tag = auto_tag_user(self._active_entries(), user,
+                            self.state.llm_url, self.state.llm_model,
+                            self.state.max_chunk_chars, self.state.llm_cache)
+        self.state.auto_tag_cache[user] = tag
+        print(f"\nTags for {user}: {tag}")
+
+    def do_auto_tag_bulk(self, arg: str) -> None:
+        """auto_tag_bulk [N]   Auto-tag top N users by activity."""
+        n = int(arg.strip()) if arg.strip() else 10
+        tags = auto_tag_bulk(self._active_entries(), self.state.llm_url, self.state.llm_model,
+                             self.state.max_chunk_chars, self.state.llm_cache, n)
+        if not tags:
+            print("(no data)")
+            return
+        print(f"\nAuto-tags for top {n} users:")
+        for user, tag in tags.items():
+            print(f"  {user:<20s}  {tag}")
+
+    # --- Recurrence breach alert (feature k) ----------------------------------
+    def do_recurrence_breach(self, arg: str) -> None:
+        """recurrence_breach <user> [recent_days]   Check if user breaks their recurrence pattern."""
+        parts = arg.strip().split()
+        if not parts:
+            print("Usage: recurrence_breach <user> [recent_days]")
+            return
+        user = parts[0]
+        days = int(parts[1]) if len(parts) > 1 else 3
+        result = check_recurrence_breach(self.state.entries, user, days)
+        if result.get("breach"):
+            print(f"\nRECURRENCE BREACH for {user}:")
+            for b in result.get("breaches", []):
+                print(f"  {json.dumps(b)}")
+        else:
+            print(f"No recurrence breach for {user}: {result.get('note', 'pattern intact')}")
+
+    # --- Config persistence (feature l) --------------------------------------
+    def do_save_config(self, arg: str) -> None:
+        """save_config   Persist current shell config (rules, webhook, etc.)."""
+        save_shell_config(self.state)
+        print(f"Config saved to {_SHELL_CONFIG_PATH}")
+
+    def do_load_config(self, arg: str) -> None:
+        """load_config   Reload shell config from disk."""
+        load_shell_config(self.state)
+        print(f"Config loaded from {_SHELL_CONFIG_PATH}")
+
     def do_quit(self, arg: str) -> bool:
         """quit   Exit the shell."""
+        save_shell_config(self.state)
         if self.state.watch_bg:
             self.state.watch_bg.stop()
             self.state.watch_bg = None
@@ -5279,6 +6157,44 @@ class LogShell(cmd.Cmd):
         return self._complete_prefix(text, self._nicks())
     def complete_pareto(self, text, line, begidx, endidx):
         return self._complete_prefix(text, ["users", "events", "targets", "levels"])
+    # completions for dashboard + 12 new features
+    def complete_dashboard(self, text, line, begidx, endidx):
+        return []
+    def complete_watch_alert(self, text, line, begidx, endidx):
+        return []
+    def complete_forecast_anomaly(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_alert_fatigue(self, text, line, begidx, endidx):
+        return []
+    def complete_export_html_drilldown(self, text, line, begidx, endidx):
+        return self._complete_path(text)
+    def complete_session_times(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_influence(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_template_filter(self, text, line, begidx, endidx):
+        return []
+    def complete_drift(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_save_profile(self, text, line, begidx, endidx):
+        prev = line[:begidx].split()
+        if len(prev) <= 1:
+            return self._complete_prefix(text, self._nicks())
+        return self._complete_path(text)
+    def complete_load_profile(self, text, line, begidx, endidx):
+        return self._complete_path(text)
+    def complete_compare_profiles(self, text, line, begidx, endidx):
+        return self._complete_path(text)
+    def complete_auto_tag(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_auto_tag_bulk(self, text, line, begidx, endidx):
+        return []
+    def complete_recurrence_breach(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_save_config(self, text, line, begidx, endidx):
+        return []
+    def complete_load_config(self, text, line, begidx, endidx):
+        return []
 
 
 # ---------- main -------------------------------------------------------------
@@ -5377,6 +6293,31 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--churn", help="With --batch, predict churn risk for user")
     p.add_argument("--pareto", nargs="?", const="users", default=None,
                    help="With --batch, Pareto analysis (users|events|targets|levels)")
+    # Dashboard + 12 new feature CLI flags
+    p.add_argument("--dashboard", action="store_true", help="Launch curses real-time dashboard")
+    p.add_argument("--forecast-anomaly", nargs=3, metavar=("USER", "Z", "DAYS"),
+                   help="Forecast-aware anomaly detection: --forecast-anomaly user 2.5 7")
+    p.add_argument("--alert-fatigue", type=int, nargs="?", const=1, default=0,
+                   help="With --batch, compute alert fatigue scores (optional window hours)")
+    p.add_argument("--export-html-drilldown", nargs="+", metavar=("PATH [USER...]"),
+                   help="Write collapsible HTML report: --export-html-drilldown report.html [user]")
+    p.add_argument("--session-times", nargs=3, metavar=("A", "B", "GAP"),
+                   help="Session-aware response times: --session-times user_a user_b 30")
+    p.add_argument("--influence", nargs=3, metavar=("SEED", "HOPS", "WIN"),
+                   help="Influence chain tracking: --influence user 3 300")
+    p.add_argument("--template-filter", help="Filter current view by template ID")
+    p.add_argument("--drift", nargs=4, metavar=("USER", "WA", "WB", "GAP"),
+                   help="Drift detection: --drift user 7 7 0")
+    p.add_argument("--save-profile", nargs=2, metavar=("USER", "PATH"),
+                   help="Save user profile to JSON: --save-profile user path.json")
+    p.add_argument("--load-profile", help="Load and display a saved profile")
+    p.add_argument("--auto-tag", help="With --batch, auto-tag a user using LLM")
+    p.add_argument("--auto-tag-bulk", type=int, nargs="?", const=10, default=0,
+                   help="With --batch, auto-tag top N users")
+    p.add_argument("--recurrence-breach", nargs="+", metavar=("USER [DAYS]"),
+                   help="Check recurrence breach: --recurrence-breach user [3]")
+    p.add_argument("--dashboard-alerts", action="store_true",
+                   help="Show alert fatigue dashboard summary")
     args = p.parse_args(argv)
 
     try:
@@ -5611,6 +6552,111 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {cum:>5.0f}%  {count:>7d}  {name}")
             return 0
 
+        if args.dashboard:
+            run_dashboard(all_entries, cache and AlertEngine() or None, args.log)
+            return 0
+
+        if args.forecast_anomaly:
+            user, z_s, days_s = args.forecast_anomaly
+            fa = forecast_aware_anomaly(active, user, float(z_s), int(days_s))
+            print(json.dumps(fa, indent=2))
+            return 0
+
+        if args.alert_fatigue:
+            scores = alert_fatigue_scores(AlertEngine(), active, args.alert_fatigue)
+            for s in scores:
+                print(f"  {s.rule_name:<20s}  fires={s.fires_total:<5d}  rate={s.signal_rate:.0%}  {s.suggestion}")
+            return 0
+
+        if args.export_html_drilldown:
+            path = args.export_html_drilldown[0]
+            users = args.export_html_drilldown[1:] or ([args.user] if args.user else [])
+            s = summarize(active, args.top)
+            profiles = [build_profile(active, u) for u in users if u] if users else None
+            write_html_report_drilldown(path, s, profiles)
+            print(f"Drill-down HTML report written to {path}")
+            return 0
+
+        if args.session_times:
+            ua, ub, gap_s = args.session_times
+            results = session_response_times(active, ua, ub, int(gap_s))
+            if not results:
+                print("(no session data)")
+            else:
+                print(f"Session-aware response times ({ua} <-> {ub}):")
+                for r in results[:20]:
+                    print(f"  [{r['session_start']}] {r['responder']} responded in {r['delay_seconds']:.0f}s")
+            return 0
+
+        if args.influence:
+            seed, hops_s, win_s = args.influence
+            chains = influence_chains(active, seed, int(hops_s), int(win_s))
+            if not chains:
+                print(f"(no chains for {seed})")
+            else:
+                print(f"Influence chains ({len(chains)}):")
+                for ch in chains[:20]:
+                    print("  " + " -> ".join(c["user"] for c in ch))
+            return 0
+
+        if args.template_filter:
+            filtered = filter_by_template(active, args.template_filter)
+            if not filtered:
+                print(f"(no matches for template {args.template_filter})")
+            else:
+                print(f"Template '{args.template_filter}' ({len(filtered)} entries):")
+                for e in filtered[:30]:
+                    print(f"  {e.raw[:200]}")
+            return 0
+
+        if args.drift:
+            user, wa_s, wb_s, gap_s = args.drift
+            result = drift_detection(active, user, int(wa_s), int(wb_s), int(gap_s))
+            print(json.dumps(result, indent=2))
+            return 0
+
+        if args.save_profile:
+            user, path = args.save_profile
+            print(save_profile(user, active, path))
+            return 0
+
+        if args.load_profile:
+            prof = load_profile(args.load_profile)
+            if prof:
+                print(json.dumps(prof, indent=2, default=str)[:2000])
+            return 0
+
+        if args.auto_tag:
+            tag = auto_tag_user(active, args.auto_tag, args.llm_url, args.llm_model,
+                                args.max_chunk_chars, cache)
+            print(f"Tags for {args.auto_tag}: {tag}")
+            return 0
+
+        if args.auto_tag_bulk:
+            tags = auto_tag_bulk(active, args.llm_url, args.llm_model,
+                                 args.max_chunk_chars, cache, args.auto_tag_bulk)
+            for user, tag in tags.items():
+                print(f"  {user:<20s}  {tag}")
+            return 0
+
+        if args.recurrence_breach:
+            parts = args.recurrence_breach
+            user = parts[0]
+            days = int(parts[1]) if len(parts) > 1 else 3
+            result = check_recurrence_breach(active, user, days)
+            print(json.dumps(result, indent=2))
+            return 0
+
+        if args.dashboard_alerts:
+            engine = AlertEngine()
+            scores = alert_fatigue_scores(engine, active, 1)
+            if not scores:
+                print("(no rules to score)")
+            else:
+                for s in scores:
+                    print(f"  {s.rule_name:<20s}  rate={s.signal_rate:.0%}")
+            return 0
+
         if args.similar:
             pairs = find_similar_users(active,
                                        min_lines=args.similar_min_lines,
@@ -5755,7 +6801,10 @@ def main(argv: list[str] | None = None) -> int:
         llm_cache=cache,
         webhook_url=args.webhook_url or "",
         plugin_dir=args.plugin_dir or "",
+        template_filter=args.template_filter or "",
+        profile_dir=os.path.join(os.path.dirname(args.log) or ".", "profiles"),
     )
+    load_shell_config(state)
     if args.plugin_dir:
         load_plugins_from(args.plugin_dir)
     if args.web:
@@ -5764,6 +6813,7 @@ def main(argv: list[str] | None = None) -> int:
         state.web_server = start_web_server(args.web)
         print(f"Web API server started at http://127.0.0.1:{args.web}")
     shell = LogShell(state)
+    _set_current_shell(shell)
     shell._refresh_prompt()
 
     try:
