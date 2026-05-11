@@ -65,6 +65,26 @@ from queue import Queue
 from collections import deque
 import enum
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_OK = True
+except ImportError:
+    MATPLOTLIB_OK = False
+
+try:
+    import pandas as pd
+    PANDAS_OK = True
+except ImportError:
+    PANDAS_OK = False
+
+try:
+    from statsmodels.tsa.holtwinters import SimpleExpSmoothing
+    STATSMODELS_OK = True
+except ImportError:
+    STATSMODELS_OK = False
+
 
 # ---------- parsing ----------------------------------------------------------
 
@@ -1266,6 +1286,473 @@ def correlate_logs(log_a_entries: list[Entry], log_b_entries: list[Entry],
         avg_d = statistics.mean(delays) if delays else 0.0
         result.append(Correlation(ea, eb, cnt, avg_d))
     return result
+
+# ---------- Log template mining (#1) ------------------------------------------
+
+TEMPLATE_VAR_RE = re.compile(r"\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b|0x[0-9a-fA-F]+|[0-9a-fA-F]{8,}|(?<=/)[a-zA-Z0-9._-]+(?=/)")
+
+def extract_log_templates(entries: list[Entry], top_n: int = 20) -> list[tuple[str, int, str]]:
+    counter: Counter = Counter()
+    sample_lines: dict[str, str] = {}
+    for e in entries:
+        text = e.text or e.raw
+        template = TEMPLATE_VAR_RE.sub("{}", text)
+        template = re.sub(r"([\"']).*?(\1)", r'\1{}\1', template)
+        template = re.sub(r"\b[a-f0-9]{8,}\b", "{}", template, flags=re.I)
+        template = re.sub(r"\d{2,}", "{}", template)
+        counter[template] += 1
+        if template not in sample_lines:
+            sample_lines[template] = text[:200]
+    out: list[tuple[str, int, str]] = []
+    for template, count in counter.most_common(top_n):
+        out.append((template[:200], count, (sample_lines.get(template) or template)[:200]))
+    return out
+
+# ---------- Change-point detection (#2) ---------------------------------------
+
+@dataclass
+class ChangePoint:
+    user: str
+    metric: str
+    at: datetime
+    before_val: float
+    after_val: float
+    effect_size: float
+
+def detect_change_points(entries: list[Entry], user: str, window_days: int = 3) -> list[ChangePoint]:
+    u = user.lower()
+    user_entries = sorted(
+        [e for e in entries if e.ts and e.user and e.user.lower() == u],
+        key=lambda e: e.ts
+    )
+    if len(user_entries) < 10:
+        return []
+    windows: list[tuple[datetime, list[Entry]]] = []
+    if not user_entries or not user_entries[0].ts:
+        return []
+    cur_start = user_entries[0].ts
+    while cur_start <= user_entries[-1].ts:
+        win_end = cur_start + timedelta(days=window_days)
+        win = [e for e in user_entries if cur_start <= e.ts < win_end]
+        if win:
+            windows.append((cur_start, win))
+        cur_start = win_end
+
+    results: list[ChangePoint] = []
+    for i in range(1, len(windows)):
+        prev_count = len(windows[i - 1][1])
+        cur_count = len(windows[i][1])
+        if prev_count > 0 and cur_count > 0:
+            effect = (cur_count - prev_count) / (prev_count + cur_count)
+            if abs(effect) > 0.5:
+                results.append(ChangePoint(user, "volume", windows[i][0], prev_count, cur_count, effect))
+        # score changes
+        prev_scores = [v for e in windows[i - 1][1] for v in _scores_from_raw(e.raw).values() if isinstance(v, (int, float))]
+        cur_scores = [v for e in windows[i][1] for v in _scores_from_raw(e.raw).values() if isinstance(v, (int, float))]
+        if prev_scores and cur_scores:
+            prev_m = statistics.mean(prev_scores)
+            cur_m = statistics.mean(cur_scores)
+            pooled_sd = (statistics.pstdev(prev_scores) + statistics.pstdev(cur_scores)) / 2 or 1
+            effect = (cur_m - prev_m) / pooled_sd
+            if abs(effect) > 0.8:
+                results.append(ChangePoint(user, "score_shift", windows[i][0], prev_m, cur_m, effect))
+    return results
+
+# ---------- Root cause tracing (#3) -------------------------------------------
+
+@dataclass
+class RootCause:
+    preceding_user: str
+    preceding_event: str
+    correlation: float
+    avg_lag_seconds: float
+    occurrences: int
+
+def trace_root_causes(entries: list[Entry], target_user: str,
+                      lookback_seconds: int = 120, min_occurrences: int = 2) -> list[RootCause]:
+    u = target_user.lower()
+    sorted_e = sorted([e for e in entries if e.ts], key=lambda e: e.ts)
+    target_times: list[datetime] = []
+    for e in sorted_e:
+        if e.user and e.user.lower() == u:
+            target_times.append(e.ts)
+
+    causes: Counter = Counter()
+    lags: dict[tuple[str, str], list[float]] = {}
+    for tt in target_times:
+        seen: set[tuple[str, str]] = set()
+        for e in sorted_e:
+            if not e.user or not e.ts or e.user.lower() == u:
+                continue
+            lag = (tt - e.ts).total_seconds()
+            if 0 < lag <= lookback_seconds:
+                key = (e.user, e.event or e.level or "msg")
+                if key not in seen:
+                    causes[key] += 1
+                    lags.setdefault(key, []).append(lag)
+                    seen.add(key)
+
+    total_target = len(target_times) or 1
+    results: list[RootCause] = []
+    for (preceding_user, preceding_event), cnt in causes.most_common(30):
+        if cnt >= min_occurrences:
+            avg_lag = statistics.mean(lags.get((preceding_user, preceding_event), [0]))
+            results.append(RootCause(preceding_user, preceding_event, cnt / total_target, avg_lag, cnt))
+    return results
+
+# ---------- Forecasting (#4) ---------------------------------------------------
+
+@dataclass
+class Forecast:
+    daily_counts: dict[str, int]
+    predictions: list[tuple[str, float]]
+    trend: str  # increasing | decreasing | stable
+
+def forecast_activity(entries: list[Entry], user: str | None = None,
+                      days_ahead: int = 7) -> Forecast:
+    if user:
+        u = user.lower()
+        filtered = [e for e in entries if e.ts and e.user and e.user.lower() == u]
+    else:
+        filtered = [e for e in entries if e.ts]
+    if not filtered:
+        return Forecast({}, [], "unknown")
+    by_day: dict[str, int] = {}
+    for e in filtered:
+        if e.ts:
+            d = e.ts.date().isoformat()
+            by_day[d] = by_day.get(d, 0) + 1
+    dates = sorted(by_day.keys())
+    counts = [by_day[d] for d in dates]
+    if len(counts) < 3:
+        return Forecast(by_day, [], "unknown")
+
+    # simple approach: average of last few days + linear extrapolation
+    recent = counts[-min(len(counts), 5):]
+    avg = statistics.mean(recent)
+    # linear trend
+    n = len(counts)
+    xs = list(range(n))
+    mean_x = statistics.mean(xs)
+    mean_y = statistics.mean(counts)
+    num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, counts))
+    den = sum((x - mean_x) ** 2 for x in xs) or 1
+    slope = num / den
+    if slope > 0.5:
+        trend = "increasing"
+    elif slope < -0.5:
+        trend = "decreasing"
+    else:
+        trend = "stable"
+
+    predictions: list[tuple[str, float]] = []
+    last_date = datetime.fromisoformat(dates[-1])
+    for i in range(1, days_ahead + 1):
+        pred_date = (last_date + timedelta(days=i)).isoformat()[:10]
+        pred_val = max(0, avg + slope * (n + i))
+        predictions.append((pred_date, round(pred_val, 1)))
+    return Forecast(by_day, predictions, trend)
+
+# ---------- Multi-factor anomaly score (#5) -----------------------------------
+
+@dataclass
+class MultiFactorAnomaly:
+    user: str
+    composite_score: float
+    daily_z: float | None
+    hourly_z: float | None
+    sentiment_z: float | None
+
+def multi_factor_anomaly(entries: list[Entry], user: str) -> MultiFactorAnomaly | None:
+    u = user.lower()
+    user_entries = [e for e in entries if e.user and e.user.lower() == u and e.ts]
+    if len(user_entries) < 10:
+        return None
+    all_entries = [e for e in entries if e.ts]
+
+    # daily volume z-score
+    by_day_all: Counter = Counter()
+    for e in all_entries:
+        if e.ts:
+            by_day_all[e.ts.date()] += 1
+    by_day_user: Counter = Counter()
+    for e in user_entries:
+        if e.ts:
+            by_day_user[e.ts.date()] += 1
+    day_vals_all = list(by_day_all.values())
+    day_vals_user = list(by_day_user.values())
+    daily_z: float | None = None
+    if len(day_vals_all) >= 3:
+        m = statistics.mean(day_vals_all)
+        s = statistics.pstdev(day_vals_all) or 1
+        daily_z = (statistics.mean(day_vals_user) - m) / s if day_vals_user else 0
+
+    # hourly z-score
+    by_hour_user: Counter = Counter()
+    for e in user_entries:
+        if e.ts:
+            by_hour_user[e.ts.hour] += 1
+    by_hour_all: Counter = Counter()
+    for e in all_entries:
+        if e.ts:
+            by_hour_all[e.ts.hour] += 1
+    hourly_z: float | None = None
+    h_vals_all = [by_hour_all.get(h, 0) for h in range(24)]
+    h_vals_user = [by_hour_user.get(h, 0) for h in range(24)]
+    if len(h_vals_all) >= 3:
+        m_h = statistics.mean(h_vals_all)
+        s_h = statistics.pstdev(h_vals_all) or 1
+        hourly_z = (statistics.mean(h_vals_user) - m_h) / s_h
+
+    # sentiment z-score vs population
+    sent_user = user_sentiment(entries, user)
+    pop_sents = [user_sentiment(entries, u2)["mean_compound"]
+                 for u2 in {e.user for e in entries if e.user}
+                 if u2.lower() != u and user_sentiment(entries, u2)]
+    sentiment_z: float | None = None
+    if pop_sents and sent_user:
+        m_s = statistics.mean(pop_sents)
+        s_s = statistics.pstdev(pop_sents) or 1
+        sentiment_z = (sent_user["mean_compound"] - m_s) / s_s
+
+    factors = [v for v in [daily_z, hourly_z, sentiment_z] if v is not None]
+    composite = statistics.mean(factors) if factors else 0.0
+    return MultiFactorAnomaly(user, composite, daily_z, hourly_z, sentiment_z)
+
+# ---------- Matplotlib chart export (#6) --------------------------------------
+
+def chart_timeline(entries: list[Entry], path: str,
+                   user: str | None = None) -> bool:
+    if not MATPLOTLIB_OK:
+        print("matplotlib not installed; try: pip install matplotlib")
+        return False
+    if user:
+        u = user.lower()
+        filtered = [e for e in entries if e.ts and e.user and e.user.lower() == u]
+    else:
+        filtered = [e for e in entries if e.ts]
+    if not filtered:
+        print("(no data to chart)")
+        return False
+    by_day: Counter = Counter()
+    for e in filtered:
+        if e.ts:
+            by_day[e.ts.date()] += 1
+    dates = sorted(by_day.keys())
+    counts = [by_day[d] for d in dates]
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.bar(range(len(dates)), counts, color="#4a9eff")
+    ax.set_xticks(range(len(dates)))
+    ax.set_xticklabels([str(d)[5:] for d in dates], rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("Entries" + (f" ({user})" if user else ""))
+    ax.set_title("Activity Timeline")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"Chart saved to {path}")
+    return True
+
+def chart_histogram(values: list[float], path: str, label: str = "",
+                    bins: int = 10, range_lo: float = 0.0, range_hi: float = 1.0) -> bool:
+    if not MATPLOTLIB_OK:
+        print("matplotlib not installed")
+        return False
+    if not values:
+        return False
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.hist(values, bins=bins, range=(range_lo, range_hi), color="#4a9eff", edgecolor="white")
+    ax.set_xlabel(label)
+    ax.set_ylabel("Frequency")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return True
+
+def chart_network(edges: Counter, path: str, top_n: int = 15) -> bool:
+    if not MATPLOTLIB_OK:
+        print("matplotlib not installed")
+        return False
+    top = edges.most_common(top_n)
+    if not top:
+        return False
+    labels = [f"{a}->{b}" for (a, b), _ in top]
+    weights = [w for _, w in top]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.barh(range(len(labels)), weights, color="#4a9eff")
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_xlabel("Weight")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return True
+
+# ---------- Interactive data frame (#7) ---------------------------------------
+
+def dataframe_view(entries: list[Entry], expr: str = "") -> str:
+    if not PANDAS_OK:
+        return "pandas not installed; try: pip install pandas"
+    rows = []
+    for e in entries:
+        rows.append({
+            "ts": e.ts.isoformat() if e.ts else None,
+            "user": e.user,
+            "target": e.target,
+            "level": e.level,
+            "event": e.event,
+            "text": (e.text or "")[:200],
+        })
+    df = pd.DataFrame(rows)
+    if expr.strip():
+        try:
+            result = eval(expr, {"pd": pd, "df": df, "np": __import__("numpy", on_error=lambda: None)})
+            return str(result)
+        except Exception as exc:
+            return f"Error: {exc}"
+    return str(df.head(50))
+
+# ---------- Recurrence detection (#8) -----------------------------------------
+
+@dataclass
+class Recurrence:
+    user: str
+    pattern_type: str  # daily|weekly|hourly
+    confidence: float  # 0-1
+    description: str
+
+def detect_recurrence(entries: list[Entry], user: str) -> list[Recurrence]:
+    u = user.lower()
+    user_entries = [e for e in entries if e.ts and e.user and e.user.lower() == u]
+    if len(user_entries) < 7:
+        return []
+    results: list[Recurrence] = []
+
+    # weekly recurrence: check if active on consistent weekdays
+    by_weekday: Counter = Counter()
+    for e in user_entries:
+        if e.ts:
+            by_weekday[e.ts.weekday()] += 1
+    if by_weekday:
+        max_wd = max(by_weekday.values())
+        active_wds = [d for d, n in by_weekday.items() if n >= max_wd * 0.5]
+        confidence = max_wd / (sum(by_weekday.values()) or 1)
+        if len(active_wds) <= 3 and confidence > 0.3:
+            wd_names = [("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[d] for d in sorted(active_wds)]
+            results.append(Recurrence(user, "weekly", confidence, f"Active on {', '.join(wd_names)}"))
+
+    # hourly recurrence
+    by_hour_r: Counter = Counter()
+    for e in user_entries:
+        if e.ts:
+            by_hour_r[e.ts.hour] += 1
+    if by_hour_r:
+        peak_h = max(by_hour_r, key=by_hour_r.get)
+        peak_n = by_hour_r[peak_h]
+        total_h = sum(by_hour_r.values())
+        conf_h = peak_n / total_h if total_h > 0 else 0
+        if conf_h > 0.25:
+            results.append(Recurrence(user, "hourly", conf_h,
+                                      f"Peak activity at {peak_h}:00 ({conf_h:.0%} of all activity)"))
+
+    # daily recurrence: are they appearing nearly every day?
+    if len(user_entries) >= 3:
+        dates = sorted({e.ts.date() for e in user_entries if e.ts})
+        span = (dates[-1] - dates[0]).days or 1
+        coverage = len(dates) / span
+        if coverage > 0.5:
+            results.append(Recurrence(user, "daily", coverage,
+                                      f"Active on {len(dates)}/{span} days ({coverage:.0%})"))
+
+    return results
+
+# ---------- Churn prediction (#9) ---------------------------------------------
+
+@dataclass
+class ChurnPrediction:
+    user: str
+    risk_score: float  # 0-1
+    factors: list[str]
+
+def predict_churn(entries: list[Entry], user: str) -> ChurnPrediction:
+    u = user.lower()
+    user_entries = [e for e in entries if e.ts and e.user and e.user.lower() == u]
+    if len(user_entries) < 5:
+        return ChurnPrediction(user, 0.0, ["insufficient data"])
+
+    dates = sorted({e.ts.date() for e in user_entries if e.ts})
+    factors: list[str] = []
+    score = 0.0
+
+    # factor 1: recency (how long since last seen)
+    if dates:
+        days_since_last = (datetime.now().date() - dates[-1]).days
+        if days_since_last > 7:
+            score += 0.3
+            factors.append(f"last active {days_since_last}d ago")
+        elif days_since_last > 3:
+            score += 0.15
+
+    # factor 2: activity trend (declining?)
+    if len(user_entries) >= 6:
+        half = len(user_entries) // 2
+        first_half = user_entries[:half]
+        second_half = user_entries[half:]
+        if second_half and first_half:
+            ratio = len(second_half) / len(first_half)
+            if ratio < 0.5:
+                score += 0.3
+                factors.append(f"activity declined {ratio:.0%} (recent vs earlier)")
+
+    # factor 3: sentiment trend
+    s = user_sentiment(entries, user)
+    if s and s.get("mean_compound", 0) < -0.1:
+        score += 0.2
+        factors.append(f"negative sentiment ({s['mean_compound']:.2f})")
+
+    # factor 4: narrowing targets (fewer channels/targets recently)
+    half = max(len(user_entries) // 2, 1)
+    recent_targets = {e.target for e in user_entries[-half:] if e.target}
+    early_targets = {e.target for e in user_entries[:half] if e.target}
+    if early_targets and len(recent_targets) < len(early_targets) * 0.5:
+        score += 0.2
+        factors.append("narrowing engagement (fewer targets)")
+
+    risk = min(1.0, score)
+    return ChurnPrediction(user, risk, factors)
+
+# ---------- Pareto analysis (#10) ---------------------------------------------
+
+@dataclass
+class ParetoResult:
+    category: str  # users|events|targets
+    items: list[tuple[str, int, float]]  # name, count, cumulative%
+    top_80_pct_count: int  # how many items account for 80% of activity
+
+def pareto_analysis(entries: list[Entry], category: str = "users",
+                    top_n: int = 50) -> ParetoResult:
+    counter: Counter = Counter()
+    for e in entries:
+        if category == "users" and e.user:
+            counter[e.user] += 1
+        elif category == "events" and e.event:
+            counter[e.event] += 1
+        elif category == "targets" and e.target:
+            counter[e.target] += 1
+        elif category == "levels" and e.level:
+            counter[e.level] += 1
+    if not counter:
+        return ParetoResult(category, [], 0)
+    total = sum(counter.values()) or 1
+    running = 0
+    items: list[tuple[str, int, float]] = []
+    top_80_count = 0
+    for name, count in counter.most_common(top_n):
+        running += count
+        cum_pct = running / total * 100
+        items.append((name, count, cum_pct))
+        if cum_pct < 80:
+            top_80_count += 1
+    return ParetoResult(category, items, top_80_count)
 
 # ---------- views (named filter sets) ---------------------------------------
 
@@ -3667,6 +4154,16 @@ class LogShell(cmd.Cmd):
             ("web", "web {start|stop|status} [port]", "Start/stop the web API server."),
             ("webhook", "webhook {set|test|clear} ...", "Configure Slack/Discord webhook."),
             ("cron", "cron [--output <path>] [--webhook-url <url>]", "Run analysis in cron mode."),
+            ("templates", "templates [N]", "Extract common log line templates."),
+            ("changepoints", "changepoints [user] [window_days]", "Detect behavioral change points."),
+            ("rootcause", "rootcause <user> [lookback_sec]", "Find root causes preceding a user's activity."),
+            ("forecast", "forecast [user] [days]", "Forecast future activity volume."),
+            ("multifactor", "multifactor [user]", "Multi-factor anomaly score."),
+            ("chart", "chart {timeline|histogram|network} <path> ...", "Generate matplotlib charts."),
+            ("dataframe", "dataframe [expression]", "View entries as pandas DataFrame."),
+            ("recurrence", "recurrence [user]", "Detect periodic patterns (weekly/daily/hourly)."),
+            ("churn", "churn [user]", "Predict churn risk for a user."),
+            ("pareto", "pareto [users|events|targets|levels]", "Pareto analysis (80/20 rule)."),
             ("commands", "commands  (or ??)", "Print this reference."),
             ("help", "help [name]  (or ?<name>)", "Built-in help."),
             ("quit", "quit  (exit, Ctrl-D)", "Exit the shell."),
@@ -4209,6 +4706,177 @@ class LogShell(cmd.Cmd):
         """aggregate   Alias for 'multi report'."""
         self.do_multi("report")
 
+    # --- NEW 10 features: templates / changepoints / rootcause / forecast / multifactor / chart / dataframe / recurrence / churn / pareto ---
+
+    def do_templates(self, arg: str) -> None:
+        """templates [N]   Extract common log line templates."""
+        n = int(arg.strip()) if arg.strip().isdigit() else 20
+        templates = extract_log_templates(self._active_entries(), n)
+        if not templates:
+            print("(no templates)")
+            return
+        print(f"\nLog templates ({len(templates)}):")
+        for template, count, sample in templates:
+            print(f"  {count:>5d}x  {template[:160]}")
+
+    def do_changepoints(self, arg: str) -> None:
+        """changepoints [user] [window_days]   Detect behavioral change points."""
+        parts = self._split(arg)
+        user = parts[0] if parts else self.state.focused_user
+        window = 3
+        for p in parts:
+            try:
+                window = int(p)
+            except ValueError:
+                user = p
+        user = self._resolve_user(user or "")
+        if not user:
+            return
+        cps = detect_change_points(self._active_entries(), user, window)
+        if not cps:
+            print(f"(no change points for '{user}')")
+            return
+        print(f"\nChange points for '{user}':")
+        for cp in cps:
+            dir_ = "UP" if cp.after_val > cp.before_val else "DOWN"
+            print(f"  {dir_:>4}  {cp.metric:<15s}  at {cp.at.date()}  {cp.before_val:.1f} -> {cp.after_val:.1f}  (effect={cp.effect_size:.2f})")
+
+    def do_rootcause(self, arg: str) -> None:
+        """rootcause <user> [lookback_sec]   Find root causes preceding a user's activity."""
+        parts = self._split(arg)
+        if not parts:
+            print("Usage: rootcause <user> [lookback_seconds]")
+            return
+        user = parts[0]
+        lookback = int(parts[1]) if len(parts) > 1 else 120
+        causes = trace_root_causes(self._active_entries(), user, lookback)
+        if not causes:
+            print(f"(no root causes found for '{user}')")
+            return
+        print(f"\nRoot causes for '{user}' (lookback={lookback}s):")
+        for rc in causes[:15]:
+            print(f"  {rc.occurrences:>4d}x  corr={rc.correlation:.2f}  lag={rc.avg_lag_seconds:.0f}s  {rc.preceding_user:<20s} {rc.preceding_event}")
+
+    def do_forecast(self, arg: str) -> None:
+        """forecast [user] [days]   Forecast future activity."""
+        parts = self._split(arg)
+        user = parts[0] if parts else self.state.focused_user
+        days = 7
+        for p in parts:
+            try:
+                days = int(p)
+            except ValueError:
+                user = p
+        fc = forecast_activity(self._active_entries(), user, days)
+        if not fc.predictions:
+            print("(insufficient data for forecast)")
+            return
+        label = f" for '{user}'" if user else ""
+        print(f"\nForecast{label}: trend={fc.trend}")
+        dates = sorted(fc.daily_counts.keys())
+        counts = [fc.daily_counts[d] for d in dates]
+        if len(counts) > 1:
+            glyphs = "▁▂▃▄▅▆▇█"
+            peak = max(counts) or 1
+            bar = "".join(glyphs[min(int(c / peak * 7), 7)] for c in counts[-min(len(counts), 30):])
+            print(f"  Recent activity: {bar}")
+        print(f"  Predictions ({days}d ahead):")
+        for d, v in fc.predictions:
+            print(f"    {d}:  {v:.0f}")
+
+    def do_multifactor(self, arg: str) -> None:
+        """multifactor [user]   Multi-factor anomaly score."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        mf = multi_factor_anomaly(self._active_entries(), user)
+        if not mf:
+            print(f"(insufficient data for '{user}')")
+            return
+        print(f"\nMulti-factor anomaly for '{user}':")
+        print(f"  Composite score: {mf.composite_score:+.3f}  ({'ANOMALOUS' if abs(mf.composite_score) > 1.5 else 'normal'})")
+        print(f"  Daily volume z:  {mf.daily_z:+.2f}" if mf.daily_z is not None else "  Daily volume z:  N/A")
+        print(f"  Hourly z:        {mf.hourly_z:+.2f}" if mf.hourly_z is not None else "  Hourly z:        N/A")
+        print(f"  Sentiment z:     {mf.sentiment_z:+.2f}" if mf.sentiment_z is not None else "  Sentiment z:     N/A")
+
+    def do_chart(self, arg: str) -> None:
+        """chart {timeline <path> [user] | histogram <path> [key] [user] | network <path> [N]}
+        Generate matplotlib charts."""
+        parts = self._split(arg)
+        if not parts:
+            print("Usage: chart timeline <path> [user]  |  chart histogram <path> [key] [user]  |  chart network <path> [N]")
+            return
+        sub = parts[0].lower()
+        if sub == "timeline" and len(parts) >= 2:
+            path = parts[1]
+            user = parts[2] if len(parts) > 2 else None
+            chart_timeline(self._active_entries(), path, user)
+        elif sub == "histogram" and len(parts) >= 2:
+            path = parts[1]
+            user = parts[3] if len(parts) > 3 else None
+            if user:
+                scores = collect_scores(self._active_entries(), user)
+                for key in SCORE_KEYS:
+                    if scores.get(key):
+                        chart_histogram(scores[key], path.replace(".png", f"_{key}.png"), label=f"{key} ({user})")
+                        print(f"  Chart saved: {path.replace('.png', f'_{key}.png')}")
+            else:
+                scores = collect_scores(self._active_entries())
+                for key in SCORE_KEYS:
+                    if scores.get(key):
+                        chart_histogram(scores[key], path.replace(".png", f"_{key}.png"), label=f"{key} (population)")
+        elif sub == "network" and len(parts) >= 2:
+            path = parts[1]
+            n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 15
+            edges = build_edge_graph(self._active_entries())
+            chart_network(edges, path, n)
+        else:
+            print("Usage: chart timeline <path> [user]  |  chart histogram <path> [key] [user]  |  chart network <path> [N]")
+
+    def do_dataframe(self, arg: str) -> None:
+        """dataframe [expression]   View entries as pandas DataFrame with optional eval expression."""
+        print(dataframe_view(self._active_entries(), arg.strip()))
+
+    def do_recurrence(self, arg: str) -> None:
+        """recurrence [user]   Detect periodic patterns in a user's activity."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        recs = detect_recurrence(self._active_entries(), user)
+        if not recs:
+            print(f"(no recurrence patterns for '{user}')")
+            return
+        print(f"\nRecurrence patterns for '{user}':")
+        for r in recs:
+            print(f"  [{r.pattern_type:>7}]  confidence={r.confidence:.0%}  {r.description}")
+
+    def do_churn(self, arg: str) -> None:
+        """churn [user]   Predict churn risk for a user."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        pred = predict_churn(self._active_entries(), user)
+        level = "HIGH" if pred.risk_score > 0.6 else "MEDIUM" if pred.risk_score > 0.3 else "LOW"
+        print(f"\nChurn prediction for '{user}': risk={level} ({pred.risk_score:.2f})")
+        if pred.factors:
+            print("  Factors:")
+            for f in pred.factors:
+                print(f"    - {f}")
+
+    def do_pareto(self, arg: str) -> None:
+        """pareto [users|events|targets|levels]   Pareto analysis (80/20 rule)."""
+        cat = arg.strip() or "users"
+        p = pareto_analysis(self._active_entries(), cat)
+        if not p.items:
+            print(f"(no data for {cat})")
+            return
+        print(f"\nPareto analysis ({cat}): top {p.top_80_pct_count} account for ~80% of activity")
+        for name, count, cum in p.items[:25]:
+            bar = "█" * int(cum / 5)
+            print(f"  {cum:>5.0f}%  {bar:<20s}  {count:>7d}  {name}")
+        if len(p.items) > 25:
+            print(f"  ...({len(p.items) - 25} more)")
+
     def do_quit(self, arg: str) -> bool:
         """quit   Exit the shell."""
         if self.state.watch_bg:
@@ -4587,6 +5255,30 @@ class LogShell(cmd.Cmd):
         return self._complete_path(text)
     def complete_export_sql(self, text, line, begidx, endidx):
         return self._complete_path(text)
+    # completions for 10 new features
+    def complete_templates(self, text, line, begidx, endidx):
+        return []
+    def complete_changepoints(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_rootcause(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_forecast(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_multifactor(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_chart(self, text, line, begidx, endidx):
+        prev = line[:begidx].split()
+        if len(prev) <= 1:
+            return self._complete_prefix(text, ["timeline", "histogram", "network"])
+        return self._complete_path(text)
+    def complete_dataframe(self, text, line, begidx, endidx):
+        return []
+    def complete_recurrence(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_churn(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_pareto(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, ["users", "events", "targets", "levels"])
 
 
 # ---------- main -------------------------------------------------------------
@@ -4668,6 +5360,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cron", action="store_true", help="Run in cron mode (batch with optional alerts)")
     p.add_argument("--cron-output", help="Append cron output to this file")
     p.add_argument("--webhook-url", help="Webhook URL for alerts (cron mode)")
+    p.add_argument("--templates", type=int, nargs="?", const=20, default=0,
+                   help="With --batch, extract log templates (optional N)")
+    p.add_argument("--changepoints", help="With --batch, detect change points for the given user")
+    p.add_argument("--changepoints-window", type=int, default=3, help="Window in days for change point detection")
+    p.add_argument("--rootcause", nargs="+", metavar=("USER [LOOKBACK]"),
+                   help="With --batch, find root causes: --rootcause user [lookback_sec]")
+    p.add_argument("--forecast", help="With --batch, forecast activity for the given user")
+    p.add_argument("--forecast-days", type=int, default=7)
+    p.add_argument("--multifactor", help="With --batch, multi-factor anomaly score for the user")
+    p.add_argument("--chart", nargs="+", metavar=("TYPE PATH [USER]"),
+                   help="With --batch, generate chart: --chart timeline out.png [user]")
+    p.add_argument("--dataframe", nargs="?", const="", default=None,
+                   help="With --batch, view as DataFrame (optional expression)")
+    p.add_argument("--recurrence", help="With --batch, detect recurrence patterns for user")
+    p.add_argument("--churn", help="With --batch, predict churn risk for user")
+    p.add_argument("--pareto", nargs="?", const="users", default=None,
+                   help="With --batch, Pareto analysis (users|events|targets|levels)")
     args = p.parse_args(argv)
 
     try:
@@ -4824,6 +5533,83 @@ def main(argv: list[str] | None = None) -> int:
         if args.cron:
             alert_engine = AlertEngine()
             return cron_mode(active, alert_engine, args.webhook_url, args.cron_output)
+
+        if args.templates:
+            templates = extract_log_templates(active, args.templates)
+            for template, count, sample in templates:
+                print(f"  {count:>5d}x  {template[:160]}")
+            return 0
+
+        if args.changepoints:
+            cps = detect_change_points(active, args.changepoints, args.changepoints_window)
+            for cp in cps:
+                dir_ = "UP" if cp.after_val > cp.before_val else "DOWN"
+                print(f"  {dir_} {cp.metric} at {cp.at.date()} {cp.before_val:.1f}->{cp.after_val:.1f} effect={cp.effect_size:.2f}")
+            if not cps:
+                print("(no change points)")
+            return 0
+
+        if args.rootcause:
+            user = args.rootcause[0]
+            lookback = int(args.rootcause[1]) if len(args.rootcause) > 1 else 120
+            causes = trace_root_causes(active, user, lookback)
+            for rc in causes[:15]:
+                print(f"  {rc.occurrences:>4d}x  corr={rc.correlation:.2f}  lag={rc.avg_lag_seconds:.0f}s  {rc.preceding_user:<20s} {rc.preceding_event}")
+            if not causes:
+                print("(no root causes)")
+            return 0
+
+        if args.forecast:
+            fc = forecast_activity(active, args.forecast, args.forecast_days)
+            print(f"Forecast for {args.forecast}: trend={fc.trend}")
+            for d, v in fc.predictions:
+                print(f"  {d}: {v:.0f}")
+            return 0
+
+        if args.multifactor:
+            mf = multi_factor_anomaly(active, args.multifactor)
+            if mf:
+                print(f"Multi-factor anomaly for {args.multifactor}: composite={mf.composite_score:+.3f}")
+            else:
+                print("(insufficient data)")
+            return 0
+
+        if args.chart:
+            sub = args.chart[0]
+            if sub == "timeline" and len(args.chart) >= 2:
+                path = args.chart[1]
+                user = args.chart[2] if len(args.chart) > 2 else None
+                chart_timeline(active, path, user)
+            else:
+                print("Usage: --chart timeline <path> [user]")
+            return 0
+
+        if args.dataframe is not None:
+            print(dataframe_view(active, args.dataframe))
+            return 0
+
+        if args.recurrence:
+            recs = detect_recurrence(active, args.recurrence)
+            for r in recs:
+                print(f"  [{r.pattern_type:>7}]  confidence={r.confidence:.0%}  {r.description}")
+            if not recs:
+                print("(no recurrence patterns)")
+            return 0
+
+        if args.churn:
+            pred = predict_churn(active, args.churn)
+            level = "HIGH" if pred.risk_score > 0.6 else "MEDIUM" if pred.risk_score > 0.3 else "LOW"
+            print(f"Churn for {args.churn}: risk={level} ({pred.risk_score:.2f})")
+            for f in pred.factors:
+                print(f"  - {f}")
+            return 0
+
+        if args.pareto:
+            p = pareto_analysis(active, args.pareto)
+            print(f"Pareto ({args.pareto}): top {p.top_80_pct_count} items account for ~80%")
+            for name, count, cum in p.items[:25]:
+                print(f"  {cum:>5.0f}%  {count:>7d}  {name}")
+            return 0
 
         if args.similar:
             pairs = find_similar_users(active,
