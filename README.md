@@ -2,7 +2,7 @@
 
 To run the core client without installing dependencies or enabling AI (LLM) detection:
 
-python eyearesee.py --no-ai --no-install ( all llm features will be disabled and it will install no dependencies. )
+python eyearesee.py --no-ai --no-install ( all llm features will be disabled and it will install no dependencies. also use --require-virtualenv for venv)
 
 ## What do you mean by AI?
 ~29% of the code (2,254 of 7,710 lines) is dedicated to AI/LLM functionality. Breakdown:
