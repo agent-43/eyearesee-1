@@ -129,6 +129,7 @@ AI_SUSPECT_THRESHOLD = 70
 # AI detection logging: enabled by default.  Set IRC_AI_LOG=0 to disable at startup.
 # Can also be toggled at runtime with /logtoggle.
 _ai_logging_enabled: bool = os.environ.get("IRC_AI_LOG", "1") not in ("0", "false", "no", "off")
+_AUTOJOIN_CHANNELS: set = set()
 
 # All data files are placed next to the script so they are writable regardless
 # of the working directory the user launches from (e.g. C:\Windows\system32).
@@ -240,6 +241,12 @@ def save_irc_config(cfg: dict) -> None:
     except OSError:
         pass
 
+
+def _save_autojoin_config() -> None:
+    cfg = load_irc_config()
+    cfg["autojoin"] = sorted(_AUTOJOIN_CHANNELS)
+    save_irc_config(cfg)
+
 def load_input_history() -> List[str]:
     """Return up to INPUT_HISTORY_MAX lines, most-recent first."""
     try:
@@ -321,7 +328,7 @@ def append_chat_line(window_name: str, line: str) -> None:
 # Control codes used by IRC for inline text formatting.
 _IRC_FMT_RE = re.compile(
     r'\x03(?:\d{1,2}(?:,\d{1,2})?)?'   # \x03[fg][,bg]  colour
-    r'|[\x02\x0F\x16\x1D\x1F]'          # bold / reset / reverse / italic / underline
+    r'|[\x02\x0F\x16\x1D\x1F\x1E]'      # bold / reset / reverse / italic / underline / strikethrough
 )
 
 # Module-level parse cache: most IRC lines repeat across redraws
@@ -816,7 +823,8 @@ def irc_parse_formatting(text: str) -> List[Tuple[str, int]]:
     """Split *text* into (segment, curses_attr) pairs honouring IRC codes.
 
     Supports: \x02 bold, \x1D italic, \x1F underline, \x0F reset,
-    \x16 reverse, \x03 colour (colour is stripped; only bold/italic/underline
+    \x16 reverse, \x1E strikethrough, \x03 colour
+    (colour is stripped; only bold/italic/underline/reverse/strikethrough
     are mapped to curses attributes).
 
     Results are cached (up to 512 entries) since the same wrapped line is
@@ -827,13 +835,13 @@ def irc_parse_formatting(text: str) -> List[Tuple[str, int]]:
         return cached
 
     segments: List[Tuple[str, int]] = []
-    bold = italic = underline = reverse = False
+    bold = italic = underline = reverse = strikethrough = False
     buf: List[str] = []
     i = 0
 
     def _flush():
         if buf:
-            segments.append(("".join(buf), _irc_attr(bold, italic, underline, reverse)))
+            segments.append(("".join(buf), _irc_attr(bold, italic, underline, reverse, strikethrough)))
             buf.clear()
 
     while i < len(text):
@@ -846,17 +854,19 @@ def irc_parse_formatting(text: str) -> List[Tuple[str, int]]:
             _flush(); underline = not underline; i += 1
         elif ch == "\x16":        # reverse toggle
             _flush(); reverse = not reverse; i += 1
+        elif ch == "\x1E":        # strikethrough toggle (draft/format)
+            _flush(); strikethrough = not strikethrough; i += 1
         elif ch == "\x0F":        # reset all
-            _flush(); bold = italic = underline = reverse = False; i += 1
+            _flush(); bold = italic = underline = reverse = strikethrough = False; i += 1
         elif ch == "\x03":        # colour code — advance past digits, map nothing
             _flush()
             i += 1
-            for _ in range(2):    # up to 2 fg digits
+            for _ in range(2):
                 if i < len(text) and text[i].isdigit(): i += 1
                 else: break
             if i < len(text) and text[i] == ",":
                 i += 1
-                for _ in range(2):  # up to 2 bg digits
+                for _ in range(2):
                     if i < len(text) and text[i].isdigit(): i += 1
                     else: break
         else:
@@ -870,14 +880,18 @@ def irc_parse_formatting(text: str) -> List[Tuple[str, int]]:
     return result
 
 
-def _irc_attr(bold: bool, italic: bool, underline: bool, reverse: bool) -> int:
+def _irc_attr(bold: bool, italic: bool, underline: bool, reverse: bool,
+              strikethrough: bool = False) -> int:
     attr = curses.A_NORMAL
     if bold:      attr |= curses.A_BOLD
     if underline: attr |= curses.A_UNDERLINE
     if reverse:   attr |= curses.A_REVERSE
     if italic:
         try:    attr |= curses.A_ITALIC
-        except AttributeError: attr |= curses.A_DIM   # fallback on older curses
+        except AttributeError: attr |= curses.A_DIM
+    if strikethrough:
+        try:    attr |= curses.A_STANDOUT  # closest curses has to strikethrough
+        except AttributeError: attr |= curses.A_DIM
     return attr
 
 # =========================
@@ -2191,6 +2205,8 @@ class IRCClient:
         self._current_msg_tags: dict = {}
         # Tokens from ISUPPORT (005 numeric): e.g. NETWORK, PREFIX, CHANTYPES.
         self._isupport: dict = {}
+        # Accumulates RPL_LIST (322) results between /list and RPL_LISTEND (323).
+        self._list_results: list = []
         self._irc_handlers: dict = {}
         self._build_irc_handlers()
         # Strong references to fire-and-forget scoring tasks so they are not
@@ -2618,7 +2634,8 @@ class IRCClient:
         "message-tags", "batch", "labeled-response", "invite-notify",
         "account-tag", "standard-replies", "setname",
         "chathistory", "draft/chathistory",
-        "draft/multiline", "message-redaction", "read-marker",
+        "draft/multiline", "draft/format",
+        "message-redaction", "read-marker",
         "draft/account-registration",
     )
 
@@ -2991,6 +3008,10 @@ class IRCClient:
         for ch in sorted(self.joined_channels):
             self.send_raw(f"JOIN {ch}")
             await self.ui_queue.put(("status", f"Joining {ch}..."))
+        for ch in sorted(_AUTOJOIN_CHANNELS):
+            if self._irc_lower(ch) not in (self._irc_lower(c) for c in self.joined_channels):
+                self.send_raw(f"JOIN {ch}")
+                await self.ui_queue.put(("status", f"Joining {ch}..."))
         if not self.current_channel and DEFAULT_CHANNEL:
             self.current_channel = DEFAULT_CHANNEL
 
@@ -3167,22 +3188,17 @@ class IRCClient:
         if len(params) < 4:
             return
         channel = params[2]
-        # When userhost-in-names CAP is active entries look like "@nick!user@host";
-        # strip mode-prefix chars and drop the !user@host suffix so the user list
-        # only contains bare nicks (matching how JOIN/PART/QUIT events work).
-        # PREFIX advertises mode-prefix chars as e.g. '(qaohv)~&@%+'
-        # — the substring after ')' is the set to strip. Fall back
-        # to the historical defaults when the server doesn't advertise.
         prefix_isup = self._isupport.get("PREFIX", "(qaohv)~&@%+")
         prefix_chars = prefix_isup.split(")", 1)[1] if ")" in prefix_isup else "@+%&~!"
-        cleaned = []
+        pairs = []
         for entry in params[3].split():
-            entry = entry.lstrip(prefix_chars)
-            if "!" in entry:                  # userhost-in-names
-                entry = entry.split("!", 1)[0]
-            if entry:
-                cleaned.append(entry)
-        await self.ui_queue.put(("names", channel, " ".join(cleaned)))
+            bare = entry.lstrip(prefix_chars)
+            if "!" in bare:
+                bare = bare.split("!", 1)[0]
+            if bare:
+                mode_char = entry[0] if entry and entry[0] in prefix_chars else ""
+                pairs.append(f"{mode_char}{bare}")
+        await self.ui_queue.put(("names", channel, " ".join(pairs)))
 
     async def _irc_who_reply(self, nick, params, prefix):  # 352/314
         await self.ui_queue.put(("status", f"{params[0] if params else ''} {' '.join(params[1:])}"))
@@ -3425,6 +3441,18 @@ class IRCClient:
         else:
             await self.ui_queue.put(("status", f"[who] {' '.join(vals)}"))
 
+    async def _irc_list(self, nick, params, prefix):  # 322 RPL_LIST
+        if len(params) >= 3:
+            channel = params[1]
+            num_users = params[2] if len(params) > 2 else "0"
+            topic = params[-1] if len(params) > 3 else ""
+            self._list_results.append((channel, num_users, topic))
+
+    async def _irc_listend(self, nick, params, prefix):  # 323 RPL_LISTEND
+        results = self._list_results
+        self._list_results = []
+        await self.ui_queue.put(("list_results", results))
+
     async def _irc_isupport(self, nick, params, prefix):  # 005 RPL_ISUPPORT
         """Parse ISUPPORT tokens and extract useful server capabilities."""
         # params = [yournick, TOKEN, TOKEN=value, ..., "are supported by this server"]
@@ -3492,6 +3520,8 @@ class IRCClient:
         h["433"]          = self._irc_nick_in_use
         h["432"]          = self._irc_bad_nick
         h["401"]          = self._irc_no_such_nick
+        h["322"]          = self._irc_list
+        h["323"]          = self._irc_listend
         h["005"]          = self._irc_isupport
         h["AWAY"]         = self._irc_away_notify
         h["CHGHOST"]      = self._irc_chghost
@@ -3799,6 +3829,7 @@ class PluginAPI:
         self.name = name
         self._tui = tui
         self._commands: Dict[str, Callable] = {}
+        self._hooks: Dict[str, List[Callable]] = {}
 
     # ── Command registration ─────────────────────────────────────────────────
 
@@ -3817,6 +3848,25 @@ class PluginAPI:
     def register(self, name: str, handler: Callable) -> None:
         """Imperatively register a slash command handler."""
         self._commands[name.lower()] = handler
+
+    # ── Event hook registration ──────────────────────────────────────────────
+
+    def on(self, event: str) -> Callable:
+        """Decorator: register an event hook.
+
+        Supported events:
+          on_message(api, nick, target, msg, is_action, is_replay)
+          on_join(api, nick, channel)
+          on_part(api, nick, channel)
+          on_quit(api, nick, reason)
+          on_nick_change(api, old_nick, new_nick)
+
+        Both sync and async callbacks are accepted.
+        """
+        def decorator(fn: Callable) -> Callable:
+            self._hooks.setdefault(event, []).append(fn)
+            return fn
+        return decorator
 
     # ── Status / output helpers ──────────────────────────────────────────────
 
@@ -3867,6 +3917,7 @@ class PluginManager:
     def __init__(self) -> None:
         self._plugins: Dict[str, Tuple[PluginAPI, Any]] = {}          # name → (api, module)
         self._commands: Dict[str, Tuple[PluginAPI, Callable]] = {}    # cmd  → (api, handler)
+        self._hooks: Dict[str, List[Tuple[PluginAPI, Callable]]] = {} # event → [(api, handler)]
 
     def load(self, path: str, tui: "TUI") -> Tuple[bool, str]:
         """Load a plugin from *path*.  Returns (success, message)."""
@@ -3886,6 +3937,9 @@ class PluginManager:
             self._plugins[name] = (api, module)
             for cmd_name, handler in api._commands.items():
                 self._commands[cmd_name] = (api, handler)
+            for event, handlers in api._hooks.items():
+                for h in handlers:
+                    self._hooks.setdefault(event, []).append((api, h))
             cmds = " ".join(f"/{c}" for c in api._commands) if api._commands else "(no commands)"
             return True, f"Loaded plugin '{name}'  {cmds}"
         except Exception as exc:
@@ -3905,6 +3959,10 @@ class PluginManager:
                 pass
         for cmd_name in list(api._commands):
             self._commands.pop(cmd_name, None)
+        for event in list(self._hooks):
+            self._hooks[event] = [(a, h) for a, h in self._hooks[event] if a is not api]
+            if not self._hooks[event]:
+                del self._hooks[event]
         return True, f"Unloaded plugin '{name}'"
 
     def reload(self, name: str, tui: "TUI") -> Tuple[bool, str]:
@@ -3929,11 +3987,25 @@ class PluginManager:
             for name, (api, _) in self._plugins.items()
         ]
 
+    async def dispatch(self, event: str, **kwargs) -> None:
+        """Dispatch *event* to all registered plugin hooks."""
+        handlers = self._hooks.get(event)
+        if not handlers:
+            return
+        for api, handler in handlers:
+            try:
+                result = handler(api, **kwargs)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
+
 
 class ServerContext:
     """Holds all state that is scoped to a single IRC server connection."""
     __slots__ = ("server_id", "client", "channel_users", "user_scores",
-                 "user_ai_scores", "_suspect_nicks", "_sorted_users")
+                 "user_ai_scores", "_suspect_nicks", "_sorted_users",
+                 "channel_user_modes")
 
     def __init__(self, server_id: str, client: "IRCClient") -> None:
         self.server_id       = server_id
@@ -3943,6 +4015,7 @@ class ServerContext:
         self.user_ai_scores: Dict[str, int]       = {}
         self._suspect_nicks: set                  = set()
         self._sorted_users:  Dict[str, List[str]] = {}
+        self.channel_user_modes: Dict[str, Dict[str, str]] = {}
 
 # =========================
 # TUI - Enhanced Dashboard
@@ -4009,8 +4082,9 @@ class TUI:
         self.channel_users  = _primary_ctx.channel_users
         self.user_scores    = _primary_ctx.user_scores
         self.user_ai_scores = _primary_ctx.user_ai_scores
-        self._suspect_nicks = _primary_ctx._suspect_nicks
-        self._sorted_users  = _primary_ctx._sorted_users
+        self._suspect_nicks     = _primary_ctx._suspect_nicks
+        self._sorted_users      = _primary_ctx._sorted_users
+        self.channel_user_modes = _primary_ctx.channel_user_modes
 
         self.current_window_index = 0
         self.current_channel: Optional[str] = DEFAULT_CHANNEL
@@ -4024,7 +4098,7 @@ class TUI:
         self.completion_state = None
         self.dirty = True
         self.last_redraw = 0.0
-        self.ignored_nicks: set = set()
+        self.ignored_nicks: set = set(load_irc_config().get("ignored_nicks", []))
         self.mention_beep_muted: bool = False
 
         # Performance caches — maintained incrementally to avoid per-frame rebuilds
@@ -4116,6 +4190,8 @@ class TUI:
 
         # Auto-translate CJK (Chinese/Japanese/…) messages to English
         self.auto_translate: bool = True
+        # Auto-fetch link metadata (title, image info, domain warnings)
+        self.link_preview_enabled: bool = True
 
     # ── Multi-server helpers ─────────────────────────────────────────────────
 
@@ -4142,7 +4218,8 @@ class TUI:
         self.user_scores    = ctx.user_scores
         self.user_ai_scores = ctx.user_ai_scores
         self._suspect_nicks = ctx._suspect_nicks
-        self._sorted_users  = ctx._sorted_users
+        self._sorted_users      = ctx._sorted_users
+        self.channel_user_modes = ctx.channel_user_modes
 
     def _sync_draw_ctx(self) -> None:
         """Sync self.* aliases to the server that owns the currently visible window.
@@ -4992,17 +5069,18 @@ class TUI:
         if display_ch:
             ch = display_ch
             if ch not in self._sorted_users:
-                self._sorted_users[ch] = sorted(self.channel_users[ch])
+                self._sorted_users[ch] = self._sort_users_by_mode(ch)
             users = self._sorted_users[ch]
+            modes = self.channel_user_modes.get(ch, {})
             thresh      = self.ai_suspect_threshold
             attr_sus    = self._attr_suspect
             attr_normal = self._attr_normal
             for i, nick in enumerate(users[:self.chat_height - 2]):
                 ai_pct = self.user_ai_scores.get(nick, 0)
-                # Pad nick to exactly 18 *visual columns* so the score badge
-                # aligns correctly even when the nick contains wide (CJK) chars.
-                nick_vis = _str_visual_width(nick)
-                padded   = nick + " " * max(0, 18 - nick_vis)
+                mode_char = self._highest_prefix(modes.get(nick, set()))
+                display_nick = (mode_char + nick) if mode_char else nick
+                nick_vis = _str_visual_width(display_nick)
+                padded   = display_nick + " " * max(0, 18 - nick_vis)
                 line     = _truncate_to_width(f"{padded} [{ai_pct:2d}%]", uw)
                 try:
                     self.user_win.addstr(i + 1, 1, line,
@@ -5188,16 +5266,24 @@ class TUI:
         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
 
-    def do_nick_complete(self) -> None:
+    @staticmethod
+    def _prefix_rank(mode_char: str) -> int:
+        return {"~": 5, "&": 4, "@": 3, "%": 2, "+": 1}.get(mode_char, 0)
+
+    def _sort_users_by_mode(self, ch: str) -> List[str]:
+        modes = self.channel_user_modes.get(ch, {})
+        users = self.channel_users.get(ch, set())
+        return sorted(users, key=lambda n: (-self._prefix_rank(self._highest_prefix(modes.get(n, set()))), n.lower()))
+
+    def do_nick_complete(self, reverse: bool = False) -> None:
         if not self.current_channel or self.current_channel not in self.channel_users:
             return
         ch = self.current_channel
         if ch not in self._sorted_users:
-            self._sorted_users[ch] = sorted(self.channel_users[ch])
+            self._sorted_users[ch] = self._sort_users_by_mode(ch)
         users = self._sorted_users[ch]
         if not users:
             return
-        # Complete the word ending at the cursor
         buf    = self.input_buffer
         cursor = self.input_cursor
         word_start = cursor
@@ -5210,13 +5296,15 @@ class TUI:
         if not matches:
             return
         if self.completion_state and self.completion_state[0] == prefix:
-            idx   = (self.completion_state[2] + 1) % len(self.completion_state[1])
+            if reverse:
+                idx = (self.completion_state[2] - 1) % len(self.completion_state[1])
+            else:
+                idx = (self.completion_state[2] + 1) % len(self.completion_state[1])
             match = self.completion_state[1][idx]
         else:
-            idx   = 0
-            match = matches[0]
+            idx = len(matches) - 1 if reverse else 0
+            match = matches[idx]
         self.completion_state = (prefix, matches, idx)
-        # First word → append colon+space; subsequent words → just a space
         suffix = ": " if word_start == 0 else " "
         replacement = match + suffix
         self.input_buffer = buf[:word_start] + replacement + buf[cursor:]
@@ -5242,7 +5330,10 @@ class TUI:
         h["react"]       = self._ev_react
         h["redact"]      = self._ev_redact
         h["markread"]    = self._ev_markread
-        for k in ("whois", "kick", "mode", "status"):
+        h["mode"]        = self._ev_mode
+        h["kick"]        = self._ev_kick
+        h["list_results"] = self._ev_list_results
+        for k in ("whois", "status"):
             h[k] = self._ev_status_line
 
     async def handle_event(self, event: tuple) -> None:
@@ -5320,7 +5411,7 @@ class TUI:
                 pass
         if self.auto_translate and _has_cjk(irc_strip_formatting(msg)):
             asyncio.create_task(self._post_translation(win, msg))
-        if _URL_RE.search(irc_strip_formatting(msg)):
+        if self.link_preview_enabled and _URL_RE.search(irc_strip_formatting(msg)):
             asyncio.create_task(self._post_link_info(win, nick, msg, win_name))
         self.user_scores[nick] = u_score
         self.user_ai_scores[nick] = rolling_ai
@@ -5346,6 +5437,8 @@ class TUI:
             pass  # _chat_dirty already set below
         self._chat_dirty = True
         self.dirty = True
+        await self.plugin_manager.dispatch("on_message", nick=nick, target=target,
+                                           msg=msg, is_action=is_action, is_replay=is_replay)
 
     async def _ev_typing(self, event):
         _, nick, target, state = event
@@ -5457,6 +5550,9 @@ class TUI:
             if old_nick in users:
                 users.discard(old_nick)
                 users.add(new_nick)
+                mode_set = self.channel_user_modes.get(ch, {}).pop(old_nick, None)
+                if mode_set is not None:
+                    self.channel_user_modes[ch][new_nick] = mode_set
                 self._sorted_users.pop(ch, None)
         if old_nick in self.user_scores:
             self.user_scores[new_nick] = self.user_scores.pop(old_nick)
@@ -5474,10 +5570,15 @@ class TUI:
         _, channel, names_raw = event
         if channel not in self.channel_users:
             self.channel_users[channel] = set()
+            self.channel_user_modes[channel] = {}
+        modes = self.channel_user_modes.setdefault(channel, {})
+        _letter_by_prefix = {"~": "q", "&": "a", "@": "o", "%": "h", "+": "v"}
         for n in names_raw.split():
-            clean = n.lstrip("@+%&~!")
+            mode_char = n[0] if n and n[0] in "~&@%+" else ""
+            clean = n.lstrip("~&@%+")
             if clean:
                 self.channel_users[channel].add(clean)
+                modes[clean] = {_letter_by_prefix[mode_char]} if mode_char else set()
         self._sorted_users.pop(channel, None)
         self._userlist_dirty = True
         self.dirty = True
@@ -5485,6 +5586,8 @@ class TUI:
     async def _ev_clear_users(self, event):
         for users in self.channel_users.values():
             users.clear()
+        for modes in self.channel_user_modes.values():
+            modes.clear()
         self._sorted_users.clear()
         self._userlist_dirty = True
         self.dirty = True
@@ -5504,17 +5607,21 @@ class TUI:
         win = self.ensure_window(channel)
         if nick == self._active_client().nick:
             self.channel_users[channel] = set()
+            self.channel_user_modes[channel] = {}
             self._sorted_users.pop(channel, None)
         else:
             if channel in self.channel_users:
                 self.channel_users[channel].add(nick)
+                self.channel_user_modes.setdefault(channel, {})[nick] = set()
                 self._sorted_users.pop(channel, None)
             win.add_line(f"* {nick} has joined {channel}")
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
+        await self.plugin_manager.dispatch("on_join", nick=nick, channel=channel)
 
     async def _ev_self_join(self, event):
         _, channel = event
+        self.channel_user_modes.setdefault(channel, {})
         win = self.ensure_window(channel)
         win.add_line(f"* You have joined {channel}")
         self.current_channel = channel
@@ -5544,6 +5651,7 @@ class TUI:
         _, nick, channel = event
         if channel in self.channel_users:
             self.channel_users[channel].discard(nick)
+            self.channel_user_modes.get(channel, {}).pop(nick, None)
             self._sorted_users.pop(channel, None)
         self._suspect_nicks.discard(nick)
         ch_win = self.window_by_name.get(self._wk(self._active_server_id, channel))
@@ -5561,6 +5669,7 @@ class TUI:
         for ch, users in self.channel_users.items():
             if nick in users:
                 users.discard(nick)
+                self.channel_user_modes.get(ch, {}).pop(nick, None)
                 self._sorted_users.pop(ch, None)
                 ch_win = self.window_by_name.get(self._wk(self._active_server_id, ch))
                 if ch_win:
@@ -5572,6 +5681,81 @@ class TUI:
         self.user_scores.pop(nick, None)
         self.user_ai_scores.pop(nick, None)
         self._chat_dirty = self._userlist_dirty = True
+        self.dirty = True
+
+    _PREFIX_BY_LETTER = {"q": "~", "a": "&", "o": "@", "h": "%", "v": "+"}
+    _MODE_ARGS_CHARS: set = set("qaohvbeIkl")
+
+    @staticmethod
+    def _highest_prefix(mode_set: set) -> str:
+        for letter in ("q", "a", "o", "h", "v"):
+            if letter in mode_set:
+                return TUI._PREFIX_BY_LETTER[letter]
+        return ""
+
+    async def _ev_mode(self, event):
+        _, nick, params = event
+        if len(params) < 2:
+            return
+        target = params[0]
+        if not target.startswith("#"):
+            return
+        modestr = params[1]
+        mode_args = params[2:]
+        modes = self.channel_user_modes.get(target)
+        if modes is None:
+            return
+        adding = True
+        arg_idx = 0
+        for ch in modestr:
+            if ch == "+":
+                adding = True
+            elif ch == "-":
+                adding = False
+            elif ch in self._PREFIX_BY_LETTER and arg_idx < len(mode_args):
+                user = mode_args[arg_idx]
+                uset = modes.setdefault(user, set())
+                if adding:
+                    uset.add(ch)
+                else:
+                    uset.discard(ch)
+                arg_idx += 1
+            elif ch in self._MODE_ARGS_CHARS:
+                arg_idx += 1
+        self._sorted_users.pop(target, None)
+        self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_kick(self, event):
+        _, nick, channel, kicked, reason = event
+        if channel in self.channel_users:
+            self.channel_users[channel].discard(kicked)
+            self.channel_user_modes.get(channel, {}).pop(kicked, None)
+            self._sorted_users.pop(channel, None)
+        self._suspect_nicks.discard(kicked)
+        ch_win = self.window_by_name.get(self._wk(self._active_server_id, channel))
+        if ch_win:
+            msg = f"* {kicked} was kicked from {channel} by {nick}" + (f" ({reason})" if reason else "")
+            ch_win.add_line(msg)
+            if ch_win is not self.get_current_window():
+                self._unread_windows.add(ch_win.name)
+                self._input_dirty = True
+        self._chat_dirty = self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_list_results(self, event):
+        _, results = event
+        ch_count = len(results)
+        sw = self._status_win()
+        sw.add_line(f"── Channel list ({ch_count} channels) ──")
+        if ch_count <= 200:
+            for ch, users, topic in results:
+                short_topic = topic[:60] + "…" if len(topic) > 60 else topic
+                sw.add_line(f"  {ch:<20} {users:>4}  {short_topic}")
+        else:
+            sw.add_line(f"  ({ch_count} channels — too many to display, try /list <pattern>)")
+        sw.add_line(f"── End of channel list ──")
+        self._chat_dirty = True
         self.dirty = True
 
     async def _ev_status_line(self, event):
@@ -5630,6 +5814,8 @@ class TUI:
         h["model"]      = self._slash_model
         h["api"]        = self._slash_api
         h["autotranslate"] = self._slash_autotranslate
+        h["linkpreview"]  = self._slash_linkpreview
+        h["autojoin"]     = self._slash_autojoin
         h["commands"]   = self._slash_commands
         h["help"]       = self._slash_help
         h["loadplugin"]   = self._slash_loadplugin
@@ -5638,7 +5824,9 @@ class TUI:
         h["plugins"]      = self._slash_plugins
         h["redraw"]       = self._slash_redraw
         h["links"]        = self._slash_links
+        h["list"]         = self._slash_list
         h["userlist"]     = self._slash_userlist
+        h["znc"]          = self._slash_znc
         h["mute"]         = self._slash_mute
         h["replay"]       = self._slash_replay
         h["monitor"]      = self._slash_monitor
@@ -6033,14 +6221,21 @@ class TUI:
     async def _slash_names(self, args, extra, line):
         self._active_client().cmd_names(args or self.current_channel or "")
 
+    def _save_ignored(self) -> None:
+        cfg = load_irc_config()
+        cfg["ignored_nicks"] = sorted(self.ignored_nicks)
+        save_irc_config(cfg)
+
     async def _slash_ignore(self, args, extra, line):
         if args:
             self.ignored_nicks.add(args.lower())
+            self._save_ignored()
             await self.ui_queue.put(("status", f"Now ignoring {args}"))
 
     async def _slash_unignore(self, args, extra, line):
         if args:
             self.ignored_nicks.discard(args.lower())
+            self._save_ignored()
             await self.ui_queue.put(("status", f"No longer ignoring {args}"))
 
     async def _slash_clear(self, args, extra, line):
@@ -6084,8 +6279,9 @@ class TUI:
                 self.dirty = True
 
     async def _slash_quit(self, args, extra, line):
+        msg = (args + " " + extra).strip() if args else ""
         quit_line = (
-            (f"QUIT :{args}" if args else "QUIT :Client exiting")
+            (f"QUIT :{msg}" if msg else "QUIT :Client exiting")
             .encode("utf-8", "replace")[:510] + b"\r\n"
         )
         for ctx in self.servers.values():
@@ -6464,6 +6660,15 @@ class TUI:
         await self.ui_queue.put(("status",
             f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  DEEPSEEK_API_KEY  GITHUB_TOKEN  OLLAMA_URL  LLAMACPP_URL"))
 
+    async def _slash_znc(self, args, extra, line):
+        text = (args + " " + extra).strip()
+        if not text:
+            await self.ui_queue.put(("status", "Usage: /znc <command>  —  sends command to ZNC *status"))
+            return
+        client = self._active_client()
+        client.send_raw(f"PRIVMSG *status :{text}")
+        await self.ui_queue.put(("status", f">>> *status: {text}"))
+
     async def _slash_mute(self, args, extra, line):
         self.mention_beep_muted = not self.mention_beep_muted
         state = "muted" if self.mention_beep_muted else "unmuted"
@@ -6473,6 +6678,44 @@ class TUI:
         self.auto_translate = not self.auto_translate
         state = "ON" if self.auto_translate else "OFF"
         await self.ui_queue.put(("status", f"Auto-translate CJK → English: {state}"))
+
+    async def _slash_linkpreview(self, args, extra, line):
+        self.link_preview_enabled = not self.link_preview_enabled
+        state = "ON" if self.link_preview_enabled else "OFF"
+        await self.ui_queue.put(("status", f"Link preview {state}"))
+
+    async def _slash_autojoin(self, args, extra, line):
+        global _AUTOJOIN_CHANNELS
+        p = args.strip().split(None, 1)
+        if not p or p[0] not in ("+", "-", "list", "clear"):
+            await self.ui_queue.put(("status", "Usage: /autojoin +<#chan> | -<#chan> | list | clear"))
+            return
+        sub = p[0]
+        if sub == "list":
+            if _AUTOJOIN_CHANNELS:
+                await self.ui_queue.put(("status", f"Auto-join channels: {' '.join(sorted(_AUTOJOIN_CHANNELS))}"))
+            else:
+                await self.ui_queue.put(("status", "No auto-join channels configured"))
+            return
+        if sub == "clear":
+            _AUTOJOIN_CHANNELS.clear()
+            _save_autojoin_config()
+            await self.ui_queue.put(("status", "Auto-join channel list cleared"))
+            return
+        chan = (p[1] if len(p) > 1 else "").strip()
+        if not chan:
+            await self.ui_queue.put(("status", f"Usage: /autojoin {sub} <#channel>"))
+            return
+        if not chan.startswith("#"):
+            chan = "#" + chan
+        if sub == "+":
+            _AUTOJOIN_CHANNELS.add(chan)
+            _save_autojoin_config()
+            await self.ui_queue.put(("status", f"Auto-join: added {chan}"))
+        elif sub == "-":
+            _AUTOJOIN_CHANNELS.discard(chan)
+            _save_autojoin_config()
+            await self.ui_queue.put(("status", f"Auto-join: removed {chan}"))
 
     async def _slash_commands(self, args, extra, line):
         sw = self.window_by_name["*status*"]
@@ -6558,9 +6801,11 @@ class TUI:
         _E("/close  (or /wc)", "Close current window; focus moves to previous")
         _E("/clear",     "Clear messages in the current window")
         _E("/links [n]", "Show last n links shared in this channel (default 20)")
+        _E("/list [pattern]","Fetch and display the server's channel list")
         _E("/theme <1-5>","Switch colour theme: Classic Hacker Ocean Sunset Neon")
         _E("/userlist",   "Toggle the user list panel on/off")
-        _C("  Ctrl+N  next window    Tab  nick completion    PgUp/PgDn  scroll")
+        _E("/znc <cmd>",  "Send a command to ZNC's *status (e.g. /znc play *chan 60)")
+        _C("  Ctrl+N  next window    Tab/Shift+Tab  nick completion    PgUp/PgDn  scroll")
         _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
         _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
         _C("")
@@ -6609,8 +6854,9 @@ class TUI:
             "── Connection ─────────────────────────────────────────────",
             "  /server [-ssl] <host> [port]  (parallel; -ssl for TLS)  /reconnect",
             "── Interface ──────────────────────────────────────────────",
-            "  /win <n>  /close (/wc)  /clear  /links  /theme <1-5>  /userlist",
-            "  Ctrl+N next window  Tab nick-complete  PgUp/Dn scroll",
+            "  /win <n>  /close (/wc)  /clear  /links  /list [pat]  /znc <cmd>",
+            "  /theme <1-5>  /userlist  Ctrl+N next window",
+            "  Tab/Shift+Tab nick-complete  PgUp/Dn scroll",
             "  Left-click a highlighted URL line to open it in the browser",
             "  Tab bar: [1:status] [2:dash] [*3:##chat]  * = unread",
             "  /quit [msg]  /commands  (full list)  /help  (this)",
@@ -6629,6 +6875,18 @@ class TUI:
         self._resize_windows()
         state = "shown" if self._show_userlist else "hidden"
         await self.ui_queue.put(("status", f"Userlist {state}"))
+
+    async def _slash_list(self, args, extra, line):
+        """Fetch and display the server's channel list (RPL_LIST 322/323)."""
+        pattern = (args + " " + extra).strip()
+        client = self._active_client()
+        client._list_results = []
+        if pattern:
+            client.send_raw(f"LIST {pattern}")
+            await self.ui_queue.put(("status", f"Fetching channel list matching '{pattern}'…"))
+        else:
+            client.send_raw("LIST")
+            await self.ui_queue.put(("status", "Fetching channel list…"))
 
     async def _slash_links(self, args, extra, line):
         """Show recent links for the current channel window."""
@@ -7173,6 +7431,11 @@ class TUI:
             self.do_nick_complete()
             self.input_cursor += len(self.input_buffer) - prev_len
 
+        elif ch == curses.KEY_BTAB:  # Shift+Tab — reverse nick completion
+            prev_len = len(self.input_buffer)
+            self.do_nick_complete(reverse=True)
+            self.input_cursor += len(self.input_buffer) - prev_len
+
         elif ch == 3:    # Ctrl+C
             raise SystemExit
 
@@ -7556,6 +7819,8 @@ def main():
     if _saved.get("github_token"):      GITHUB_TOKEN      = _saved["github_token"]
     if _saved.get("ollama_url"):        OLLAMA_URL        = _saved["ollama_url"]
     if _saved.get("llamacpp_url"):      LLAMACPP_URL      = _saved["llamacpp_url"]
+    if _saved.get("autojoin"):
+        _AUTOJOIN_CHANNELS.update(_saved["autojoin"])
 
     # ── IRC connection ───────────────────────────────────────────────────────────
 
