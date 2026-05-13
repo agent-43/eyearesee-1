@@ -23,7 +23,7 @@ import time
 import os
 import uuid
 import warnings
-from collections import deque, OrderedDict
+from collections import Counter, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 from math import log2
 from typing import Optional, Dict, List, Tuple, Callable
@@ -8377,10 +8377,17 @@ def main():
     if _saved.get("autojoin"):
         _AUTOJOIN_CHANNELS.update(_saved["autojoin"])
 
+    # ── Safe input helper (returns "" on EOF so defaults are used) ─────────────
+    def _input(prompt: str) -> str:
+        try:
+            return input(prompt)
+        except EOFError:
+            return ""
+
     # ── IRC connection ───────────────────────────────────────────────────────────
 
     # Server — accepts host  or  host:port
-    raw = input(f"  Server   [{DEFAULT_SERVER}] : ").strip()
+    raw = _input(f"  Server   [{DEFAULT_SERVER}] : ").strip()
     if raw:
         if ":" in raw:
             host, _, port_str = raw.rpartition(":")
@@ -8392,7 +8399,7 @@ def main():
             DEFAULT_SERVER = raw
 
     # Nick
-    raw = input(f"  Nick     [{DEFAULT_NICK}] : ").strip()
+    raw = _input(f"  Nick     [{DEFAULT_NICK}] : ").strip()
     if raw:
         # IRC nicks: letters/digits/[-\[\]\\`_^{|}], max 30 chars (RFC 1459 §2.3.1)
         raw = re.sub(r'[^a-zA-Z0-9\[\]\\`_\-^{|}]', '', raw)[:30]
@@ -8400,7 +8407,7 @@ def main():
             DEFAULT_NICK = raw
 
     # Channel — prepend # if omitted
-    raw = input(f"  Channel  [{DEFAULT_CHANNEL}] : ").strip()
+    raw = _input(f"  Channel  [{DEFAULT_CHANNEL}] : ").strip()
     if raw:
         DEFAULT_CHANNEL = raw if raw.startswith("#") else "#" + raw
         # Strip characters illegal in channel names: NUL, BEL, space, comma, CR/LF
@@ -8410,7 +8417,7 @@ def main():
     # ── SASL ────────────────────────────────────────────────────────────────────
 
     _mech_hint = f"PLAIN/SCRAM-SHA-256/EXTERNAL/ECDSA-NIST256P-CHALLENGE"
-    raw = input(f"  SASL     [{SASL_MECHANISM}] ({_mech_hint}) : ").strip().upper()
+    raw = _input(f"  SASL     [{SASL_MECHANISM}] ({_mech_hint}) : ").strip().upper()
     if raw:
         SASL_MECHANISM = raw
 
@@ -8424,11 +8431,11 @@ def main():
     if SASL_MECHANISM in ("EXTERNAL", "ECDSA-NIST256P-CHALLENGE"):
         if SASL_MECHANISM == "EXTERNAL":
             _cert_hint = SASL_CERT or "path to PEM cert"
-            raw = input(f"  SASL cert [{_cert_hint}] : ").strip()
+            raw = _input(f"  SASL cert [{_cert_hint}] : ").strip()
             if raw:
                 SASL_CERT = raw
         _key_hint = SASL_KEY or "path to PEM key"
-        raw = input(f"  SASL key  [{_key_hint}] : ").strip()
+        raw = _input(f"  SASL key  [{_key_hint}] : ").strip()
         if raw:
             SASL_KEY = raw
 
@@ -8439,7 +8446,7 @@ def main():
 
     def _prompt_key(label: str, current: str) -> str:
         hint = "[configured]" if current else "blank to skip"
-        val = input(f"  {label:<22} ({hint}) : ").strip()
+        val = _input(f"  {label:<22} ({hint}) : ").strip()
         if val == "-":
             return ""
         return val if val else current
@@ -8451,10 +8458,10 @@ def main():
 
     print()
     print("  Local inference servers (press Enter to keep).")
-    raw = input(f"  Ollama URL    [{OLLAMA_URL}] : ").strip()
+    raw = _input(f"  Ollama URL    [{OLLAMA_URL}] : ").strip()
     if raw:
         OLLAMA_URL = raw
-    raw = input(f"  llama.cpp URL [{LLAMACPP_URL}] : ").strip()
+    raw = _input(f"  llama.cpp URL [{LLAMACPP_URL}] : ").strip()
     if raw:
         LLAMACPP_URL = raw
 
