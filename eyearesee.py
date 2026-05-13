@@ -31,8 +31,9 @@ from typing import Optional, Dict, List, Tuple, Callable
 # =========================
 # CLI flags — parsed before any optional imports or install code runs
 # =========================
-_NO_AI:      bool = "--no-ai"      in sys.argv
-_NO_INSTALL: bool = "--no-install" in sys.argv
+_NO_AI:         bool = "--no-ai"              in sys.argv
+_NO_INSTALL:    bool = "--no-install"         in sys.argv
+_REQUIRE_VENV:  bool = "--require-virtualenv" in sys.argv
 
 # =========================
 # Anthropic (optional)
@@ -5299,7 +5300,7 @@ class TUI:
         if not users:
             return
         buf    = self.input_buffer
-        cursor = self.input_cursor
+        cursor = min(self.input_cursor, len(buf))
         word_start = cursor
         while word_start > 0 and buf[word_start - 1] not in (" ", "\t"):
             word_start -= 1
@@ -5886,6 +5887,8 @@ class TUI:
         h["pem"]          = self._slash_pem
         h["vibe"]         = self._slash_vibe
         h["explain"]      = self._slash_explain
+        h["fingerprint"]  = self._slash_fingerprint
+        h["cluster"]      = self._slash_cluster
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -7177,6 +7180,177 @@ class TUI:
         self._chat_dirty = True
         self.dirty = True
 
+    async def _slash_fingerprint(self, args, extra, line) -> None:
+        """Cross-nick linguistic similarity check.
+
+        Builds a BotFingerprint for <nick> from their message history and
+        compares it against fingerprints built for every other user, ranking
+        them by Jaccard vocabulary + n-gram overlap.
+
+        Usage: /fingerprint <nick> [min_similarity]
+          min_similarity  – 0.0–1.0 threshold to show (default 0.0)
+        """
+        tokens = (args + " " + extra).strip().split()
+        if not tokens:
+            await self.ui_queue.put(("status",
+                "Usage: /fingerprint <nick> [min_similarity]"))
+            return
+
+        target    = tokens[0]
+        min_sim   = 0.0
+        if len(tokens) > 1:
+            try:
+                min_sim = max(0.0, min(1.0, float(tokens[1])))
+            except ValueError:
+                pass
+
+        _MSG_RE = re.compile(r'^\[\d{2}:\d{2}\] <(\S+?)> (.+)$')
+        _ACT_RE = re.compile(r'^\[\d{2}:\d{2}\] \* (\S+) (.+)$')
+
+        # One pass through all windows — collect message texts per nick
+        nicks_msgs: Dict[str, List[str]] = {}
+        for win in self.window_by_name.values():
+            if win.name in ("*status*", "*dashboard*"):
+                continue
+            for ln in win.lines:
+                m = _MSG_RE.match(ln)
+                if m:
+                    nicks_msgs.setdefault(m.group(1).lower(), []).append(m.group(2))
+                    continue
+                a = _ACT_RE.match(ln)
+                if a:
+                    nicks_msgs.setdefault(a.group(1).lower(), []).append(a.group(2))
+
+        target_l = target.lower()
+        if target_l not in nicks_msgs:
+            await self.ui_queue.put(("status",
+                f"/fingerprint: no messages found for '{target}'"))
+            return
+
+        target_msgs = nicks_msgs.pop(target_l)
+
+        # Build target fingerprint
+        target_fp = BotFingerprint(target)
+        for msg in target_msgs:
+            target_fp.ingest(msg)
+
+        if target_fp.msg_count < 3:
+            await self.ui_queue.put(("status",
+                f"/fingerprint: too few msgs ({target_fp.msg_count}) for '{target}' — need ≥3"))
+            return
+
+        def _fp_similarity(a: BotFingerprint, b: BotFingerprint) -> float:
+            if not a.word_vocab or not b.word_vocab:
+                return 0.0
+            vocab_j  = len(a.word_vocab & b.word_vocab) / len(a.word_vocab | b.word_vocab)
+            bi_score = 0.0
+            if a.bigrams and b.bigrams:
+                bi_score = len(a.bigrams & b.bigrams) / len(a.bigrams | b.bigrams)
+            tri_score = 0.0
+            if a.trigrams and b.trigrams:
+                tri_score = len(a.trigrams & b.trigrams) / len(a.trigrams | b.trigrams)
+            return min(1.0, 0.25 * vocab_j + 0.35 * bi_score + 0.40 * tri_score)
+
+        results = []
+        for nick_l, msgs in nicks_msgs.items():
+            if len(msgs) < 3:
+                continue
+            fp = BotFingerprint(nick_l)
+            for msg in msgs:
+                fp.ingest(msg)
+            sim = _fp_similarity(target_fp, fp)
+            if sim >= min_sim:
+                results.append((sim, nick_l, fp.msg_count))
+
+        results.sort(key=lambda x: -x[0])
+
+        sw = self._status_win()
+        sw.add_line(
+            f"\u2500\u2500 Linguistic fingerprint: {target} "
+            f"({target_fp.msg_count} msgs, {len(target_fp.word_vocab)} words, "
+            f"{len(target_fp.bigrams)} bigrams, {len(target_fp.trigrams)} trigrams) "
+            f"\u2500\u2500")
+        if not results:
+            sw.add_line("  No similar users found" +
+                        (f"  (min similarity: {min_sim:.2f})" if min_sim > 0 else ""))
+        else:
+            sw.add_line(f"  {'Nick':<20} {'Sim':>6}  {'Msgs':>5}")
+            sw.add_line(f"  {'\u2500'*20} {'\u2500'*6}  {'\u2500'*5}")
+            for sim, nick_l, msg_count in results[:20]:
+                sw.add_line(f"  {nick_l:<20} {sim*100:5.1f}%  {msg_count:>5}")
+        sw.add_line(f"\u2500\u2500 {len(results)} matches, showing top 20 \u2500\u2500")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_cluster(self, args, extra, line) -> None:
+        """Show a nick's social circle — who they talk to, who addresses them,
+        and what channels they share.
+
+        Combines adjacency, targeting, inverse-targeting, and channel activity
+        into a ranked list of connections.
+
+        Usage: /cluster <nick>
+        """
+        nick = (args + " " + extra).strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /cluster <nick>"))
+            return
+
+        nl = nick.lower()
+
+        adj = self._adjacency.get(nl, {})
+        adj_total = sum(adj.values()) if adj else 0
+
+        tgt = self._targets.get(nl, {})
+        tgt_total = sum(tgt.values()) if tgt else 0
+
+        ch_act = self._ch_activity.get(nl, {})
+
+        # Inverse targets — who addresses this nick
+        inverse_tgt: Counter = Counter()
+        for other_nick, targets in self._targets.items():
+            if other_nick == nl:
+                continue
+            if nl in targets:
+                inverse_tgt[other_nick] = targets[nl]
+        inv_total = sum(inverse_tgt.values()) if inverse_tgt else 0
+
+        all_connections = set(adj) | set(tgt) | set(inverse_tgt)
+        connections = []
+        for other in all_connections:
+            adj_score = adj.get(other, 0)
+            tgt_score = tgt.get(other, 0)
+            inv_score = inverse_tgt.get(other, 0)
+
+            adj_pct = (adj_score / adj_total * 100) if adj_total > 0 else 0
+            tgt_pct = (tgt_score / tgt_total * 100) if tgt_total > 0 else 0
+            inv_pct = (inv_score / inv_total * 100) if inv_total > 0 else 0
+
+            # Weighted strength: adjacency (40%), targeting (35%), being targeted (25%)
+            combined = adj_pct * 0.40 + tgt_pct * 0.35 + inv_pct * 0.25
+            connections.append((combined, other, adj_score, tgt_score, inv_score))
+
+        connections.sort(key=lambda x: -x[0])
+
+        sw = self._status_win()
+        ch_list = ", ".join(
+            sorted(ch_act, key=lambda c: -ch_act[c])[:8]) if ch_act else ""
+        sw.add_line(f"\u2500\u2500 Social cluster: {nick} \u2500\u2500")
+        if ch_list:
+            sw.add_line(f"  Channels: {ch_list}")
+        if not connections:
+            sw.add_line("  No social connections found.")
+        else:
+            sw.add_line(f"  {'Nick':<20} {'Str':>5}  {'Adj':>4} {'Tgt':>4} {'Inv':>4}")
+            sw.add_line(f"  {'\u2500'*20} {'\u2500'*5}  {'\u2500'*4} {'\u2500'*4} {'\u2500'*4}")
+            for combined, other, adj_score, tgt_score, inv_score in connections[:20]:
+                sw.add_line(
+                    f"  {other:<20} {combined:4.0f}%  "
+                    f"{adj_score:>4} {tgt_score:>4} {inv_score:>4}")
+        sw.add_line(f"\u2500\u2500 {len(connections)} connections, showing top 20 \u2500\u2500")
+        self._chat_dirty = True
+        self.dirty = True
+
     async def _slash_alias(self, args, extra, line):
         parts = (args + " " + extra).strip().split(maxsplit=1)
         if not parts or not parts[0]:
@@ -7982,14 +8156,10 @@ class TUI:
                 self.dirty = True
 
         elif ch == 9:    # Tab — nick completion
-            prev_len = len(self.input_buffer)
             self.do_nick_complete()
-            self.input_cursor += len(self.input_buffer) - prev_len
 
         elif ch == curses.KEY_BTAB:  # Shift+Tab — reverse nick completion
-            prev_len = len(self.input_buffer)
             self.do_nick_complete(reverse=True)
-            self.input_cursor += len(self.input_buffer) - prev_len
 
         elif ch == 3:    # Ctrl+C
             raise SystemExit
@@ -8113,7 +8283,10 @@ class TUI:
                 if ch == -1:
                     break
                 had_key = True
-                is_enter = self._handle_key(ch)
+                try:
+                    is_enter = self._handle_key(ch)
+                except Exception:
+                    is_enter = False
                 if is_enter:
                     # Send +typing=done *before* clearing the buffer.
                     if self._typing_out_state in ("active", "paused"):
@@ -8280,6 +8453,13 @@ async def main_curses(stdscr, ai_detector: EnsembleAIDetector):
                 except Exception:
                     pass
 
+def _in_virtualenv() -> bool:
+    """Return True if the interpreter is running inside a virtual environment."""
+    return hasattr(sys, "real_prefix") or (
+        hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix
+    )
+
+
 def _ensure_deps() -> bool:
     """Check for every required and optional package.
     Any that are absent are installed via pip automatically.
@@ -8329,6 +8509,15 @@ def _ensure_deps() -> bool:
 
 
 def main():
+    if _REQUIRE_VENV and not _in_virtualenv():
+        sys.exit(
+            "error: --require-virtualenv is set but no virtual environment is active.\n"
+            "  Create and activate one:\n"
+            "    python -m venv venv\n"
+            "    .\\venv\\Scripts\\activate   (Windows)\n"
+            "    source venv/bin/activate    (Linux/macOS)"
+        )
+
     global DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, DEFAULT_CHANNEL
     global NICKSERV_PASSWORD, SASL_MECHANISM, SASL_CERT, SASL_KEY
     global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GITHUB_TOKEN
