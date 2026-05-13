@@ -4109,6 +4109,11 @@ class TUI:
         self.ignored_nicks: set = set(load_irc_config().get("ignored_nicks", []))
         self._aliases: Dict[str, str] = dict(load_irc_config().get("aliases", {}))
         self.mention_beep_muted: bool = False
+        self._msg_hours: Dict[str, List[int]] = {}
+        self._last_speaker: Dict[str, str] = {}
+        self._adjacency: Dict[str, Counter] = {}
+        self._targets: Dict[str, Counter] = {}
+        self._ch_activity: Dict[str, Counter] = {}
 
         # Performance caches — maintained incrementally to avoid per-frame rebuilds
         # NOTE: _suspect_nicks and _sorted_users are now aliased from the active
@@ -5423,6 +5428,26 @@ class TUI:
             asyncio.create_task(self._post_translation(win, msg))
         if self.link_preview_enabled and _URL_RE.search(irc_strip_formatting(msg)):
             asyncio.create_task(self._post_link_info(win, nick, msg, win_name))
+        # Investigative tracking
+        hour = time.localtime().tm_hour
+        self._msg_hours.setdefault(nick, []).append(hour)
+        if target.startswith("#"):
+            prev = self._last_speaker.get(target)
+            if prev and prev != nick:
+                self._adjacency.setdefault(nick, Counter())[prev] += 1
+                self._adjacency.setdefault(prev, Counter())[nick] += 1
+            self._last_speaker[target] = nick
+            self._ch_activity.setdefault(nick, Counter())[target] += 1
+        # Targeting: detect "nick:" or "nick," at message start
+        clean = msg.lstrip()
+        if clean:
+            comma = clean.find(",")
+            colon = clean.find(":")
+            end = min(comma, colon) if comma >= 0 and colon >= 0 else max(comma, colon)
+            if end > 0:
+                maybe = clean[:end].lower()
+                if maybe and maybe != nick.lower():
+                    self._targets.setdefault(nick, Counter())[maybe] += 1
         self.user_scores[nick] = u_score
         self.user_ai_scores[nick] = rolling_ai
         if win is not self.get_current_window():
@@ -5563,6 +5588,10 @@ class TUI:
                 mode_set = self.channel_user_modes.get(ch, {}).pop(old_nick, None)
                 if mode_set is not None:
                     self.channel_user_modes[ch][new_nick] = mode_set
+        # Migrate investigative data
+        for d in (self._msg_hours, self._adjacency, self._targets, self._ch_activity):
+            if old_nick in d:
+                d[new_nick] = d.pop(old_nick)
                 self._sorted_users.pop(ch, None)
         if old_nick in self.user_scores:
             self.user_scores[new_nick] = self.user_scores.pop(old_nick)
@@ -5838,6 +5867,11 @@ class TUI:
         h["userlist"]     = self._slash_userlist
         h["znc"]          = self._slash_znc
         h["jitsi"]        = self._slash_jitsi
+        h["chain"]        = self._slash_chain
+        h["idle"]         = self._slash_idle
+        h["together"]     = self._slash_together
+        h["adjacent"]     = self._slash_adjacent
+        h["targets"]      = self._slash_targets
         h["alias"]        = self._slash_alias
         h["mute"]         = self._slash_mute
         h["replay"]       = self._slash_replay
@@ -5850,6 +5884,8 @@ class TUI:
         h["redact"]       = self._slash_redact
         h["register"]     = self._slash_register
         h["pem"]          = self._slash_pem
+        h["vibe"]         = self._slash_vibe
+        h["explain"]      = self._slash_explain
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -6620,6 +6656,240 @@ class TUI:
         self._dashboard_profile_locked = True
         self.dirty                     = True
 
+    async def _slash_vibe(self, args, extra, line) -> None:
+        """Analyze channel culture using AI.
+
+        Usage: /vibe <channel> [n] [model]
+          n      – number of most-recent messages to include (default 100, max 500)
+          model  – any key from /model  (e.g. sonnet, gpt4o)
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[vibe] disabled by --no-ai")); return
+        if self._askai_pending:
+            await self.ui_queue.put(("status", "/vibe already in progress, please wait\u2026"))
+            return
+
+        tokens = args.split()
+        if not tokens:
+            await self.ui_queue.put(("status", "Usage: /vibe <channel> [n] [model]"))
+            return
+
+        chan_name = tokens[0]
+        n_msgs    = 100
+        model_key = self.ai_chat_model
+        for token in tokens[1:]:
+            if token.isdigit():
+                n_msgs = max(10, min(500, int(token)))
+            elif token.lower() in AI_MODELS or token.lower().startswith("ollama:"):
+                model_key = token.lower()
+
+        # Find window by name (case-insensitive)
+        win = None
+        for w in self.window_by_name.values():
+            if w.name.lower() == chan_name.lower():
+                win = w
+                break
+        if not win or win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", f"/vibe: channel '{chan_name}' not found"))
+            return
+
+        raw_lines = list(win.lines)[-n_msgs:]
+        if not raw_lines:
+            await self.ui_queue.put(("status", f"/vibe: no messages in {chan_name}"))
+            return
+
+        _TS_RE      = re.compile(r'^\[\d{2}:\d{2}\]\s*')
+        _SPEAKER_RE = re.compile(r'^<(\S+?)>')
+        cleaned     = [irc_strip_formatting(_TS_RE.sub("", ln)) for ln in raw_lines]
+        transcript  = "\n".join(cleaned)
+
+        speakers = sorted({m.group(1) for ln in cleaned for m in [_SPEAKER_RE.match(ln)] if m})
+        speaker_hint = (f"Active speakers: {', '.join(speakers)}\n\n" if speakers else "")
+
+        if model_key.startswith("ollama:"):
+            model_id = model_key[len("ollama:"):]
+            label    = f"Ollama/{model_id}"
+        elif model_key.startswith("llamacpp:"):
+            model_id = model_key[len("llamacpp:"):]
+            label    = f"llama.cpp/{model_id}"
+        else:
+            spec     = AI_MODELS.get(model_key) or AI_MODELS[CLAUDE_DEFAULT_MODEL]
+            model_id = spec["id"]
+            label    = spec["label"]
+
+        prompt = (
+            f"The following is a transcript of an IRC channel \"{win.name}\" "
+            f"({len(raw_lines)} messages).\n"
+            f"{speaker_hint}"
+            f"Analyze the channel's culture and vibe based on this transcript. Cover:\n"
+            f"1. Overall atmosphere \u2014 is it friendly, technical, chaotic, quiet, etc.\n"
+            f"2. Recurring topics and interests of the community.\n"
+            f"3. Social dynamics \u2014 inside jokes, recurring bits, how people interact.\n"
+            f"4. Individual personalities \u2014 for active speakers, describe their role/style.\n"
+            f"5. Any notable norms, rituals, or unwritten rules.\n\n"
+            f"Be specific, name users, and keep the total under 400 words.\n\n"
+            f"Transcript:\n{transcript}"
+        )
+
+        self._askai_pending = True
+        await self.ui_queue.put(("status",
+            f"[vibe] {len(raw_lines)} msgs from {win.name} via "
+            f"{model_key} ({label})\u2026"))
+        task = asyncio.create_task(
+            self._do_vibe(prompt, model_key, model_id, label,
+                          win.name, len(raw_lines), speakers))
+        task.add_done_callback(self._ai_task_done)
+
+    async def _do_vibe(self, prompt: str, model_key: str, model_id: str,
+                        label: str, win_name: str, n_msgs: int,
+                        speakers: list) -> None:
+        answer, tokens = "", "?"
+        try:
+            answer, tokens = await asyncio.wait_for(
+                self._call_ai(prompt, model_key, max_tokens=2000), timeout=180.0)
+        except asyncio.TimeoutError:
+            answer, tokens = "[error] AI request timed out after 180 s", "?"
+        except Exception as exc:
+            answer, tokens = f"[error] {exc}", "?"
+        finally:
+            self._askai_pending = False
+
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+        L(f"=== /vibe  [{win_name}]  last {n_msgs} msgs  [{model_key}  {label}] ===")
+        if speakers:
+            L(f"  Speakers: {', '.join(speakers)}")
+        L("")
+        for raw_line in answer.splitlines():
+            L(f"  {raw_line}" if raw_line.strip() else "")
+        L("")
+        L(f"  model: {model_id}  tokens used: {tokens}")
+        self.current_window_index      = 1
+        self._chat_dirty               = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self.dirty                     = True
+
+    async def _slash_explain(self, args, extra, line) -> None:
+        """Analyze a user's behavior using AI.
+
+        Usage: /explain <nick> [model]
+          model  – any key from /model  (e.g. sonnet, gpt4o)
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[explain] disabled by --no-ai")); return
+        if self._askai_pending:
+            await self.ui_queue.put(("status", "/explain already in progress, please wait\u2026"))
+            return
+
+        tokens = (args + " " + extra).strip().split()
+        if not tokens:
+            await self.ui_queue.put(("status", "Usage: /explain <nick> [model]"))
+            return
+
+        target    = tokens[0].lower()
+        model_key = self.ai_chat_model
+        for token in tokens[1:]:
+            if token.lower() in AI_MODELS or token.lower().startswith("ollama:"):
+                model_key = token.lower()
+
+        # Collect all messages from this nick across all windows
+        _TS_RE      = re.compile(r'^\[\d{2}:\d{2}\]\s*')
+        _SPEAKER_RE = re.compile(r'^<(\S+?)>')
+        found       = []  # (window_name, cleaned_line)
+        for win in self.window_by_name.values():
+            if win.name in ("*status*", "*dashboard*"):
+                continue
+            for ln in win.lines:
+                stripped = _TS_RE.sub("", ln)
+                m = _SPEAKER_RE.match(stripped)
+                if m and m.group(1).lower() == target:
+                    found.append((win.name, irc_strip_formatting(stripped)))
+
+        if not found:
+            await self.ui_queue.put(("status", f"/explain: no messages found for '{target}'"))
+            return
+
+        # Group by window, limit per-window to 100
+        by_win = {}
+        for wname, line_text in found:
+            by_win.setdefault(wname, []).append(line_text)
+        parts = []
+        for wname, lines in by_win.items():
+            if len(lines) > 100:
+                lines = lines[-100:]
+            parts.append(f"--- {wname} ({len(lines)} messages) ---")
+            parts.extend(lines)
+        transcript = "\n".join(parts)
+
+        if model_key.startswith("ollama:"):
+            model_id = model_key[len("ollama:"):]
+            label    = f"Ollama/{model_id}"
+        elif model_key.startswith("llamacpp:"):
+            model_id = model_key[len("llamacpp:"):]
+            label    = f"llama.cpp/{model_id}"
+        else:
+            spec     = AI_MODELS.get(model_key) or AI_MODELS[CLAUDE_DEFAULT_MODEL]
+            model_id = spec["id"]
+            label    = spec["label"]
+
+        prompt = (
+            f"The following are messages from a user '{target}' across IRC channels "
+            f"({len(found)} total messages).\n\n"
+            f"Analyze this user's behavior and personality based on their messages. Cover:\n"
+            f"1. Communication style \u2014 tone, formality, verbosity.\n"
+            f"2. Expertise and interests \u2014 what topics they engage with.\n"
+            f"3. Social role \u2014 helpful, argumentative, humorous, lurker, etc.\n"
+            f"4. Interaction patterns \u2014 who they talk to, how they respond.\n"
+            f"5. Overall impression \u2014 what kind of community member they are.\n\n"
+            f"Be specific, cite examples, and keep the total under 400 words.\n\n"
+            f"Messages:\n{transcript}"
+        )
+
+        self._askai_pending = True
+        await self.ui_queue.put(("status",
+            f"[explain] {len(found)} msgs from {target} via "
+            f"{model_key} ({label})\u2026"))
+        task = asyncio.create_task(
+            self._do_explain(prompt, model_key, model_id, label,
+                            target, len(found)))
+        task.add_done_callback(self._ai_task_done)
+
+    async def _do_explain(self, prompt: str, model_key: str, model_id: str,
+                           label: str, target: str, n_msgs: int) -> None:
+        answer, tokens = "", "?"
+        try:
+            answer, tokens = await asyncio.wait_for(
+                self._call_ai(prompt, model_key, max_tokens=2000), timeout=180.0)
+        except asyncio.TimeoutError:
+            answer, tokens = "[error] AI request timed out after 180 s", "?"
+        except Exception as exc:
+            answer, tokens = f"[error] {exc}", "?"
+        finally:
+            self._askai_pending = False
+
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+        L(f"=== /explain  [{target}]  {n_msgs} msgs  [{model_key}  {label}] ===")
+        L("")
+        for raw_line in answer.splitlines():
+            L(f"  {raw_line}" if raw_line.strip() else "")
+        L("")
+        L(f"  model: {model_id}  tokens used: {tokens}")
+        self.current_window_index      = 1
+        self._chat_dirty               = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self.dirty                     = True
+
     async def _slash_model(self, args, extra, line):
         key = args.strip().lower()
         detector = self._active_client().scoring.ai_detector
@@ -6751,6 +7021,162 @@ class TUI:
         self._chat_dirty = True
         self.dirty = True
 
+    async def _slash_chain(self, args, extra, line):
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/chain: switch to a channel or PM window"))
+            return
+        nick_filter = (args + " " + extra).strip().lower() or None
+        msgs = []
+        for line_text in win.lines:
+            parts = line_text.split(None, 2)
+            if len(parts) >= 2:
+                ts = parts[0]
+                rest = parts[1] if len(parts) > 1 else ""
+                sender = ""
+                text = ""
+                if rest.startswith("<") and ">" in rest:
+                    sender = rest[1:].split(">", 1)[0].lower()
+                    text = rest.split(">", 1)[1] if ">" in rest else ""
+                elif rest.startswith("*"):
+                    sender = rest[2:].split()[0].lower() if len(rest) > 2 else ""
+                    text = rest
+                if sender and (not nick_filter or sender == nick_filter):
+                    msgs.append((ts, sender, text.strip()))
+        if not msgs:
+            await self.ui_queue.put(("status", "/chain: no messages found" + (f" from {nick_filter}" if nick_filter else "")))
+            return
+        sw = self._status_win()
+        sw.add_line(f"── Message chain ({win.name})" + (f" — {nick_filter}" if nick_filter else "") + " ──")
+        for ts, sender, text in msgs[-30:]:
+            preview = text[:60] + "…" if len(text) > 60 else text
+            sw.add_line(f"  {ts} <{sender}> {preview}")
+        sw.add_line(f"── {len(msgs)} messages, showing last 30 ──")
+        self._chat_dirty = True
+        self.dirty = True
+
+    def _make_sparkline(self, hours: List[int]) -> str:
+        if not hours:
+            return ""
+        buckets = [0] * 24
+        for h in hours:
+            if 0 <= h <= 23:
+                buckets[h] += 1
+        mx = max(buckets)
+        if mx == 0:
+            return "·" * 24
+        bars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+        return "".join(bars[min(7, int(b / mx * 7))] for b in buckets)
+
+    async def _slash_idle(self, args, extra, line):
+        nick = (args + " " + extra).strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /idle <nick>"))
+            return
+        nl = nick.lower()
+        hours = self._msg_hours.get(nl)
+        if not hours:
+            await self.ui_queue.put(("status", f"No message data for {nick}"))
+            return
+        total = len(hours)
+        spark = self._make_sparkline(hours)
+        sw = self._status_win()
+        sw.add_line(f"── Activity pattern: {nick} ({total} messages) ──")
+        sw.add_line(f"   0         6        12        18       24")
+        sw.add_line(f"   {spark}")
+        sw.add_line(f"   └{'─'*23}┘ hour (UTC)")
+        chs = self._ch_activity.get(nl, {})
+        if chs:
+            top = sorted(chs.items(), key=lambda x: -x[1])[:5]
+            sw.add_line(f"  Top channels: " + ", ".join(f"{ch}({n})" for ch, n in top))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_together(self, args, extra, line):
+        parts = (args + " " + extra).strip().split()
+        if len(parts) < 2:
+            await self.ui_queue.put(("status", "Usage: /together <nick1> <nick2>"))
+            return
+        n1, n2 = parts[0].lower(), parts[1].lower()
+        ac1 = self._ch_activity.get(n1, {})
+        ac2 = self._ch_activity.get(n2, {})
+        common = {}
+        for ch, c1 in ac1.items():
+            c2 = ac2.get(ch)
+            if c2:
+                common[ch] = (c1, c2)
+        sw = self._status_win()
+        sw.add_line(f"── Together: {parts[0]} & {parts[1]} ──")
+        if not common:
+            # Fall back to checking current channel membership overlap
+            cur = [ch for ch, us in self.channel_users.items()
+                   if parts[0].lower() in {u.lower() for u in us}
+                   and parts[1].lower() in {u.lower() for u in us}]
+            if cur:
+                sw.add_line(f"  Currently together in: {', '.join(cur)}")
+            else:
+                sw.add_line(f"  No common channels detected")
+        else:
+            sw.add_line(f"  {'Channel':<20} {parts[0]:<8} {parts[1]:<8}")
+            total1 = total2 = 0
+            for ch in sorted(common, key=lambda c: -common[c][0] - common[c][1]):
+                c1, c2 = common[ch]
+                sw.add_line(f"  {ch:<20} {c1:<8} {c2:<8}")
+                total1 += c1; total2 += c2
+            sw.add_line(f"  {'─'*20} {'─'*8} {'─'*8}")
+            sw.add_line(f"  {'Total':<20} {total1:<8} {total2:<8}")
+            # Also check current membership
+            cur = [ch for ch, us in self.channel_users.items()
+                   if parts[0].lower() in {u.lower() for u in us}
+                   and parts[1].lower() in {u.lower() for u in us}
+                   and ch not in common]
+            if cur:
+                sw.add_line(f"  Also currently in: {', '.join(cur)}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_adjacent(self, args, extra, line):
+        nick = (args + " " + extra).strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /adjacent <nick>"))
+            return
+        nl = nick.lower()
+        adj = self._adjacency.get(nl)
+        if not adj:
+            await self.ui_queue.put(("status", f"No adjacency data for {nick}"))
+            return
+        sw = self._status_win()
+        total = sum(adj.values())
+        sw.add_line(f"── Conversation adjacency: {nick} ({total} pairs) ──")
+        for other, count in adj.most_common(20):
+            pct = count / total * 100
+            bar = "█" * int(pct / 5) + "▏" * (1 if pct % 5 >= 3 else 0)
+            sw.add_line(f"  {other:<20} {count:>4} ({pct:4.0f}%) {bar}")
+        sw.add_line("  (messages spoken immediately before or after)")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_targets(self, args, extra, line):
+        nick = (args + " " + extra).strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /targets <nick>"))
+            return
+        nl = nick.lower()
+        tgt = self._targets.get(nl)
+        if not tgt:
+            await self.ui_queue.put(("status", f"No targeting data for {nick}"))
+            return
+        sw = self._status_win()
+        total = sum(tgt.values())
+        sw.add_line(f"── Targeting score: {nick} ({total} addresses) ──")
+        for other, count in tgt.most_common(20):
+            pct = count / total * 100
+            bar = "█" * int(pct / 5)
+            sw.add_line(f"  {other:<20} {count:>4} ({pct:4.0f}%) {bar}")
+        sw.add_line("  (messages starting with '<nick>:' or '<nick>,' )")
+        self._chat_dirty = True
+        self.dirty = True
+
     async def _slash_alias(self, args, extra, line):
         parts = (args + " " + extra).strip().split(maxsplit=1)
         if not parts or not parts[0]:
@@ -6846,6 +7272,11 @@ class TUI:
         _E("/msg <nick> <text>",            "Send a PM; opens and switches to the DM window")
         _E("/query <nick> [message]",       "Open a DM window with nick; optionally send a first message")
         _E("/jitsi",                        "Generate a Jitsi Meet link and send it in the current PM")
+        _E("/chain [nick]",                 "Show recent message chain for current window in status")
+        _E("/idle <nick>",                  "24h activity heatmap for a user")
+        _E("/together <n1> <n2>",           "Compare two users' channel overlap")
+        _E("/adjacent <nick>",              "Show who speaks before/after a user")
+        _E("/targets <nick>",               "Show who a user addresses most")
         _E("/notice <nick> <text>",         "Send a notice (-nick- style, not shown in chat)")
         _E("/me <text>",                    "Send an action line  (* nick waves)")
         _E("/reply <text>",                 "Reply to last message with +reply tag (IRCv3 message-tags)")
@@ -6957,6 +7388,10 @@ class TUI:
             "  /op /deop /voice /devoice /hop /dehop  /ban /unban",
             "── Users ─────────────────────────────────────────────────",
             "  /nick <new>  /whois <nick>  /whowas <nick>  /who <pat>",
+            "  /idle <nick>     24h activity heatmap",
+            "  /adjacent <nick>  who speaks before/after",
+            "  /targets <nick>   who they address most",
+            "  /together <n1> <n2>  channel overlap",
             "  /ignore <nick>  /unignore <nick>  /away [msg]  /back",
             "── Services ──────────────────────────────────────────────",
             "  /ns <cmd>  /cs <cmd>  /ctcp <nick> <cmd> [args]",
@@ -6974,6 +7409,7 @@ class TUI:
             "── Interface ──────────────────────────────────────────────",
             "  /win <n>  /close (/wc)  /clear  /links  /list [pat]  /znc <cmd>",
             "  /alias [name] [expansion]  list/set/remove command aliases",
+            "  /chain [nick]  message tree for current window  /jitsi  video call",
             "  /theme <1-5>  /userlist  Ctrl+N next window",
             "  Tab/Shift+Tab nick-complete  PgUp/Dn scroll",
             "  Left-click a highlighted URL line to open it in the browser",
