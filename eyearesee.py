@@ -3206,6 +3206,13 @@ class IRCClient:
     async def _irc_away_reply(self, nick, params, prefix):  # 301
         await self.ui_queue.put(("status", f"Away: {' '.join(params[1:])}"))
 
+    async def _irc_chanmode(self, nick, params, prefix):  # 324 RPL_CHANNELMODEIS
+        if len(params) >= 3:
+            channel = params[1]
+            modestr = params[2]
+            mode_args = params[3:]
+            await self.ui_queue.put(("chanmode", channel, modestr, mode_args))
+
     async def _irc_topic_reply(self, nick, params, prefix):  # 332
         channel = params[1] if len(params) > 1 else ""
         topic   = params[-1] if len(params) > 2 else ""
@@ -3522,6 +3529,7 @@ class IRCClient:
         h["401"]          = self._irc_no_such_nick
         h["322"]          = self._irc_list
         h["323"]          = self._irc_listend
+        h["324"]          = self._irc_chanmode
         h["005"]          = self._irc_isupport
         h["AWAY"]         = self._irc_away_notify
         h["CHGHOST"]      = self._irc_chghost
@@ -4099,6 +4107,7 @@ class TUI:
         self.dirty = True
         self.last_redraw = 0.0
         self.ignored_nicks: set = set(load_irc_config().get("ignored_nicks", []))
+        self._aliases: Dict[str, str] = dict(load_irc_config().get("aliases", {}))
         self.mention_beep_muted: bool = False
 
         # Performance caches — maintained incrementally to avoid per-frame rebuilds
@@ -5333,6 +5342,7 @@ class TUI:
         h["mode"]        = self._ev_mode
         h["kick"]        = self._ev_kick
         h["list_results"] = self._ev_list_results
+        h["chanmode"]     = self._ev_chanmode
         for k in ("whois", "status"):
             h[k] = self._ev_status_line
 
@@ -5827,6 +5837,8 @@ class TUI:
         h["list"]         = self._slash_list
         h["userlist"]     = self._slash_userlist
         h["znc"]          = self._slash_znc
+        h["jitsi"]        = self._slash_jitsi
+        h["alias"]        = self._slash_alias
         h["mute"]         = self._slash_mute
         h["replay"]       = self._slash_replay
         h["monitor"]      = self._slash_monitor
@@ -5850,6 +5862,12 @@ class TUI:
             cmd   = parts[0].lower()
             args  = parts[1] if len(parts) > 1 else ""
             extra = parts[2] if len(parts) > 2 else ""
+            # User-defined alias expansion — only expand once (no recursion)
+            if cmd in self._aliases and cmd not in self._slash_handlers:
+                expanded = self._aliases[cmd]
+                new_line = "/" + expanded + (" " + " ".join(filter(None, [args, extra]))).rstrip()
+                await self.handle_input_line(new_line)
+                return
             handler = self._slash_handlers.get(cmd)
             if handler:
                 await handler(args, extra, line)
@@ -5912,18 +5930,61 @@ class TUI:
         if args:
             self._active_client().cmd_whois(args)
 
+    async def _ev_chanmode(self, event):
+        _, channel, modestr, mode_args = event
+        wk = self._wk(self._active_server_id, channel)
+        win = self.window_by_name.get(wk) or self._status_win()
+        if mode_args:
+            win.add_line(f"* Channel modes for {channel}: +{modestr} {' '.join(mode_args)}")
+        else:
+            win.add_line(f"* Channel modes for {channel}: +{modestr}" if modestr
+                         else f"* No channel modes set for {channel}")
+        self._chat_dirty = True
+        self.dirty = True
+
     async def _slash_mode(self, args, extra, line):
-        if args:
-            target, *modes = args.split(maxsplit=1)
-            self._active_client().cmd_mode(target, modes[0] if modes else "")
+        # Reconstruct from the raw line to avoid maxsplit=2 truncation
+        space = line.find(" ")
+        if space == -1:
+            ch = self.current_channel or self.get_current_window().name
+            if ch and ch.startswith("#"):
+                self._active_client().cmd_mode(ch)
+            else:
+                await self.ui_queue.put(("status", "Usage: /mode [<#channel>] [modes]"))
+            return
+        rest = line[space + 1:].strip()
+        parts = rest.split(maxsplit=1)
+        target = parts[0]
+        modestr = parts[1] if len(parts) > 1 else ""
+        if target.startswith("#") or target.startswith("&"):
+            self._active_client().cmd_mode(target, modestr)
+        else:
+            await self.ui_queue.put(("status", "Usage: /mode <#channel> [modes]"))
 
     async def _slash_topic(self, args, extra, line):
-        if args:
-            if " " in args:
-                channel, topic = args.split(maxsplit=1)
-                self._active_client().cmd_topic(channel, topic)
+        if not args and not extra:
+            ch = self.current_channel or self.get_current_window().name
+            if ch and ch.startswith("#"):
+                self._active_client().cmd_topic(ch)
             else:
-                self._active_client().cmd_topic(args)
+                await self.ui_queue.put(("status", "Usage: /topic [<#channel>] [<new topic>]"))
+            return
+        first = args.strip()
+        rest = extra.strip()
+        if first.startswith("#"):
+            # /topic <#channel> [new topic]
+            if rest:
+                self._active_client().cmd_topic(first, rest)
+            else:
+                self._active_client().cmd_topic(first)
+        else:
+            # /topic <new topic>  (current channel)
+            ch = self.current_channel or self.get_current_window().name
+            if ch and ch.startswith("#"):
+                text = first + (" " + rest if rest else "")
+                self._active_client().cmd_topic(ch, text)
+            else:
+                await self.ui_queue.put(("status", "Usage: /topic [<#channel>] [<new topic>]"))
 
     async def _slash_kick(self, args, extra, line):
         if args:
@@ -6224,6 +6285,11 @@ class TUI:
     def _save_ignored(self) -> None:
         cfg = load_irc_config()
         cfg["ignored_nicks"] = sorted(self.ignored_nicks)
+        save_irc_config(cfg)
+
+    def _save_aliases(self) -> None:
+        cfg = load_irc_config()
+        cfg["aliases"] = dict(self._aliases)
         save_irc_config(cfg)
 
     async def _slash_ignore(self, args, extra, line):
@@ -6669,6 +6735,55 @@ class TUI:
         client.send_raw(f"PRIVMSG *status :{text}")
         await self.ui_queue.put(("status", f">>> *status: {text}"))
 
+    async def _slash_jitsi(self, args, extra, line):
+        win = self.get_current_window()
+        if win.is_channel or win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/jitsi: switch to a PM window first"))
+            return
+        target = win.name
+        room = uuid.uuid4().hex[:12]
+        url = f"https://meet.jit.si/{room}"
+        client = self._active_client()
+        client.send_raw(f"PRIVMSG {target} :\x01ACTION suggests a Jitsi call: {url}\x01")
+        win.add_line(f"* You suggest a Jitsi call: {url}")
+        webbrowser.open(url)
+        await self.ui_queue.put(("status", f"Jitsi link sent and opened in browser"))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_alias(self, args, extra, line):
+        parts = (args + " " + extra).strip().split(maxsplit=1)
+        if not parts or not parts[0]:
+            if not self._aliases:
+                await self.ui_queue.put(("status", "No aliases defined. Usage: /alias <name> <expansion>"))
+                return
+            sw = self._status_win()
+            sw.add_line("── Aliases ──")
+            for name in sorted(self._aliases):
+                sw.add_line(f"  {name:<20} → {self._aliases[name]}")
+            sw.add_line(f"── {len(self._aliases)} aliases ──")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+        name = parts[0].lower()
+        if name.startswith("-"):
+            name = name[1:]
+            self._aliases.pop(name, None)
+            self._save_aliases()
+            await self.ui_queue.put(("status", f"Alias removed: {name}"))
+            return
+        if len(parts) < 2 or not parts[1]:
+            expansion = self._aliases.get(name)
+            if expansion:
+                await self.ui_queue.put(("status", f"Alias: {name} → {expansion}"))
+            else:
+                await self.ui_queue.put(("status", f"No alias defined for '{name}'"))
+            return
+        expansion = parts[1].strip()
+        self._aliases[name] = expansion
+        self._save_aliases()
+        await self.ui_queue.put(("status", f"Alias set: {name} → {expansion}"))
+
     async def _slash_mute(self, args, extra, line):
         self.mention_beep_muted = not self.mention_beep_muted
         state = "muted" if self.mention_beep_muted else "unmuted"
@@ -6730,6 +6845,7 @@ class TUI:
         _H("Messaging")
         _E("/msg <nick> <text>",            "Send a PM; opens and switches to the DM window")
         _E("/query <nick> [message]",       "Open a DM window with nick; optionally send a first message")
+        _E("/jitsi",                        "Generate a Jitsi Meet link and send it in the current PM")
         _E("/notice <nick> <text>",         "Send a notice (-nick- style, not shown in chat)")
         _E("/me <text>",                    "Send an action line  (* nick waves)")
         _E("/reply <text>",                 "Reply to last message with +reply tag (IRCv3 message-tags)")
@@ -6740,11 +6856,11 @@ class TUI:
         _H("Channels")
         _E("/join <channel>",               "Join a channel (# is added automatically if omitted)")
         _E("/part [channel] [message]",     "Leave a channel with an optional part message")
-        _E("/topic <channel> [text]",       "View or set the channel topic")
+        _E("/topic [channel] [text]",       "View or set the channel topic (uses current channel)")
         _E("/names [channel]",              "List users currently in the channel")
         _E("/kick <chan> <nick> [reason]",  "Kick a user from the channel")
         _E("/invite <nick> [channel]",      "Invite a user to a channel")
-        _E("/mode <target> [modes]",        "Get or set channel / user modes")
+        _E("/mode [channel] [modes]",       "Get or set channel modes (no args = show current)")
         _C("")
         _H("Operator")
         _E("/op <nick>",    "Grant operator status  (+o)")
@@ -6800,6 +6916,7 @@ class TUI:
         _E("/win <n>",    "Switch to window n; clears its unread marker")
         _E("/close  (or /wc)", "Close current window; focus moves to previous")
         _E("/clear",     "Clear messages in the current window")
+        _E("/alias [name] [expansion]", "List, set or remove command alias (/alias -<name> to remove)")
         _E("/links [n]", "Show last n links shared in this channel (default 20)")
         _E("/list [pattern]","Fetch and display the server's channel list")
         _E("/theme <1-5>","Switch colour theme: Classic Hacker Ocean Sunset Neon")
@@ -6830,11 +6947,12 @@ class TUI:
             "── Messaging ──────────────────────────────────────────────",
             "  /msg <nick> <text>       PM nick; opens & switches to DM window",
             "  /query <nick> [message]  Open a DM window (optional first message)",
+            "  /jitsi                   Jitsi video call — sends link in current PM",
             "  /notice <nick> <text>    Send a notice   /me <text>  Action line",
             "── Channels ──────────────────────────────────────────────",
-            "  /join <chan>  /part [chan] [msg]  /topic <chan> [text]",
+            "  /join <chan>  /part [chan] [msg]  /topic [chan] [text]",
             "  /kick <chan> <nick> [reason]  /invite <nick> [chan]",
-            "  /names [chan]  /mode <target> [modes]",
+            "  /names [chan]  /mode [chan] [modes]",
             "── Operator ──────────────────────────────────────────────",
             "  /op /deop /voice /devoice /hop /dehop  /ban /unban",
             "── Users ─────────────────────────────────────────────────",
@@ -6855,6 +6973,7 @@ class TUI:
             "  /server [-ssl] <host> [port]  (parallel; -ssl for TLS)  /reconnect",
             "── Interface ──────────────────────────────────────────────",
             "  /win <n>  /close (/wc)  /clear  /links  /list [pat]  /znc <cmd>",
+            "  /alias [name] [expansion]  list/set/remove command aliases",
             "  /theme <1-5>  /userlist  Ctrl+N next window",
             "  Tab/Shift+Tab nick-complete  PgUp/Dn scroll",
             "  Left-click a highlighted URL line to open it in the browser",
