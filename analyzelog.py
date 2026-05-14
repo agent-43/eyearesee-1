@@ -56,6 +56,8 @@ try:
     import readline  # type: ignore[import-not-found]
 except ImportError:
     readline = None  # type: ignore[assignment]
+if readline and not hasattr(readline, "backend"):
+    readline.backend = "readline"  # Python 3.13 compat
 
 import sqlite3
 import html as html_mod
@@ -1564,40 +1566,120 @@ def chart_timeline(entries: list[Entry], path: str,
     print(f"Chart saved to {path}")
     return True
 
-def chart_histogram(values: list[float], path: str, label: str = "",
-                    bins: int = 10, range_lo: float = 0.0, range_hi: float = 1.0) -> bool:
-    if not MATPLOTLIB_OK:
-        print("matplotlib not installed")
-        return False
-    if not values:
-        return False
-    fig, ax = plt.subplots(figsize=(8, 3))
-    ax.hist(values, bins=bins, range=(range_lo, range_hi), color="#4a9eff", edgecolor="white")
-    ax.set_xlabel(label)
-    ax.set_ylabel("Frequency")
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    return True
 
-def chart_network(edges: Counter, path: str, top_n: int = 15) -> bool:
-    if not MATPLOTLIB_OK:
-        print("matplotlib not installed")
-        return False
-    top = edges.most_common(top_n)
-    if not top:
-        return False
-    labels = [f"{a}->{b}" for (a, b), _ in top]
-    weights = [w for _, w in top]
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.barh(range(len(labels)), weights, color="#4a9eff")
-    ax.set_yticks(range(len(labels)))
-    ax.set_yticklabels(labels, fontsize=8)
-    ax.set_xlabel("Weight")
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    return True
+# ---------- Web portal (interactive browser console) --------------------------
+
+_WEBPORTAL_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>analyzelog</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;color:#00ff41;font-family:Consolas,monospace;font-size:14px;height:100vh;display:flex;flex-direction:column}
+#output{flex:1;overflow-y:auto;padding:12px;white-space:pre-wrap;word-wrap:break-word;line-height:1.5}
+#output div{margin:0}
+#input-line{display:flex;align-items:center;padding:8px 12px;background:#000;border-top:1px solid #0a3a0a}
+#prompt{color:#00ff41;white-space:pre}
+#input{flex:1;background:#0a0a0a;border:1px solid #0a3a0a;color:#00ff41;font:inherit;padding:6px 8px;outline:none;margin-left:4px}
+#input:focus{border-color:#00ff41}
+#input::placeholder{color:#0a3a0a}
+::-webkit-scrollbar{width:8px}
+::-webkit-scrollbar-track{background:#000}
+::-webkit-scrollbar-thumb{background:#0a3a0a;border-radius:4px}
+</style>
+</head>
+<body>
+<div id="output"></div>
+<div id="input-line"><span id="prompt">(log) </span><input type="text" id="input" autofocus spellcheck="false" autocomplete="off"></div>
+<script>
+var o=document.getElementById('output'),i=document.getElementById('input'),p=document.getElementById('prompt'),h=[],hi=-1;
+function a(t){var d=document.createElement('div');d.textContent=t;o.appendChild(d);o.scrollTop=o.scrollHeight}
+i.addEventListener('keydown',function(e){
+ if(e.key==='Enter'){
+  var c=this.value.trim();if(!c)return;
+  a(p.textContent+c);h.push(c);hi=h.length;this.value='';
+  fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:c})})
+  .then(function(r){return r.json()}).then(function(d){if(d.output)a(d.output);if(d.prompt)p.textContent=d.prompt})
+  .catch(function(e){a('Error: '+e.message)})
+ }else if(e.key==='ArrowUp'){e.preventDefault();if(hi>0){hi--;this.value=h[hi]}}
+ else if(e.key==='ArrowDown'){e.preventDefault();if(hi<h.length-1){hi++;this.value=h[hi]}else{hi=h.length;this.value=''}}
+});
+fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:''})})
+.then(function(r){return r.json()}).then(function(d){if(d.output)a(d.output);if(d.prompt)p.textContent=d.prompt})
+.catch(function(e){a('Error: '+e.message)});
+</script>
+</body>
+</html>"""
+
+_webportal_server: HTTPServer | None = None
+_webportal_shell_ref: "LogShell | None" = None
+
+
+class WebPortalHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if urllib.parse.urlparse(self.path).path in ("/", "/index.html"):
+            body = _WEBPORTAL_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.close_connection = True
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def do_POST(self) -> None:
+        if urllib.parse.urlparse(self.path).path == "/api/command":
+            shell = _webportal_shell_ref
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length) if content_length else b"{}"
+            data: dict = {}
+            if body:
+                try:
+                    data = json.loads(body)
+                except json.JSONDecodeError:
+                    data = {}
+            cmd = data.get("command", "").strip()
+            if shell is None:
+                out = "(shell not available)\n"
+                pr = "(no shell) "
+            elif not cmd:
+                out = "analyzelog web portal. Type 'commands' for reference.\n"
+                pr = shell.prompt
+            elif cmd.lower() in ("quit", "exit", "q"):
+                out = "Type 'webportal disable' to stop the web portal.\n"
+                pr = shell.prompt
+            else:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    try:
+                        shell.onecmd(cmd)
+                    except Exception as exc:
+                        print(f"Error: {exc}")
+                out = buf.getvalue()
+                shell._refresh_prompt()
+                pr = shell.prompt
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"output": out, "prompt": pr}, default=str).encode("utf-8"))
+        else:
+            self.send_error(404)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+def start_webportal(shell: "LogShell", host: str = "127.0.0.1", port: int = 80) -> HTTPServer:
+    global _webportal_shell_ref
+    _webportal_shell_ref = shell
+    server = HTTPServer((host, port), WebPortalHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
+
 
 # ---------- Interactive data frame (#7) ---------------------------------------
 
@@ -1977,16 +2059,17 @@ def forecast_aware_anomaly(entries: list[Entry], user: str, z: float = 2.5,
             daily[e.ts.date()] += 1
     if not daily:
         return {"user": user, "anomalies": [], "note": "insufficient data"}
-    if not base.predictions:
-        anomalies = detect_anomalies(entries, user, z)
-        return {"user": user, "anomalies": [{"date": str(a.ts), "score": a.z_score} for a in anomalies], "forecast_based": False}
-    forecast_map = {str(p[0]): p[1] for p in base.predictions}
+    if not base.get("forecast"):
+        # fall back to standard anomaly
+        return detect_anomalies(entries, user, z)
     anomalies = []
+    forecast_map = {f["date"]: f.get("predicted", 0) for f in base["forecast"] if isinstance(f, dict)}
+    today = datetime.now().date()
     for date_key, actual in sorted(daily.items()):
-        expected = forecast_map.get(str(date_key))
+        expected = forecast_map.get(str(date_key), forecast_map.get(date_key, None))
         if expected is not None:
             dev = abs(actual - expected)
-            if dev > z * (statistics.mean([abs(a - v) for v in forecast_map.values() if v > 0]) or 1):
+            if dev > z * (base.get("rmse", 1) or 1):
                 anomalies.append({"date": str(date_key), "actual": actual, "expected": expected})
     return {"user": user, "anomalies": anomalies, "forecast_based": True}
 
@@ -2097,10 +2180,8 @@ def session_response_times(entries: list[Entry], user_a: str, user_b: str,
     sessions = detect_sessions(entries, user_a, gap_minutes)
     results = []
     for sess in sessions:
-        a_entries = [e for e in entries if e.ts and sess.start <= e.ts <= sess.end
-                     and line_matches_user(e, user_a)]
-        b_entries = [e for e in entries if e.ts and sess.start <= e.ts <= sess.end
-                     and line_matches_user(e, user_b)]
+        a_entries = [e for e in sess.entries if line_matches_user(e, user_a)]
+        b_entries = [e for e in sess.entries if line_matches_user(e, user_b)]
         if not a_entries or not b_entries:
             continue
         a_times = sorted([e.ts for e in a_entries if e.ts])
@@ -2169,27 +2250,17 @@ def _safe_parse_ts(ts_str: str) -> datetime | None:
 # ---------- Template-based filtering (feature g) ------------------------------
 
 def filter_by_template(entries: list[Entry], template_id: str) -> list[Entry]:
-    """Filter entries matching a specific template ID."""
-    tmpls = extract_log_templates(entries, top_n=200)
-    try:
-        idx = int(template_id)
-        if idx < 1 or idx > len(tmpls):
-            return []
-        pattern, _, sample = tmpls[idx - 1]
-    except (ValueError, IndexError):
+    """Filter entries matching a specific template ID (heuristic: first template line)."""
+    tmpls = extract_templates(entries, top_n=100)
+    tmpl = next((t for t in tmpls if t.id == template_id), None)
+    if not tmpl:
         return []
-    # Match by splitting template on placeholders and checking each literal segment
-    parts = pattern.split("{}")
-    # Remove empty leading/trailing parts
-    parts = [p for p in parts if p.strip()]
-    if not parts:
-        return [e for e in entries if e.raw]
-    results = []
-    for e in entries:
-        text = e.text or e.raw or ""
-        if all(p in text for p in parts):
-            results.append(e)
-    return results
+    pattern = re.escape(tmpl.pattern).replace(r"\{\*\}", ".*")
+    try:
+        rx = re.compile(pattern)
+    except re.error:
+        return []
+    return [e for e in entries if rx.search(e.raw or "")]
 
 # ---------- Drift monitoring (feature h) --------------------------------------
 
@@ -2274,11 +2345,8 @@ def auto_tag_user(entries: list[Entry], user: str, llm_url: str, llm_model: str,
         f"(e.g. 'high-volume', 'error-prone', 'night-owl', 'support-focused', 'bot-like').\n"
         f"Return only comma-separated tags, no explanation.\n\n{text}"
     )
-    try:
-        result = call_llm_cached(llm_url, llm_model, "", prompt, cache=cache)
-        return result.strip() if result else "(no response)"
-    except Exception as exc:
-        return f"(error: {exc})"
+    result = llm_complete(llm_url, llm_model, prompt, max_tokens=100, cache=cache)
+    return result.strip() if result else "(no response)"
 
 def auto_tag_bulk(entries: list[Entry], llm_url: str, llm_model: str,
                   max_chunk_chars: int = 12000, cache: LLMCache | None = None,
@@ -4798,6 +4866,7 @@ class LogShell(cmd.Cmd):
             ("auto_report", "auto_report", "LLM-generated narrative report."),
             ("plugin", "plugin {load|list|reload} [dir]", "Manage analysis plugins."),
             ("web", "web {start|stop|status} [port]", "Start/stop the web API server."),
+            ("webportal", "webportal {enable|disable}", "Start/stop the web-based console on port 80."),
             ("webhook", "webhook {set|test|clear} ...", "Configure Slack/Discord webhook."),
             ("cron", "cron [--output <path>] [--webhook-url <url>]", "Run analysis in cron mode."),
             ("templates", "templates [N]", "Extract common log line templates."),
@@ -5323,6 +5392,39 @@ class LogShell(cmd.Cmd):
             else:
                 print("(not running)")
 
+    def do_webportal(self, arg: str) -> None:
+        """webportal {enable|disable|status}   Start/stop/query the web-based console on port 80."""
+        global _webportal_server
+        parts = self._split(arg)
+        if not parts:
+            print("Usage: webportal enable  |  webportal disable")
+            return
+        sub = parts[0].lower()
+        if sub == "enable":
+            if _webportal_server:
+                print("Web portal already running at http://127.0.0.1:80")
+                return
+            try:
+                _webportal_server = start_webportal(self, "127.0.0.1", 80)
+                print("Web portal started at http://127.0.0.1:80")
+            except OSError as exc:
+                print(f"Could not start web portal: {exc}")
+        elif sub == "disable":
+            if _webportal_server:
+                srv = _webportal_server
+                _webportal_server = None
+                threading.Thread(target=lambda: (srv.shutdown(), srv.server_close()), daemon=True).start()
+                print("Web portal stopping...")
+            else:
+                print("(web portal not running)")
+        elif sub == "status":
+            if _webportal_server:
+                print("Web portal is running at http://127.0.0.1:80")
+            else:
+                print("Web portal is not running")
+        else:
+            print("Usage: webportal enable  |  webportal disable  |  webportal status")
+
     # --- NEW: webhook (#25) --------------------------------------------------
     def do_webhook(self, arg: str) -> None:
         """webhook {set <url> [slack|discord] | test <message> | clear}   Configure webhook."""
@@ -5770,6 +5872,7 @@ class LogShell(cmd.Cmd):
 
     def do_quit(self, arg: str) -> bool:
         """quit   Exit the shell."""
+        global _webportal_server
         save_shell_config(self.state)
         if self.state.watch_bg:
             self.state.watch_bg.stop()
@@ -5777,6 +5880,10 @@ class LogShell(cmd.Cmd):
         if self.state.web_server:
             self.state.web_server.shutdown()
             self.state.web_server = None
+        if _webportal_server:
+            _webportal_server.shutdown()
+            _webportal_server.server_close()
+            _webportal_server = None
         if self.state.llm_cache:
             self.state.llm_cache.save()
         self._save_history()
@@ -6131,6 +6238,8 @@ class LogShell(cmd.Cmd):
         return []
     def complete_web(self, text, line, begidx, endidx):
         return self._complete_prefix(text, ["start", "stop", "status"])
+    def complete_webportal(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, ["enable", "disable", "status"])
     def complete_webhook(self, text, line, begidx, endidx):
         prev = line[:begidx].split()
         if len(prev) <= 1:
@@ -6286,6 +6395,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--auto-report", action="store_true", help="With --batch, LLM-generated narrative report")
     p.add_argument("--web", type=int, nargs="?", const=8088, default=0,
                    help="Start web API server on given port")
+    p.add_argument("--webportal", action="store_true",
+                   help="Start web-based interactive console on port 80")
     p.add_argument("--plugin-dir", help="Directory to load analysis plugins from")
     p.add_argument("--cron", action="store_true", help="Run in cron mode (batch with optional alerts)")
     p.add_argument("--cron-output", help="Append cron output to this file")
@@ -6830,8 +6941,36 @@ def main(argv: list[str] | None = None) -> int:
     _set_current_shell(shell)
     shell._refresh_prompt()
 
+    if args.webportal:
+        try:
+            _webportal_server = start_webportal(shell, "127.0.0.1", 80)
+            print("Web portal started at http://127.0.0.1:80")
+        except OSError as exc:
+            print(f"Could not start web portal: {exc}")
+
     try:
         startup_cmds: list[str] = []
         if args.show_commands:
             startup_cmds.append("commands")
-        startup_cmds.exte
+        startup_cmds.extend(args.cmd)
+
+        if startup_cmds:
+            print(shell.intro, end="")
+            for c in startup_cmds:
+                print(f"{shell.prompt}{c}")
+                if shell.onecmd(c):
+                    return 0
+                shell._refresh_prompt()
+            shell.cmdloop(intro="")
+        else:
+            shell.cmdloop()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        if state.llm_cache:
+            state.llm_cache.save()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
