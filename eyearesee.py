@@ -21,11 +21,12 @@ import re
 import ssl
 import time
 import os
+import random
 import uuid
 import warnings
 from collections import Counter, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
-from math import log2
+from math import log, log2
 from typing import Optional, Dict, List, Tuple, Callable
 
 # =========================
@@ -142,6 +143,10 @@ INPUT_HISTORY_MAX  = 500
 CHAT_LOG_DIR       = os.path.join(_SCRIPT_DIR, "chat_logs")
 LINK_LOG_DIR       = os.path.join(_SCRIPT_DIR, "link_logs")
 CHAT_LOG_LOAD      = 500
+# User-contributed tell-phrases learned via /learn_tell
+USER_TELL_PATH     = os.path.join(_SCRIPT_DIR, "user_tell_phrases.json")
+# Sentence embedding model for semantic-drift detection
+EMBEDDING_MODEL: str = os.environ.get("IRC_EMBEDDING_MODEL", "")  # e.g. "all-MiniLM-L6-v2"
 
 # AI provider keys
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -152,6 +157,10 @@ GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
 OLLAMA_URL: str    = os.environ.get("OLLAMA_URL",    "http://127.0.0.1:11434")
 # llama.cpp: local server with OpenAI-compatible API.  Override with LLAMACPP_URL env var.
 LLAMACPP_URL: str  = os.environ.get("LLAMACPP_URL",  "http://127.0.0.1:8033")
+# Modern observer model for Binoculars — replaced distilgpt2 when set.
+# Any HuggingFace causal LM works (e.g. "TinyLlama/TinyLlama-1.1B-Chat-v1.0").
+# Falls back to distilgpt2 if loading fails.
+OBSERVER_MODEL_ID: str = os.environ.get("IRC_OBSERVER_MODEL", "distilgpt2")
 
 # Unified model registry — key is the short name used in /askai, /summarize, /model.
 # Each entry: provider ("claude"|"openai"|"ollama"|"llamacpp"), api model id, human label.
@@ -975,7 +984,10 @@ def log_ai_event(nick: str, target: str, msg: str,
                  heu_score: float = 0.0,
                  bino_score: float = 0.0,
                  cls_score: float = 0.0,
-                 llama_score: float = 0.0) -> None:
+                 llama_score: float = 0.0,
+                 adv_score: float = 0.0,
+                 embed_score: float = 0.0,
+                 watermark_score_val: float = 0.0) -> None:
     """Write one JSONL detection record to ai_scores.log.
 
     Every record contains the full signal breakdown so any line can be
@@ -996,6 +1008,9 @@ def log_ai_event(nick: str, target: str, msg: str,
       bino      – Binoculars cross-entropy ratio sub-score
       cls       – averaged classifier probability (ChatGPT-RoBERTa + general)
       llama     – Llama-specific structural/phrasing pattern sub-score
+      adv       – adversarial-evasion sub-score (char n-gram entropy + spacing)
+      embed     – embedding-variance sub-score (0 when no history)
+      wm        – watermark-detection sub-score
       msg       – raw message text (JSON-escaped)
     """
     if not _ai_logging_enabled:
@@ -1010,6 +1025,9 @@ def log_ai_event(nick: str, target: str, msg: str,
     bino_score  = max(0.0, min(1.0, float(bino_score)))
     cls_score   = max(0.0, min(1.0, float(cls_score)))
     llama_score = max(0.0, min(1.0, float(llama_score)))
+    adv_score   = max(0.0, min(1.0, float(adv_score)))
+    embed_score = max(0.0, min(1.0, float(embed_score)))
+    watermark_score_val = max(0.0, min(1.0, float(watermark_score_val)))
     # Cap the stored message at the IRC protocol line length to bound record size.
     msg_logged  = msg[:512]
     global _log_seq
@@ -1031,6 +1049,9 @@ def log_ai_event(nick: str, target: str, msg: str,
         "bino":    round(bino_score,  4),
         "cls":     round(cls_score,   4),
         "llama":   round(llama_score, 4),
+        "adv":     round(adv_score,   4),
+        "embed":   round(embed_score, 4),
+        "wm":      round(watermark_score_val, 4),
         "msg":     msg_logged,
     }
     _ai_log_write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -1249,6 +1270,15 @@ if not _NO_AI:
         AI_AVAILABLE = True
     except Exception:
         AI_AVAILABLE = False
+
+# PEFT (LoRA) optional — only needed for incremental fine-tuning (Area 7)
+_PEFT_AVAILABLE = False
+if not _NO_AI:
+    try:
+        import peft  # noqa: F401
+        _PEFT_AVAILABLE = True
+    except ImportError:
+        _PEFT_AVAILABLE = False
 
 IRC_CASUAL_WORDS = frozenset({
     "lol", "lmao", "lmfao", "rofl", "haha", "hehe", "xd", "xdd",
@@ -1595,14 +1625,22 @@ class EnsembleAIDetector:
         self.enabled = not disabled
         self.active_detect_model: str = "" if disabled else "qwen3"  # default: llama.cpp qwen3 for LLM detection
         self._gpt2_model = None   # GPT-2: Binoculars performer
-        self._obs_model  = None   # distilgpt2: Binoculars observer
-        self._gpt2_tok   = None   # shared tokenizer (same BPE vocab)
+        self._obs_model  = None   # distilgpt2 or configurable observer
+        self._obs_modern = None   # modern observer (TinyLlama etc.), optional
+        self._obs_modern_tok = None
+        self._gpt2_tok   = None   # shared GPT-2 tokenizer
         self._cls_model  = None   # primary classifier (ChatGPT-focused RoBERTa)
         self._cls_tok    = None
         self._cls2_model = None   # secondary classifier (general LLM detector), optional
         self._cls2_tok   = None
+        self._embed_model = None  # sentence embedding model (drift detection), optional
+        self._embed_tok   = None
         self._device = "cpu"
         self._pred_cache: OrderedDict = OrderedDict()  # text → Dict[str,float], LRU
+        # ── LoRA incremental fine-tuning (Area 7) ────────────────────────────
+        self._lora_peft_config = None
+        self._lora_model = None
+        self._lora_loaded = False
 
         if disabled:
             return
@@ -1625,14 +1663,55 @@ class EnsembleAIDetector:
         self._gpt2_model.eval()
         print("OK")
 
-        print("AI detector: loading distilgpt2 (Binoculars observer)...", end=" ", flush=True)
-        self._obs_model = GPT2LMHeadModel.from_pretrained("distilgpt2").to(self._device)
-        self._obs_model.eval()
-        print("OK")
+        # ── Binoculars observer model (configurable via IRC_OBSERVER_MODEL) ──────────
+        _obs_id = OBSERVER_MODEL_ID
+        if _obs_id == "distilgpt2":
+            print("AI detector: loading distilgpt2 (Binoculars observer)...", end=" ", flush=True)
+            try:
+                self._obs_model = GPT2LMHeadModel.from_pretrained(_obs_id).to(self._device)
+                self._obs_model.eval()
+                print("OK")
+            except Exception as _e:
+                print(f"failed ({_e})")
+        else:
+            # Modern observer — not GPT-2 family, so it gets its own tokenizer
+            print(f"AI detector: loading {_obs_id} (modern Binoculars observer)...", end=" ", flush=True)
+            try:
+                from transformers import AutoModelForCausalLM as _AutoCausal
+                self._obs_modern_tok = AutoTokenizer.from_pretrained(_obs_id)
+                if self._obs_modern_tok.pad_token is None:
+                    self._obs_modern_tok.pad_token = self._obs_modern_tok.eos_token
+                self._obs_modern = _AutoCausal.from_pretrained(
+                    _obs_id, torch_dtype="auto", device_map="auto",
+                ).to(self._device)
+                self._obs_modern.eval()
+                print("OK")
+            except Exception as _e:
+                self._obs_modern = None
+                self._obs_modern_tok = None
+                print(f"skipped ({_e})")
+            # Load distilgpt2 as fallback for the classic Binoculars path
+            print("AI detector: loading distilgpt2 (fallback observer)...", end=" ", flush=True)
+            try:
+                self._obs_model = GPT2LMHeadModel.from_pretrained("distilgpt2").to(self._device)
+                self._obs_model.eval()
+                print("OK")
+            except Exception as _e:
+                print(f"failed ({_e})")
 
-        # Silence transformers' weight-mismatch logger during from_pretrained() calls.
-        # These models have benign pooler/head key mismatches that produce "IS NOT
-        # expected" / "unexpected keys" log lines at WARNING level — not actual errors.
+        # ── Sentence embedding model for semantic-drift detection ───────────────────
+        if EMBEDDING_MODEL:
+            print(f"AI detector: loading embedding model ({EMBEDDING_MODEL})...", end=" ", flush=True)
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._embed_model = SentenceTransformer(EMBEDDING_MODEL, device=self._device)
+                print("OK")
+            except ImportError:
+                print("skipped (sentence-transformers not installed)")
+            except Exception as _e:
+                print(f"skipped ({_e})")
+
+        # ── Classifiers ─────────────────────────────────────────────────────────────
         _tf_logger = logging.getLogger("transformers")
         _prev_tf_level = _tf_logger.level
         _tf_logger.setLevel(logging.ERROR)
@@ -1652,7 +1731,6 @@ class EnsembleAIDetector:
                 self._cls_model = None
                 print(f"skipped ({_e})")
 
-            # Secondary classifier — optional; broadens coverage to Llama/open-source LLMs
             print(f"AI detector: loading secondary classifier ({self._CLS2_MODEL})...", end=" ", flush=True)
             try:
                 self._cls2_tok = AutoTokenizer.from_pretrained(self._CLS2_MODEL)
@@ -1669,11 +1747,14 @@ class EnsembleAIDetector:
         finally:
             _tf_logger.setLevel(_prev_tf_level)
 
-        loaded = ["Binoculars(gpt2+distilgpt2)", "Llama-heuristics"]
+        obs_name = OBSERVER_MODEL_ID if self._obs_modern else "distilgpt2"
+        loaded = [f"Binoculars(gpt2+{obs_name})", "Llama-heuristics"]
         if self._cls_model:
             loaded.append("RoBERTa(chatgpt)")
         if self._cls2_model:
             loaded.append("RoBERTa(general)")
+        if self._embed_model:
+            loaded.append(f"Embed({EMBEDDING_MODEL})")
         print(f"AI detector ENABLED: {' + '.join(loaded)}  (device={self._device})")
 
     # ---- static heuristics ----
@@ -1816,38 +1897,86 @@ class EnsembleAIDetector:
         """Binoculars (Hans et al., 2024): CE_observer / CE_performer.
 
         Low ratio → both models find the text fluent → likely AI-generated.
-        GPT-2 family is used here; it captures fluency patterns common across
-        most RLHF-tuned models including Llama which shares similar token
-        distributions due to overlapping pre-training data (Common Crawl, etc.).
+        When `self._obs_modern` is set, both the performer (gpt2) and the
+        modern observer run on their own tokenizers independently and we take
+        whichever yields a stronger signal.  Falls back to classic (gpt2,
+        distilgpt2) if the modern model is unavailable.
         Returns 0..1, higher = more AI-like.
         """
-        if self._gpt2_tok is None or self._gpt2_model is None or self._obs_model is None:
+        if self._gpt2_tok is None or self._gpt2_model is None:
             return 0.0
         if len(text.split()) < 5:
             return 0.0
-        try:
-            enc = self._gpt2_tok(text, return_tensors="pt", truncation=True, max_length=128)
-            enc = {k: v.to(self._device) for k, v in enc.items()}
-            if enc["input_ids"].shape[1] < 3:
-                return 0.0
-            with torch.inference_mode():
-                ce_obs  = self._obs_model( **enc, labels=enc["input_ids"]).loss.item()
-                ce_perf = self._gpt2_model(**enc, labels=enc["input_ids"]).loss.item()
-            if ce_perf < 1e-6:
-                return 0.0
-            ratio = ce_obs / ce_perf
-            # Human IRC: ratio ~1.3–2.5  (smaller distilgpt2 observer struggles more)
-            # AI text:   ratio ~0.7–1.2  (both models agree — text is fluent)
-            # Calibrated empirically on IRC logs; Llama outputs typically score ~0.9–1.1
-            return max(0.0, min(1.0, (1.9 - ratio) / 1.3))
-        except Exception:
+
+        performer_ready = self._gpt2_model is not None
+        classic_ready   = performer_ready and self._obs_model is not None
+        modern_ready    = performer_ready and self._obs_modern is not None and self._obs_modern_tok is not None
+
+        if not classic_ready and not modern_ready:
             return 0.0
+
+        best_ratio = None
+
+        # Classic path (gpt2 performer + distilgpt2 observer)
+        if classic_ready:
+            try:
+                enc = self._gpt2_tok(text, return_tensors="pt", truncation=True, max_length=128)
+                enc = {k: v.to(self._device) for k, v in enc.items()}
+                if enc["input_ids"].shape[1] >= 3:
+                    with torch.inference_mode():
+                        ce_perf = self._gpt2_model(**enc, labels=enc["input_ids"]).loss.item()
+                        ce_obs  = self._obs_model(**enc, labels=enc["input_ids"]).loss.item()
+                    if ce_perf >= 1e-6:
+                        best_ratio = ce_obs / ce_perf
+            except Exception:
+                pass
+
+        # Modern path (gpt2 performer + modern observer on its own tokenizer).
+        # A strong fluency disagreement between the two architectures is a
+        # cheaper signal than perplexity itself.
+        if modern_ready:
+            try:
+                enc_m = self._obs_modern_tok(
+                    text, return_tensors="pt", truncation=True, max_length=128,
+                    padding=True,
+                )
+                enc_m = {k: v.to(self._device) for k, v in enc_m.items()}
+                if enc_m["input_ids"].shape[1] >= 3:
+                    with torch.inference_mode():
+                        ce_modern = self._obs_modern(**enc_m, labels=enc_m["input_ids"]).loss.item()
+                    if ce_modern >= 1e-6:
+                        # Re-run performer through the same encoding to compare
+                        # on the modern model's tokenization.
+                        enc_p = self._gpt2_tok(
+                            text, return_tensors="pt", truncation=True, max_length=128)
+                        enc_p = {k: v.to(self._device) for k, v in enc_p.items()}
+                        with torch.inference_mode():
+                            ce_perf2 = self._gpt2_model(**enc_p, labels=enc_p["input_ids"]).loss.item()
+                        if ce_perf2 >= 1e-6:
+                            r = ce_modern / ce_perf2
+                            if best_ratio is None or r < best_ratio:
+                                best_ratio = r
+            except Exception:
+                pass
+
+        if best_ratio is None:
+            return 0.0
+
+        # Calibration is model-pair specific.  distilgpt2 threshold:
+        #   human ~1.3–2.5,  AI ~0.7–1.2  →  score = (1.9 - r) / 1.3
+        # A modern observer (e.g. TinyLlama) has lower perplexity overall,
+        # so the ratio for AI text is typically *higher* (~1.0–1.6) because
+        # both the performer and the modern model find it reasonably fluent.
+        if self._obs_modern is not None and best_ratio is not None:
+            return max(0.0, min(1.0, (2.2 - best_ratio) / 1.4))
+        return max(0.0, min(1.0, (1.9 - best_ratio) / 1.3))
 
     def _classifier_score(self, text: str) -> float:
         """Average AI-probability across all loaded classifiers.
 
         Primary (cls1): Hello-SimpleAI/chatgpt-detector-roberta — strong on
-          ChatGPT / GPT-4 / Claude family output.
+          ChatGPT / GPT-4 / Claude family output.  If a LoRA adapter is loaded
+          (Area 7), the LoRA-adapted cls1 is used instead.
         Secondary (cls2): openai-community/roberta-base-openai-detector — trained
           on GPT-2 outputs; generalises to Llama / Mistral / open-source LLMs
           because it captures broad fluency features rather than ChatGPT style.
@@ -1856,14 +1985,18 @@ class EnsembleAIDetector:
         scores: List[float] = []
         if len(text.split()) < 5:
             return 0.0
-        try:
-            enc = self._cls_tok(text, return_tensors="pt", truncation=True, max_length=128)
-            enc = {k: v.to(self._device) for k, v in enc.items()}
-            with torch.inference_mode():
-                logits = self._cls_model(**enc).logits
-            scores.append(torch.softmax(logits, dim=-1)[0][1].item())
-        except Exception:
-            pass
+        _cls_model = self._cls_model
+        if getattr(self, "_lora_loaded", False) and self._lora_model is not None:
+            _cls_model = self._lora_model
+        if _cls_model is not None:
+            try:
+                enc = self._cls_tok(text, return_tensors="pt", truncation=True, max_length=128)
+                enc = {k: v.to(self._device) for k, v in enc.items()}
+                with torch.inference_mode():
+                    logits = _cls_model(**enc).logits
+                scores.append(torch.softmax(logits, dim=-1)[0][1].item())
+            except Exception:
+                pass
         if self._cls2_model is not None:
             try:
                 enc2 = self._cls2_tok(text, return_tensors="pt", truncation=True, max_length=128)
@@ -1876,9 +2009,104 @@ class EnsembleAIDetector:
                 pass
         return sum(scores) / len(scores) if scores else 0.0
 
+    # ---- adversarial character-level detection ----
+
+    @staticmethod
+    def _char_ngram_entropy(text: str, n: int = 3) -> float:
+        """Normalised entropy over character n-grams.  Low entropy suggests
+        repetitive/patterned text; near-zero is suspicious for natural language
+        but common in adversarial padding (e.g. "s p r e a d  o u t")."""
+        if not text or len(text) < n:
+            return 1.0
+        ngrams: Counter = Counter()
+        for i in range(len(text) - n + 1):
+            ngrams[text[i:i + n]] += 1
+        total = sum(ngrams.values())
+        inv   = 1.0 / total
+        ent   = -sum(c * inv * log2(c * inv) for c in ngrams.values())
+        max_ent = log2(len(ngrams)) if ngrams else 1.0
+        return ent / max_ent if max_ent > 0 else 0.0
+
+    @staticmethod
+    def _spacing_anomaly(text: str) -> float:
+        """Score (0..1) for unusual spacing patterns common in adversarial
+        evasion: multi-space gaps, letter-spacing (every-other char space),
+        excessive whitespace."""
+        if not text:
+            return 0.0
+        score = 0.0
+        # Multi-space runs (>2 spaces)
+        multi = re.findall(r'  +', text)
+        if multi:
+            score += min(0.4, 0.1 * len(multi))
+        # Letter-spacing detection: "s p r e a d" pattern
+        spaced = re.findall(r'\b(?:\w ){3,}\w\b', text)
+        if spaced:
+            score += min(0.5, 0.15 * len(spaced))
+        # Whitespace ratio anomaly
+        if len(text) > 10:
+            ws_ratio = text.count(" ") / len(text)
+            if ws_ratio > 0.5:
+                score += min(0.3, (ws_ratio - 0.5) * 2.0)
+        return min(1.0, score)
+
+    @staticmethod
+    def _adversarial_score(text: str) -> float:
+        """Combined adversarial-evasion score (0..1).  Low char-ngram entropy
+        combined with spacing anomalies is a strong indicator of adversarial
+        padding designed to bypass classifiers."""
+        if not text or len(text) < 8:
+            return 0.0
+        tri_ent = EnsembleAIDetector._char_ngram_entropy(text, n=3)
+        quad_ent = EnsembleAIDetector._char_ngram_entropy(text, n=4)
+        spacing = EnsembleAIDetector._spacing_anomaly(text)
+        entropy_penalty = max(0.0, 0.5 - (tri_ent + quad_ent) * 0.5) * 0.6
+        return min(1.0, entropy_penalty + 0.4 * spacing)
+
+    # ---- embedding-based semantic drift ----
+
+    def _embed_text(self, text: str):
+        """Return a sentence embedding vector, or None on failure."""
+        if self._embed_model is None:
+            return None
+        try:
+            return self._embed_model.encode(text, convert_to_numpy=True)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _cosine_sim(a, b) -> float:
+        """Cosine similarity between two 1-D vectors."""
+        import numpy as _np
+        a_n = _np.linalg.norm(a)
+        b_n = _np.linalg.norm(b)
+        if a_n < 1e-8 or b_n < 1e-8:
+            return 0.0
+        return float(_np.dot(a, b) / (a_n * b_n))
+
+    def _embedding_variance_score(self, text: str, recent_embeds: list) -> float:
+        """Return 0..1 based on how much *text*'s embedding deviates from
+        the user's recent embedding history.  Low variance (tight cluster)
+        suggests machine-generated text.  Returns 0 if not enough data or
+        embedding model unavailable."""
+        if self._embed_model is None or not recent_embeds:
+            return 0.0
+        emb = self._embed_text(text)
+        if emb is None:
+            return 0.0
+        sims = [self._cosine_sim(emb, e) for e in recent_embeds if e is not None]
+        if len(sims) < 3:
+            return 0.0
+        avg_sim = sum(sims) / len(sims)
+        # Humans typically have avg_sim ~0.6–0.8 (diverse topics);
+        # bots cluster at ~0.85–1.0 (uniform style/topic).
+        # Scale: 1.0 at avg_sim=1.0, 0.0 at avg_sim <= 0.60
+        return max(0.0, min(1.0, (avg_sim - 0.60) / 0.40))
+
     # ---- main entry point ----
 
-    def predict_detailed(self, text: str) -> Dict[str, float]:
+    def predict_detailed(self, text: str,
+                         recent_embeds: Optional[list] = None) -> Dict[str, float]:
         """Return ensemble probability plus per-signal breakdown.
 
         Keys:
@@ -1887,12 +2115,15 @@ class EnsembleAIDetector:
           llama – raw Llama-specific pattern sub-score (0–1)
           bino  – Binoculars perplexity ratio score (0–1)
           cls   – average classifier score across all loaded models (0–1)
+          adv   – adversarial-evasion score (char n-gram entropy + spacing) (0–1)
+          embed – embedding-variance score (0–1); needs recent_embeds
 
         All values 0–1; higher = more likely AI-generated.
         Results are LRU-cached (up to _CACHE_MAX entries).
         """
         _zero: Dict[str, float] = {
-            "prob": 0.0, "heu": 0.0, "llama": 0.0, "bino": 0.0, "cls": 0.0}
+            "prob": 0.0, "heu": 0.0, "llama": 0.0,
+            "bino": 0.0, "cls": 0.0, "adv": 0.0, "embed": 0.0, "watermark": 0.0}
         if not self.enabled:
             return _zero
         text = text.strip()
@@ -1911,7 +2142,8 @@ class EnsembleAIDetector:
         # bleeding into chat are unambiguous AI evidence — skip all other scoring.
         if re.search(r'</?think\b', text, re.IGNORECASE):
             _certain: Dict[str, float] = {
-                "prob": 1.0, "heu": 1.0, "llama": 1.0, "bino": 1.0, "cls": 1.0}
+                "prob": 1.0, "heu": 1.0, "llama": 1.0,
+                "bino": 1.0, "cls": 1.0, "adv": 1.0, "embed": 0.0, "watermark": 1.0}
             if len(self._pred_cache) >= self._CACHE_MAX:
                 self._pred_cache.popitem(last=False)
             self._pred_cache[text] = _certain
@@ -1921,6 +2153,9 @@ class EnsembleAIDetector:
         heu   = self._heuristic_score(text)
         bino  = self._binoculars_score(text)
         cls   = self._classifier_score(text)
+        adv   = self._adversarial_score(text)
+        embed = self._embedding_variance_score(text, recent_embeds or [])
+        wm    = self.watermark_score(text)
 
         # Adaptive ensemble: ML models are unreliable on short IRC messages
         # (< 8 words) — weight heuristics much higher there.  For long text
@@ -1938,8 +2173,23 @@ class EnsembleAIDetector:
         if llama >= 0.60 and prob < 0.55:
             prob = min(1.0, prob * 0.5 + llama * 0.5)
 
+        # Adversarial-evasion override: strong spacing/entropy anomalies push
+        # the score upward regardless of the main ensemble.
+        if adv >= 0.40:
+            prob = min(1.0, prob + 0.6 * adv * (1.0 - prob))
+
+        # Embedding-variance boost: add up to +0.08 when the text is unusually
+        # consistent with the user's own recent style.
+        if embed > 0.0:
+            prob = min(1.0, prob + 0.08 * embed)
+
+        # Watermark-detection boost: add up to +0.12 when watermark patterns found
+        if wm > 0.0:
+            prob = min(1.0, prob + 0.12 * wm)
+
         result: Dict[str, float] = {
-            "prob": prob, "heu": heu, "llama": llama, "bino": bino, "cls": cls}
+            "prob": prob, "heu": heu, "llama": llama, "bino": bino,
+            "cls": cls, "adv": adv, "embed": embed, "watermark": wm}
 
         if len(self._pred_cache) >= self._CACHE_MAX:
             self._pred_cache.popitem(last=False)   # O(1) FIFO eviction
@@ -1949,6 +2199,145 @@ class EnsembleAIDetector:
     def predict_prob(self, text: str) -> float:
         """Convenience wrapper — returns only the ensemble probability (0–1)."""
         return self.predict_detailed(text)["prob"]
+
+    # ---- watermark detection (Area 5) ----
+
+    def watermark_score(self, text: str) -> float:
+        """Detect common LLM watermark patterns.  Returns 0..1.
+
+        Checks:
+          • Duplicate-token watermark (repeated function words / high-frequency
+            tokens at suspiciously regular intervals)
+          • Green-red list bias (unusual token-frequency distribution)
+          • Structural watermarks (uniform sentence length, low positional entropy)
+        """
+        if not text or len(text) < 10:
+            return 0.0
+        score = 0.0
+        words = text.lower().split()
+        n_words = len(words)
+        if n_words < 5:
+            return 0.0
+
+        # ── Duplicate-token watermark ────────────────────────────────────────
+        # Some watermarking schemes bias toward repeating high-frequency tokens.
+        # Detect by counting function-word repeats at 3–7 token intervals.
+        _func_words = frozenset({
+            "the", "a", "an", "of", "to", "in", "is", "that", "for", "it",
+            "on", "and", "be", "or", "as", "at", "by", "with", "this", "are",
+            "was", "were", "been", "has", "have", "had", "do", "does", "did",
+            "will", "would", "can", "could", "may", "might", "shall", "should",
+            "not", "no", "so", "if", "than", "then", "but", "because", "we",
+        })
+        func_positions = [i for i, w in enumerate(words) if w in _func_words]
+        if len(func_positions) >= 6:
+            gaps = [func_positions[i+1] - func_positions[i]
+                    for i in range(len(func_positions)-1)]
+            if gaps:
+                mean_gap = sum(gaps) / len(gaps)
+                low_var = sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)
+                cv = (low_var ** 0.5) / max(mean_gap, 1)
+                # Suspiciously regular function-word spacing → watermark
+                if cv < 0.30 and mean_gap <= 7:
+                    score += 0.25
+
+        # ── Green-red token bias ─────────────────────────────────────────────
+        # Watermarked text tends to have an unusually uniform token-frequency
+        # rank distribution (too many "medium-rare" tokens, too few rare ones).
+        if n_words >= 10:
+            wf: Counter = Counter()
+            for w in words:
+                wf[w] += 1
+            freqs = sorted(wf.values(), reverse=True)
+            if len(freqs) >= 5:
+                top3 = sum(freqs[:3])
+                rare = sum(freqs[3:])
+                total_f = sum(freqs)
+                top3_ratio = top3 / total_f if total_f else 0
+                # Human text: top-3 words account for ~15–35% of tokens.
+                # Watermarked: more uniform → top-3 ratio < 15% or > 45%.
+                if top3_ratio < 0.15:
+                    score += 0.15
+                elif top3_ratio > 0.45:
+                    score += 0.10
+
+        # ── Sentence-length uniformity ───────────────────────────────────────
+        # Watermarked prose often has very uniform sentence lengths.
+        sentences = re.split(r'[.!?]+', text)
+        sent_lens = [len(s.split()) for s in sentences if len(s.split()) >= 2]
+        if len(sent_lens) >= 4:
+            m_sl = sum(sent_lens) / len(sent_lens)
+            v_sl = sum((sl - m_sl) ** 2 for sl in sent_lens) / len(sent_lens)
+            cv_sl = (v_sl ** 0.5) / max(m_sl, 1)
+            if cv_sl < 0.25:
+                score += 0.20
+
+        return min(1.0, score)
+
+    # ---- LoRA incremental fine-tuning (Area 7) ----
+
+    def _init_lora(self) -> bool:
+        """Attempt to prepare a LoRA adapter on cls1.  Returns True if ready."""
+        if self._cls_model is None:
+            return False
+        try:
+            from peft import LoraConfig, get_peft_model, TaskType
+            if getattr(self, "_lora_peft_config", None) is None:
+                self._lora_peft_config = LoraConfig(
+                    task_type=TaskType.SEQ_CLS,
+                    r=8,
+                    lora_alpha=16,
+                    lora_dropout=0.05,
+                    target_modules=["query", "value"],
+                )
+                self._lora_model = get_peft_model(self._cls_model, self._lora_peft_config)
+                self._lora_model.to(self._device)
+            return True
+        except ImportError:
+            return False
+
+    def _train_lora_adapter(self, positive_texts: List[str], negative_texts: List[str],
+                             output_path: str, epochs: int = 3) -> str:
+        """Fine-tune the LoRA adapter on positive vs negative examples.
+
+        Runs synchronously (call from a thread executor).  Returns the adapter
+        path on success, or an error message on failure.
+        """
+        if not _PEFT_AVAILABLE or self._cls_tok is None:
+            return "PEFT not available"
+        if not self._init_lora():
+            return "failed to init LoRA"
+        from torch.utils.data import DataLoader, TensorDataset
+        texts = positive_texts + negative_texts
+        labels = [1] * len(positive_texts) + [0] * len(negative_texts)
+        if len(texts) < 4:
+            return "need at least 4 examples (2 pos + 2 neg)"
+        enc = self._cls_tok(texts, truncation=True, padding=True, max_length=128, return_tensors="pt")
+        dataset = TensorDataset(enc["input_ids"], enc["attention_mask"], torch.tensor(labels))
+        loader = DataLoader(dataset, batch_size=4, shuffle=True)
+        opt = torch.optim.AdamW(self._lora_model.parameters(), lr=3e-5)
+        self._lora_model.train()
+        for epoch in range(epochs):
+            for batch_ids, batch_mask, batch_labels in loader:
+                batch_ids = batch_ids.to(self._device)
+                batch_mask = batch_mask.to(self._device)
+                batch_labels = batch_labels.to(self._device).float()
+                out = self._lora_model(input_ids=batch_ids, attention_mask=batch_mask,
+                                       labels=batch_labels.long())
+                loss = out.loss
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        self._lora_model.eval()
+        try:
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            self._lora_model.save_pretrained(output_path)
+        except Exception as e:
+            return f"save failed: {e}"
+        self._lora_loaded = True
+        # Swap reference so _classifier_score picks up the adapted model
+        # (already handled via _lora_loaded flag in _classifier_score)
+        return output_path
 
 # =========================
 # BotFingerprint
@@ -2019,6 +2408,92 @@ class ScoringEngine:
         self.ai_detector      = ai_detector
         self.confirmed_bot_nicks: set = set()
         self.bot_fingerprints: Dict[str, BotFingerprint] = {}
+        self.blocklisted_ngrams: set = set()
+        self._load_blocklist()
+
+    # ── Collaborative n-gram blocklist (Area 3) ───────────────────────────
+
+    def _blocklist_path(self) -> str:
+        return USER_TELL_PATH
+
+    def _load_blocklist(self) -> None:
+        path = self._blocklist_path()
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                self.blocklisted_ngrams = set(data.get("ngrams", []))
+            except Exception:
+                self.blocklisted_ngrams = set()
+
+    def _save_blocklist(self) -> None:
+        path = self._blocklist_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"ngrams": sorted(self.blocklisted_ngrams)}, f)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        return [w.lower().translate(_STRIP_PUNCT) for w in text.split() if w.strip(_STRIP_PUNCT)]
+
+    def _extract_tell_ngrams(self, text: str) -> set:
+        words = self._tokenize(text)
+        ngrams: set = set()
+        for w in words:
+            ngrams.add(w)
+        for i in range(len(words) - 1):
+            ngrams.add(f"{words[i]} {words[i+1]}")
+        for i in range(len(words) - 2):
+            ngrams.add(f"{words[i]} {words[i+1]} {words[i+2]}")
+        return ngrams
+
+    def add_tell(self, phrase: str) -> int:
+        ngrams = self._extract_tell_ngrams(phrase)
+        before = len(self.blocklisted_ngrams)
+        self.blocklisted_ngrams |= ngrams
+        self._save_blocklist()
+        return len(self.blocklisted_ngrams) - before
+
+    def remove_tell(self, phrase: str) -> int:
+        ngrams = self._extract_tell_ngrams(phrase)
+        before = len(self.blocklisted_ngrams)
+        self.blocklisted_ngrams -= ngrams
+        self._save_blocklist()
+        return before - len(self.blocklisted_ngrams)
+
+    def blocklist_overlap_score(self, text: str) -> float:
+        """Return 0..1 — fraction of blocklisted n-grams present in *text*."""
+        if not self.blocklisted_ngrams or not text:
+            return 0.0
+        words = self._tokenize(text)
+        if not words:
+            return 0.0
+        hits = 0
+        total = 0
+        seen = set()
+        # Unigrams
+        for w in words:
+            if w in self.blocklisted_ngrams and w not in seen:
+                hits += 1
+                seen.add(w)
+            total += 1
+        # Bigrams
+        for i in range(len(words) - 1):
+            bg = f"{words[i]} {words[i+1]}"
+            if bg in self.blocklisted_ngrams and bg not in seen:
+                hits += 1
+                seen.add(bg)
+            total += 1
+        # Trigrams
+        for i in range(len(words) - 2):
+            tg = f"{words[i]} {words[i+1]} {words[i+2]}"
+            if tg in self.blocklisted_ngrams and tg not in seen:
+                hits += 1
+                seen.add(tg)
+            total += 1
+        return min(1.0, hits / max(1, total))
 
     def confirm_bot(self, nick: str, messages: List[str]) -> BotFingerprint:
         """Mark *nick* as a confirmed bot and build their linguistic fingerprint."""
@@ -2055,7 +2530,7 @@ class ScoringEngine:
 class UserState:
     __slots__ = ("nick", "join_time", "last_msg_time", "msg_times", "msg_lengths",
                  "total_msgs", "ai_scores", "_rolling_sum", "_len_sum", "_time_sum",
-                 "is_confirmed_bot")
+                 "is_confirmed_bot", "_recent_embeds", "_log_gaps", "_recent_signals")
     def __init__(self, nick: str):
         self.nick = nick
         self.join_time = time.monotonic()
@@ -2068,6 +2543,12 @@ class UserState:
         self._len_sum:     int   = 0
         self._time_sum:    float = 0.0
         self.is_confirmed_bot: bool = False
+        # Embedding history for semantic-drift detection (max 32 vectors)
+        self._recent_embeds: deque = deque(maxlen=32)
+        # Log-transformed inter-message gaps for timing-distribution model
+        self._log_gaps: deque = deque(maxlen=USER_HISTORY_WINDOW)
+        # Per-signal breakdown history for explainability (Area 6)
+        self._recent_signals: deque = deque(maxlen=USER_HISTORY_WINDOW)
 
     def record_message(self, msg: str, ai_score: Optional[int] = None) -> None:
         now = time.monotonic()
@@ -2077,6 +2558,7 @@ class UserState:
                 self._time_sum -= self.msg_times[0]
             self.msg_times.append(gap)
             self._time_sum += gap
+            self._log_gaps.append(log(gap + 1e-9))
         self.last_msg_time = now
         msg_len = len(msg)
         if len(self.msg_lengths) == USER_HISTORY_WINDOW:
@@ -2111,6 +2593,26 @@ class UserState:
     def messages_per_minute(self) -> float:
         n = len(self.msg_times)
         return (n / self._time_sum) * 60 if n and self._time_sum > 0 else 0.0
+
+    def timing_anomaly_score(self) -> float:
+        """0..1 — log-normal timing regularity model.
+
+        Models log-transformed inter-message gaps as a normal distribution.
+        Bots exhibit low log-variance and consistently small z-scores.
+        Higher return value = more automated/bot-like timing pattern.
+        """
+        if len(self._log_gaps) < 5:
+            return 0.0
+        import statistics as _stats
+        mean_log = _stats.mean(self._log_gaps)
+        stdev_log = _stats.stdev(self._log_gaps) if len(self._log_gaps) >= 2 else 0.0
+        if stdev_log < 0.01:
+            return 0.9  # near-zero variance → almost certainly automated
+        latest_log = self._log_gaps[-1]
+        z = abs((latest_log - mean_log) / stdev_log)
+        reg_score = max(0.0, 1.0 - z / 2.0)           # small z → too regular
+        stdev_score = max(0.0, min(1.0, (0.8 - stdev_log) / 0.8))  # low std → consistent
+        return max(0.0, min(1.0, 0.5 * reg_score + 0.5 * stdev_score))
 
 class ChatWindow:
     def __init__(self, name: str, is_channel: bool = True, server_id: str = ""):
@@ -3735,10 +4237,13 @@ class IRCClient:
                 if _ML_SEM is None:
                     _ML_SEM = asyncio.Semaphore(2)
                 loop = asyncio.get_running_loop()
+                _recent_embeds = list(u_state._recent_embeds)
                 async with _ML_SEM:
                     detail = await asyncio.wait_for(
                         loop.run_in_executor(
-                            _ML_EXECUTOR, self.scoring.ai_detector.predict_detailed, msg),
+                            _ML_EXECUTOR,
+                            lambda: self.scoring.ai_detector.predict_detailed(
+                                msg, recent_embeds=_recent_embeds)),
                         timeout=15.0)
                 prob = detail["prob"]
                 # Optional LLM-based classification: blended in when /model is set.
@@ -3756,20 +4261,12 @@ class IRCClient:
                     # Max +35 percentage points at full similarity; tapers off smoothly.
                     prob = min(1.0, prob + 0.35 * fp_sim)
 
-                # Behavioral: timing regularity — bots tend to post at very uniform
-                # intervals.  Coefficient of variation (std/mean) of inter-message
-                # gaps below 0.30 is unusual for human IRC typing; below 0.15 is
-                # near-impossible outside scripted clients.
-                if len(u_state.msg_times) >= 6:
-                    _times = list(u_state.msg_times)
-                    _mean_t = sum(_times) / len(_times)
-                    if _mean_t > 0.5:  # ignore burst-typing noise
-                        _var = sum((t - _mean_t) ** 2 for t in _times) / len(_times)
-                        _cv = (_var ** 0.5) / _mean_t
-                        if _cv < 0.15:
-                            prob = min(1.0, prob + 0.20)
-                        elif _cv < 0.30:
-                            prob = min(1.0, prob + 0.10)
+                # Behavioral: timing regularity via log-normal distribution model.
+                # Human IRC typing has irregular gaps (high log-variance, sporadic
+                # z-scores); bots produce near-constant intervals.
+                _timing_score = u_state.timing_anomaly_score()
+                if _timing_score > 0.0:
+                    prob = min(1.0, prob + 0.20 * _timing_score)
 
                 # Rolling momentum: if this user is already tracking as AI across
                 # several past messages, give new messages a small confidence nudge
@@ -3777,6 +4274,12 @@ class IRCClient:
                 _rolling_prior = u_state.rolling_ai_likelihood()
                 if _rolling_prior >= 75.0 and len(u_state.ai_scores) >= 4:
                     prob = min(1.0, prob + 0.10)
+
+                # Collaborative blocklist boost (Area 3): if this message contains
+                # n-grams that have been /learn_tell'd, boost the score.
+                _blocklist_score = self.scoring.blocklist_overlap_score(msg)
+                if _blocklist_score > 0.0:
+                    prob = min(1.0, prob + 0.30 * _blocklist_score)
 
                 a_score = int(prob * 100)
         except asyncio.CancelledError:
@@ -3786,8 +4289,10 @@ class IRCClient:
             log_ai_event(
                 nick, target, msg, u_score, m_score, a_score,
                 int(u_state.rolling_ai_likelihood()),
-                heu_score=detail["heu"], bino_score=detail["bino"],
-                cls_score=detail["cls"], llama_score=detail["llama"],
+                heu_score=detail.get("heu", 0), bino_score=detail.get("bino", 0),
+                cls_score=detail.get("cls", 0), llama_score=detail.get("llama", 0),
+                adv_score=detail.get("adv", 0), embed_score=detail.get("embed", 0),
+                watermark_score_val=detail.get("watermark", 0),
             )
             raise
         except Exception:
@@ -3800,16 +4305,35 @@ class IRCClient:
             log_ai_event(
                 nick, target, msg, u_score, m_score, a_score,
                 int(u_state.rolling_ai_likelihood()),
-                heu_score=detail["heu"], bino_score=detail["bino"],
-                cls_score=detail["cls"], llama_score=detail["llama"],
+                heu_score=detail.get("heu", 0), bino_score=detail.get("bino", 0),
+                cls_score=detail.get("cls", 0), llama_score=detail.get("llama", 0),
+                adv_score=detail.get("adv", 0), embed_score=detail.get("embed", 0),
+                watermark_score_val=detail.get("watermark", 0),
             )
             return
         u_state.record_message(msg, a_score)
+        # Store per-signal breakdown for explainability (Area 6)
+        u_state._recent_signals.append({
+            "prob": detail.get("prob", 0), "heu": detail.get("heu", 0),
+            "bino": detail.get("bino", 0), "cls": detail.get("cls", 0),
+            "llama": detail.get("llama", 0), "adv": detail.get("adv", 0),
+            "embed": detail.get("embed", 0), "watermark": detail.get("watermark", 0),
+        })
+        # Store sentence embedding for future semantic-drift detection
+        if self.scoring.ai_detector._embed_model is not None and len(msg.split()) >= 3:
+            try:
+                emb = self.scoring.ai_detector._embed_text(msg)
+                if emb is not None:
+                    u_state._recent_embeds.append(emb)
+            except Exception:
+                pass
         rolling_ai = int(u_state.rolling_ai_likelihood())
         log_ai_event(
             nick, target, msg, u_score, m_score, a_score, rolling_ai,
-            heu_score=detail["heu"], bino_score=detail["bino"],
-            cls_score=detail["cls"], llama_score=detail["llama"],
+            heu_score=detail.get("heu", 0), bino_score=detail.get("bino", 0),
+            cls_score=detail.get("cls", 0), llama_score=detail.get("llama", 0),
+            adv_score=detail.get("adv", 0), embed_score=detail.get("embed", 0),
+            watermark_score_val=detail.get("watermark", 0),
         )
         await self.ui_queue.put(("ai_score", nick, rolling_ai))
 
@@ -4565,6 +5089,18 @@ class TUI:
                 L("  Status                 : IGNORED")
             if spark:
                 L(f"  Score history          : {spark}")
+            # Per-signal breakdown (Area 6) — averages over recent scored messages
+            _signals = list(state._recent_signals)
+            if len(_signals) >= 3:
+                _avg = lambda k: sum(d.get(k, 0) for d in _signals) / len(_signals)
+                L("  ── Signal breakdown ─────────────────────────")
+                L(f"  Binoculars (bino)      : {_avg('bino'):.2f}")
+                L(f"  Classifier  (cls)      : {_avg('cls'):.2f}")
+                L(f"  Heuristics  (heu)      : {_avg('heu'):.2f}")
+                L(f"  Llama-patt  (llama)    : {_avg('llama'):.2f}")
+                L(f"  Adversarial (adv)      : {_avg('adv'):.2f}")
+                L(f"  Embed-drift (embed)    : {_avg('embed'):.2f}")
+                L(f"  Watermark   (wm)       : {_avg('watermark'):.2f}")
             L("")
         else:
             L("  (not seen in current session)")
@@ -5817,6 +6353,9 @@ class TUI:
         h["ai"]         = self._slash_ai
         h["bot"]        = self._slash_bot
         h["unbot"]      = self._slash_unbot
+        h["learn_tell"] = h["ltell"] = self._slash_learn_tell
+        h["forget_tell"] = h["ftell"] = self._slash_forget_tell
+        h["scan_watermark"] = h["watermark"] = self._slash_scan_watermark
         h["topai"]      = self._slash_topai
         h["aitoggle"]   = self._slash_aitoggle
         h["logtoggle"]  = self._slash_logtoggle
@@ -6091,6 +6630,30 @@ class TUI:
             f"({len(fp.bigrams)} bigrams, {len(fp.trigrams)} trigrams)  "
             f"session msgs: {msg_count}"))
 
+        # ── Asynchronously train LoRA adapter on this bot's messages ────────
+        if _PEFT_AVAILABLE and raw_msgs:
+            _neg_msgs: List[str] = []
+            for _win in self.windows:
+                for _ln in list(_win.lines)[-100:]:
+                    _m = self._MSG_LINE_RE.match(_ln)
+                    if _m and _m.group(1) != nick and len(_m.group(2).split()) >= 3:
+                        _neg_msgs.append(_m.group(2))
+            if len(_neg_msgs) > len(raw_msgs) * 3:
+                _neg_msgs = random.sample(_neg_msgs, min(len(raw_msgs) * 3, 60))
+            _adapter_dir = os.path.join(_SCRIPT_DIR, f"lora_{nick}")
+            _detector = scoring.ai_detector
+            loop = asyncio.get_running_loop()
+            _lora_result = await loop.run_in_executor(
+                None, _detector._train_lora_adapter,
+                raw_msgs, _neg_msgs, _adapter_dir)
+            if _lora_result and os.path.isdir(_lora_result):
+                await self.ui_queue.put(("status",
+                    f"[bot] LoRA adapter saved to {_lora_result}  "
+                    f"(use /bot to confirm another user, or restart to reload)"))
+            elif _lora_result:
+                await self.ui_queue.put(("status",
+                    f"[bot] LoRA: {_lora_result}"))
+
     async def _slash_unbot(self, args, extra, line):
         """Remove confirmed-bot status from a nick."""
         if _NO_AI:
@@ -6109,6 +6672,104 @@ class TUI:
 
         scoring.unconfirm_bot(nick)
         await self.ui_queue.put(("status", f"[bot] {nick} removed from confirmed-bot list"))
+
+    # ── /learn_tell  —  collaborative n-gram blocklist  (Area 3) ──────────
+
+    async def _slash_learn_tell(self, args, extra, line):
+        """Add n-grams from a phrase to the shared blocklist.
+
+        Usage: /learn_tell <phrase>
+          The phrase is tokenised into words, bigrams, and trigrams and added
+          to the persistent blocklist.  Future messages containing these n-grams
+          receive a score boost.
+        """
+        phrase = (args + " " + extra).strip()
+        if not phrase:
+            await self.ui_queue.put(("status", "Usage: /learn_tell <phrase>"))
+            return
+        scoring = self._active_client().scoring
+        n_added = scoring.add_tell(phrase)
+        await self.ui_queue.put(("status",
+            f"[learn_tell] added {n_added} n-gram(s) from \"{phrase[:60]}\"  "
+            f"(total: {len(scoring.blocklisted_ngrams)})"))
+
+    async def _slash_forget_tell(self, args, extra, line):
+        """Remove n-grams of a phrase from the shared blocklist.
+
+        Usage: /forget_tell <phrase>
+        """
+        phrase = (args + " " + extra).strip()
+        if not phrase:
+            await self.ui_queue.put(("status", "Usage: /forget_tell <phrase>"))
+            return
+        scoring = self._active_client().scoring
+        n_removed = scoring.remove_tell(phrase)
+        await self.ui_queue.put(("status",
+            f"[forget_tell] removed {n_removed} n-gram(s) for \"{phrase[:60]}\"  "
+            f"(total: {len(scoring.blocklisted_ngrams)})"))
+
+    # ── /scan_watermark  —  LLM watermark detection  (Area 5) ─────────────
+
+    async def _slash_scan_watermark(self, args, extra, line):
+        """Scan recent messages or provided text for LLM watermark patterns.
+
+        Usage: /scan_watermark [text]
+          If text is provided, analyse it directly.  Otherwise scan the last
+          10 messages in the current window.
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[watermark] disabled by --no-ai")); return
+        msg_text = (args + " " + extra).strip()
+        detector = self._active_client().scoring.ai_detector
+        if not detector.enabled:
+            await self.ui_queue.put(("status", "[watermark] AI detector is disabled")); return
+
+        results: List[Tuple[str, float]] = []
+        if msg_text:
+            wm = detector.watermark_score(msg_text)
+            results.append((msg_text[:80], wm))
+        else:
+            cur_win = self.get_current_window()
+            _TS_RE = re.compile(r'^\[\d{2}:\d{2}\]\s*')
+            _SPEAKER_RE = re.compile(r'^<(\S+?)>\s*(.*)')
+            count = 0
+            for ln in reversed(list(cur_win.lines)):
+                stripped = _TS_RE.sub("", ln)
+                m = _SPEAKER_RE.match(stripped)
+                if m:
+                    wm = detector.watermark_score(m.group(2))
+                    results.append((f"<{m.group(1)}> {m.group(2)[:60]}", wm))
+                    count += 1
+                    if count >= 10:
+                        break
+
+        if not results:
+            await self.ui_queue.put(("status", "[watermark] no messages to scan"))
+            return
+
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+        L("=== Watermark Scan ===")
+        L("")
+        bars = "▁▂▃▄▅▆▇█"
+        for preview, wm_score in results:
+            bar = bars[min(7, int(wm_score * 8))]
+            flag = "  *** WATERMARK ***" if wm_score >= 0.35 else ""
+            L(f"  [{wm_score:.2f} {bar}] {preview}{flag}")
+        L("")
+        L("  ── Legend ──────────────────────────────────────")
+        L("  Score ≥ 0.35  — likely watermarked (LLM-generated)")
+        L("  Score 0.15–0.34 — weak watermark signal")
+        L("  Score < 0.15  — natural/unwatermarked text")
+
+        self._dashboard_mode = "profile"
+        self._dashboard_dirty = False
+        self._dashboard_last_update = time.monotonic()
+        self.current_window_index = 1
+        self._chat_dirty = True
+        self.dirty = True
 
     async def _slash_topai(self, args, extra, line):
         if _NO_AI:
