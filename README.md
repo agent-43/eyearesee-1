@@ -18,11 +18,44 @@ python eyearesee.py --no-ai --no-install ( all llm features will be disabled and
 The remaining ~71% is the IRC protocol stack (full IRCv3), curses TUI, plugin system, CJK translation, and general infrastructure.
 
 ## Explained 
-eyearesee is a 7,710-line Python curses-based IRCv3 client with integrated AI detection. It connects to IRC (default irc.libera.chat:6697), supports SASL auth (PLAIN, SCRAM-SHA-256, EXTERNAL, ECDSA-NIST256P-CHALLENGE), full IRCv3 capabilities (message-tags, server-time, echo-message, batch, chathistory, multiline, read-marker, typing indicators, account-registration), CTCP, multi-server via /server, and has a tabbed TUI with userlist, channel history persistence, and CJK auto-translation.
-Its distinguishing feature is an ensemble AI detector that scores every incoming message on a 0–100 AI-likelihood scale using: heuristic formality/pattern analysis, Binoculars cross-entropy ratio (GPT-2/distilGPT-2), RoBERTa classifiers (ChatGPT-focused + general), optional LLM-based classification (via Claude/OpenAI/Ollama/llama.cpp), and bot fingerprinting with n-gram similarity. A dashboard shows ranked suspects, per-user AI profiles with sparklines and session breakdowns, and channel activity stats. It also supports /askai and /summarize using any configured provider, a Python plugin system, and persistent JSONL audit logging.
+eyearesee.py (~9364 lines) is a full-featured curses-based IRC client with an integrated AI-generated-text detection system. It connects to IRC servers (Libera.Chat, OFTC, etc.), renders a split-pane TUI (chat + dashboard), and silently scores every incoming message for AI-likeness using a 7-signal ensemble. Single-file, zero-dependency IRC stack (no irclib).
+Core IRC Features
+- Multi-server support with SSL, SASL (PLAIN, SCRAM-SHA-256, EXTERNAL, ECDSA-NIST256P-CHALLENGE)
+- IRCv3: labeled-response, message-tags (server-time, msgid), chathistory replay, multiline, monitor, WHOX, draft/react, draft/redact, draft/reply, draft/mention
+- Full CTCP handling (VERSION, PING, TIME, CLIENTINFO, ACTION)
+- TUI: curses-based split-pane with chat window, user list, input line, and scrollable *dashboard* pane for AI profiles and infoviz
+- Persistence: chat logs, AI score log (JSONL), input history, config (JSON), autojoin channels
+- Auto-translation (Google Translate API), link previews, online help, plugin system, aliases, vim-style /chain commands, /explain (AI analysis of a nick via Claude/GPT/Ollama)
+AI Detection System (EnsembleAIDetector)
+All 8 detection signals, computed per-message:
+Signal	Method	What it detects
+Binoculars	_binoculars_score()	Perplexity ratio between GPT-2 (performer) and observer model (distilgpt2 or modern configurable LLM)
+Classifiers	_classifier_score()	Chatgpt-detector-roberta (cls1) + openai-detector (cls2), optionally LoRA-adapted
+Heuristics	_heuristic_score()	Formality, capitalisation, punctuation, IRC slang absence, tell phrases
+Llama patterns	llama_pattern_score()	Markdown structure, bot openers, colon-terminated intros, enumeration
+Adversarial	_adversarial_score()	Low char-ngram entropy + spacing anomalies (evasion padding)
+Embedding drift	_embedding_variance_score()	Cosine similarity of sentence-BERT embeddings against user's own recent history — tight clusters → bot
+Watermark	watermark_score()	Duplicate-token spacing regularity, green-red list bias, sentence-length uniformity
+Timing	timing_anomaly_score()	Log-normal model of inter-message gaps — low log-variance + small z-scores → automated
+Ensemble weighting adapts to message length (<8 words: 75% heuristic, ≥30 words: 38% binoculars + 37% classifier). Additional boosts from fingerprint similarity (cross-nick style matching), rolling momentum, adversarial override, and collaborative blocklist.
+Interactive Commands
+Command	Function
+/ai <nick>	Full AI profile with per-signal breakdown, session + all-time stats, verdict
+/topai	Per-channel ranking by AI likelihood
+/bot <nick>	Mark as confirmed bot — builds n-gram fingerprint + trains LoRA adapter
+/unbot <nick>	Remove confirmed-bot status
+/learn_tell <phrase>	Add n-grams to collaborative blocklist
+/forget_tell <phrase>	Remove n-grams from blocklist
+/scan_watermark [text]	Scan text or last 10 messages for watermark patterns
+/aitoggle	Enable/disable AI scoring
+/explain <nick>	LLM-based behavioural analysis of a user
+/askai <question>	Query a configured LLM (Claude, GPT, Ollama, llama.cpp)
+/model	List/select AI provider models
+/fingerprint	Show confirmed-bot style fingerprints
+/cluster	Cluster users by linguistic similarity
 
 # Summary: 
-eyearesee is an unusually ambitious single-file project: a polished, IRCv3-compliant terminal IRC client merged with a four-signal AI text detector and a multi-provider LLM chat interface, all in one script with minimal external dependencies.
+eyearesee is an unusually ambitious single-file project: a polished, IRCv3-compliant terminal IRC client merged with a seven-signal AI text detector and a multi-provider LLM chat interface, all in one script with minimal external dependencies.
 
 ## Dependencies Required 
 (auto-installed if missing):
