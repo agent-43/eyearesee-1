@@ -4709,6 +4709,16 @@ class TUI:
         self._mention_re: Optional[re.Pattern] = None   # matches our nick in message body
         self._mention_re_nick: str = ""                  # nick the regex was compiled for
         self._dashboard_dirty = False             # needs rebuild?
+
+        # Mouse support
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+            # Some terminals need this to enable mouse reporting
+            print("\033[?1003h", end="")
+        except Exception:
+            pass
+        self._tab_regions: List[Tuple[int, int, int]] = []  # (start_x, end_x, win_index)
+        self._user_list_nicks: List[str] = []               # nicks currently shown in userlist
         self._dashboard_last_update = 0.0         # last rebuild timestamp
         self._dashboard_ota_interval = 5.0        # auto-refresh interval while dashboard is visible
         # "suspects" = normal auto-refreshing suspects view
@@ -5687,7 +5697,9 @@ class TUI:
             thresh      = self.ai_suspect_threshold
             attr_sus    = self._attr_suspect
             attr_normal = self._attr_normal
+            self._user_list_nicks = []
             for i, nick in enumerate(users[:self.chat_height - 2]):
+                self._user_list_nicks.append(nick)
                 ai_pct = self.user_ai_scores.get(nick, 0)
                 mode_char = self._highest_prefix(modes.get(nick, set()))
                 display_nick = (mode_char + nick) if mode_char else nick
@@ -5744,6 +5756,7 @@ class TUI:
                     break
 
         col = 1
+        self._tab_regions = []
         for i in range(start, len(labels)):
             label = labels[i]
             lw = len(label)
@@ -5759,6 +5772,7 @@ class TUI:
                 attr = curses.A_DIM
             try:
                 self.input_win.addstr(1, col, label, attr)
+                self._tab_regions.append((col, col + lw, i))
             except curses.error:
                 pass
             col += lw + 1   # +1 space between tabs
@@ -8958,34 +8972,77 @@ class TUI:
                 _, mx, my, _, bstate = curses.getmouse()
             except curses.error:
                 return False
-            # Fire on any button-1 event (press or click) regardless of platform
-            # constant differences between ncurses and pdcurses/windows-curses.
-            # Values 1-16 cover: released, pressed, clicked, double, triple.
+
+            # 1. Handle Scroll Wheel
+            # BUTTON4_PRESSED = Up, BUTTON5_PRESSED = Down
+            # Some platforms/curses use different values, but these are common.
+            if bstate & (curses.BUTTON4_PRESSED | 0x10000): # Wheel Up
+                win = self.get_current_window()
+                self._wrap_window(win)
+                max_off = max(0, len(win.wrapped_cache) - self._content_height)
+                win.scroll_offset = min(win.scroll_offset + 3, max_off)
+                self._chat_dirty = True
+                self.dirty = True
+                return True
+            elif bstate & (0x200000 | 0x2000000): # Wheel Down (BUTTON5_PRESSED)
+                win = self.get_current_window()
+                win.scroll_offset = max(0, win.scroll_offset - 3)
+                self._chat_dirty = True
+                self.dirty = True
+                return True
+
+            # 2. Check for Click (Button 1)
+            # 0x001F covers release, press, click, double, triple for button 1
             if not (bstate & 0x001F):
                 return False
-            # Left-click: open URL if the clicked line is a URL line
+
+            # A. Click on Tab Bar (height - 3)
+            if my == self.height - 3:
+                for start_x, end_x, win_idx in self._tab_regions:
+                    if start_x <= mx <= end_x:
+                        self.current_window_index = win_idx
+                        self._chat_dirty = self._userlist_dirty = True
+                        self.dirty = True
+                        return True
+
+            # B. Click on User List
+            if mx >= self.width - self.userlist_width and my < self.height - 4:
+                # Header is row 0 of user_win, nicks start at row 1
+                nick_idx = my - 1
+                if 0 <= nick_idx < len(self._user_list_nicks):
+                    nick = self._user_list_nicks[nick_idx]
+                    # Logic: WHOIS the user on click
+                    self._active_client().cmd_whois(nick)
+                    # Also switch to AI dashboard to show their profile?
+                    for i, w in enumerate(self.windows):
+                        if w.name == "*dashboard*":
+                            self.current_window_index = i
+                            break
+                    self._chat_dirty = self._userlist_dirty = True
+                    self.dirty = True
+                    return True
+
+            # C. Click on Chat Area (URL detection)
             chat_w = self.chat_win.getmaxyx()[1]
-            if my < 1 or my >= self.chat_height or mx >= chat_w:
-                return False  # title bar, input area, or userlist column
-            win = self.get_current_window()
-            self._wrap_window(win)
-            total     = len(win.wrapped_cache)
-            offset    = win.scroll_offset
-            end_idx   = total - offset
-            start_idx = max(0, end_idx - self._content_height)
-            line_idx  = start_idx + (my - 1)  # row 0 is the title bar
-            if line_idx >= total:
-                return False
-            url = win.url_map.get(line_idx)
-            if not url:
-                return False
-            try:
-                webbrowser.open(url)
-            except Exception:
-                pass
-            self.window_by_name["*status*"].add_line(f"Opening: {url}")
-            self._chat_dirty = True
-            self.dirty = True
+            if my >= 1 and my < self.chat_height and mx < chat_w:
+                win = self.get_current_window()
+                self._wrap_window(win)
+                total     = len(win.wrapped_cache)
+                offset    = win.scroll_offset
+                end_idx   = total - offset
+                start_idx = max(0, end_idx - self._content_height)
+                line_idx  = start_idx + (my - 1)
+                if line_idx < total:
+                    url = win.url_map.get(line_idx)
+                    if url:
+                        try:
+                            webbrowser.open(url)
+                            self.window_by_name["*status*"].add_line(f"Opening: {url}")
+                            self._chat_dirty = True
+                            self.dirty = True
+                        except Exception:
+                            pass
+                        return True
 
         elif 32 <= ch <= 1114111:
             try:
