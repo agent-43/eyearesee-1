@@ -150,6 +150,15 @@ USER_TELL_PATH     = os.path.join(_SCRIPT_DIR, "user_tell_phrases.json")
 # Sentence embedding model for semantic-drift detection
 EMBEDDING_MODEL: str = os.environ.get("IRC_EMBEDDING_MODEL", "")  # e.g. "all-MiniLM-L6-v2"
 
+# ── Built-in bouncer (BNC) ────────────────────────────────────────────────────
+BNC_BUFFER_PATH    = os.path.join(_SCRIPT_DIR, "bouncer_buffer.jsonl")
+BNC_CONFIG_PATH    = os.path.join(_SCRIPT_DIR, "bouncer_config.json")
+# GPG
+GPG_BINARY: str    = os.environ.get("IRC_GPG_BINARY", "gpg")
+# Tor SOCKS5 proxy
+TOR_PROXY_HOST: str = os.environ.get("IRC_TOR_PROXY_HOST", "127.0.0.1")
+TOR_PROXY_PORT: int = int(os.environ.get("IRC_TOR_PROXY_PORT", "9050"))
+
 # AI provider keys
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
@@ -2466,6 +2475,236 @@ class BotFingerprint:
         return min(1.0, 0.25 * vocab_j + 0.35 * bi_score + 0.40 * tri_score)
 
 
+# =========================
+# Bouncer Buffer (BNC)
+# =========================
+class BouncerBuffer:
+    """Persistent message buffer for the built-in bouncer.
+
+    When the TUI is detached, incoming IRC messages are serialised to a JSONL
+    file.  On reattach they are replayed via the ui_queue in chronological
+    order, then the buffer file is truncated to zero.
+    """
+
+    def __init__(self, path: str = BNC_BUFFER_PATH):
+        self.path = path
+        self._count: int = 0
+
+    def append(self, event_type: str, *args) -> None:
+        """Write one buffered event as a JSON line."""
+        try:
+            entry = {"t": event_type, "a": args, "ts": time.time()}
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            self._count += 1
+        except Exception:
+            pass
+
+    def replay(self, ui_queue: asyncio.Queue) -> int:
+        """Read all buffered lines, push them onto *ui_queue*, and clear the file.
+        Returns the number of events replayed."""
+        entries: list = []
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if raw:
+                        try:
+                            entries.append(json.loads(raw))
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        if not entries:
+            return 0
+        # Sort by timestamp so replay order matches original arrival
+        entries.sort(key=lambda e: e.get("ts", 0))
+        for entry in entries:
+            try:
+                ui_queue.put_nowait(tuple([entry["t"]] + list(entry["a"])))
+            except asyncio.QueueFull:
+                break
+        # Truncate the buffer file
+        try:
+            open(self.path, "w").close()
+        except Exception:
+            pass
+        self._count = 0
+        return len(entries)
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def clear(self) -> None:
+        try:
+            open(self.path, "w").close()
+        except Exception:
+            pass
+        self._count = 0
+
+
+# =========================
+# GPG helpers
+# =========================
+
+def _gpg_available() -> bool:
+    """Return True if the gpg binary is reachable."""
+    try:
+        subprocess.run([GPG_BINARY, "--version"], capture_output=True, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def _gpg_encrypt(plaintext: str, recipient: str) -> Optional[str]:
+    """Encrypt *plaintext* for *recipient* using gpg --encrypt.
+    Returns base64-encoded ciphertext, or None on failure."""
+    try:
+        proc = subprocess.run(
+            [GPG_BINARY, "--encrypt", "--armor", "--recipient", recipient,
+             "--trust-model", "always"],
+            input=plaintext.encode("utf-8"),
+            capture_output=True, timeout=15,
+        )
+        if proc.returncode == 0:
+            return base64.b64encode(proc.stdout).decode()
+    except Exception:
+        pass
+    return None
+
+
+def _gpg_decrypt(b64_ciphertext: str) -> Optional[str]:
+    """Decrypt a base64-encoded GPG ciphertext.
+    Returns the plaintext string, or None on failure."""
+    try:
+        raw = base64.b64decode(b64_ciphertext)
+        proc = subprocess.run(
+            [GPG_BINARY, "--decrypt"],
+            input=raw, capture_output=True, timeout=15,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.decode("utf-8", errors="replace").strip()
+    except Exception:
+        pass
+    return None
+
+
+def _gpg_sign(plaintext: str, key_fingerprint: str = "") -> Optional[str]:
+    """Sign *plaintext* with GPG. Returns base64-encoded detached signature."""
+    try:
+        args = [GPG_BINARY, "--detach-sign", "--armor"]
+        if key_fingerprint:
+            args += ["--default-key", key_fingerprint]
+        proc = subprocess.run(
+            args, input=plaintext.encode("utf-8"),
+            capture_output=True, timeout=15,
+        )
+        if proc.returncode == 0:
+            return base64.b64encode(proc.stdout).decode()
+    except Exception:
+        pass
+    return None
+
+
+def _gpg_verify(plaintext: str, b64_signature: str) -> Optional[str]:
+    """Verify a base64-encoded GPG detached signature against *plaintext*.
+    Returns the signing key fingerprint on success, or None on failure."""
+    try:
+        sig = base64.b64decode(b64_signature)
+        proc = subprocess.run(
+            [GPG_BINARY, "--verify"],
+            input=sig + plaintext.encode("utf-8"),
+            capture_output=True, timeout=15,
+        )
+        if proc.returncode == 0:
+            # Extract fingerprint from stderr
+            for line in proc.stderr.decode("utf-8", errors="replace").splitlines():
+                if "fingerprint" in line.lower() or "key ID" in line.lower():
+                    return line.strip()
+            return "(verified, no fingerprint in stderr)"
+    except Exception:
+        pass
+    return None
+
+
+# ── SOCKS5 proxy (Tor) ────────────────────────────────────────────────────
+async def _socks5_connect(host: str, port: int,
+                          proxy_host: str = TOR_PROXY_HOST,
+                          proxy_port: int = TOR_PROXY_PORT,
+                          timeout: float = 30.0,
+                          ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Connect to *host:port* via a SOCKS5 proxy at *proxy_host:proxy_port*.
+
+    Returns (reader, writer) — the same shape as ``asyncio.open_connection``.
+    Raises ``ConnectionError`` on failure (handshake refused, timeout, …).
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(timeout)
+        raw_sock.setblocking(False)
+
+        await asyncio.wait_for(
+            loop.sock_connect(raw_sock, (proxy_host, proxy_port)),
+            timeout=timeout,
+        )
+
+        # ── 1. SOCKS5 greet (no auth) ──────────────────────────────────────
+        greet = bytes([0x05, 0x01, 0x00])
+        await asyncio.wait_for(
+            loop.sock_sendall(raw_sock, greet), timeout=timeout,
+        )
+        resp = await asyncio.wait_for(
+            loop.sock_recv(raw_sock, 2), timeout=timeout,
+        )
+        if resp != bytes([0x05, 0x00]):
+            raw_sock.close()
+            raise ConnectionError(f"SOCKS5: proxy rejected no-auth (got {resp.hex()})")
+
+        # ── 2. CONNECT request (domain name) ───────────────────────────────
+        host_bytes = host.encode("idna")
+        if len(host_bytes) > 255:
+            raise ConnectionError("SOCKS5: hostname too long")
+        req = bytes([0x05, 0x01, 0x00, 0x03, len(host_bytes)]) \
+              + host_bytes \
+              + struct.pack("!H", port)
+        await asyncio.wait_for(
+            loop.sock_sendall(raw_sock, req), timeout=timeout,
+        )
+        # Response: version(1) + status(1) + reserved(1) + atyp(1) + bind(4-16) + port(2)
+        resp = await asyncio.wait_for(
+            loop.sock_recv(raw_sock, 255), timeout=timeout,
+        )
+        if len(resp) < 2:
+            raw_sock.close()
+            raise ConnectionError("SOCKS5: truncated connect response")
+        if resp[1] != 0x00:
+            statuses = {
+                0x01: "general failure", 0x02: "not allowed",
+                0x03: "network unreachable", 0x04: "host unreachable",
+                0x05: "connection refused", 0x06: "TTL expired",
+                0x07: "command not supported", 0x08: "address type not supported",
+            }
+            raw_sock.close()
+            raise ConnectionError(
+                f"SOCKS5: connect failed — {statuses.get(resp[1], f'0x{resp[1]:02x}')}")
+
+        raw_sock.setblocking(True)
+        reader = asyncio.StreamReader(limit=2 ** 20)
+        protocol = asyncio.StreamReaderProtocol(reader)
+        await loop.connect_accepted_socket(
+            lambda: protocol, raw_sock,
+        )
+        writer = asyncio.StreamWriter(raw_sock, protocol, reader, loop)
+        return reader, writer
+
+    except asyncio.TimeoutError:
+        raise ConnectionError(f"SOCKS5: connection to {proxy_host}:{proxy_port} timed out")
+
+
 class ScoringEngine:
     def __init__(self, ai_detector: EnsembleAIDetector):
         self.ai_detector      = ai_detector
@@ -2721,11 +2960,13 @@ if SASL_MECHANISM == "EXTERNAL" and SASL_CERT and SASL_KEY:
 # =========================
 class IRCClient:
     def __init__(self, server: str, port: int, nick: str, ui_queue: asyncio.Queue,
-                 scoring_engine: ScoringEngine, use_ssl: bool = True):
+                 scoring_engine: ScoringEngine, use_ssl: bool = True,
+                 use_tor: bool = False):
         self.server = server
         self.port = port
         self.nick = nick
         self.use_ssl = use_ssl
+        self.use_tor = use_tor
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.ui_queue = ui_queue
@@ -2786,19 +3027,41 @@ class IRCClient:
         return f"{self.server}:{self.port}"
 
     async def connect(self) -> None:
+        via = " (via Tor)" if self.use_tor else ""
         proto = "SSL" if self.use_ssl else "plain"
-        await self.ui_queue.put(("status", f"Connecting to {self.server}:{self.port} ({proto})..."))
+        await self.ui_queue.put(("status", f"Connecting to {self.server}:{self.port} ({proto}{via})..."))
         try:
             # 30-second connect timeout prevents hangs on unreachable hosts.
             # limit=2^20 (1 MiB) sets the StreamReader internal buffer; the default
             # 64 KB can stall on fast servers that send large NAMES / MOTD bursts.
-            self.reader, self.writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    self.server, self.port,
-                    ssl=_SSL_CTX if self.use_ssl else None,
-                    limit=2 ** 20),
-                timeout=30.0,
-            )
+            if self.use_tor:
+                self.reader, self.writer = await asyncio.wait_for(
+                    _socks5_connect(self.server, self.port),
+                    timeout=30.0,
+                )
+                if self.use_ssl:
+                    loop = asyncio.get_running_loop()
+                    raw_sock = self.writer.transport.get_extra_info("socket")
+                    ssl_sock = await loop.run_in_executor(
+                        None, lambda: _SSL_CTX.wrap_socket(
+                            raw_sock, server_hostname=self.server,
+                            do_handshake_on_connect=True))
+                    ssl_sock.setblocking(False)
+                    ssl_reader = asyncio.StreamReader(limit=2**20)
+                    ssl_protocol = asyncio.StreamReaderProtocol(ssl_reader)
+                    await loop.connect_accepted_socket(
+                        lambda: ssl_protocol, ssl_sock)
+                    self.writer = asyncio.StreamWriter(
+                        ssl_sock, ssl_protocol, ssl_reader, loop)
+                    self.reader = ssl_reader
+            else:
+                self.reader, self.writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        self.server, self.port,
+                        ssl=_SSL_CTX if self.use_ssl else None,
+                        limit=2 ** 20),
+                    timeout=30.0,
+                )
         except asyncio.TimeoutError:
             raise ConnectionError(
                 f"Connection to {self.server}:{self.port} timed out after 30 s")
@@ -2822,8 +3085,9 @@ class IRCClient:
                     raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
             except Exception:
                 pass  # socket options are best-effort
+        via = " via Tor" if self.use_tor else ""
         conn_label = "SSL connection" if self.use_ssl else "Connection"
-        await self.ui_queue.put(("status", f"{conn_label} established to {self.server}:{self.port}"))
+        await self.ui_queue.put(("status", f"{conn_label}{via} established to {self.server}:{self.port}"))
         # Flush any stale messages queued from a previous (failed) connection
         # so they are not replayed on the new session.
         while not self._send_queue.empty():
@@ -4989,6 +5253,25 @@ class TUI:
         # Auto-fetch link metadata (title, image info, domain warnings)
         self.link_preview_enabled: bool = True
 
+        # ── Built-in bouncer ──────────────────────────────────────────────────────
+        self._bouncer_enabled: bool = True         # master toggle
+        self._bouncer_detached: bool = False       # TUI hidden, IRC still connected
+        self._bouncer_buffer  = BouncerBuffer()
+        # Load bouncer config (server-side playback settings)
+        _bc = load_irc_config().get("bouncer", {})
+        self._bouncer_enabled = _bc.get("enabled", True)
+        self._bouncer_detached = _bc.get("detached", False)
+
+        # ── GPG ───────────────────────────────────────────────────────────────────
+        self._gpg_enabled: bool = _gpg_available()
+        self._gpg_key_fp: str = ""   # default signing key fingerprint
+        _gc = load_irc_config().get("gpg", {})
+        self._gpg_key_fp = _gc.get("key_fingerprint", "")
+
+        # ── Tor ───────────────────────────────────────────────────────────────────
+        self._use_tor: bool = load_irc_config().get("tor", {}).get("enabled", False)
+        self.client.use_tor = self._use_tor
+
     # ── Multi-server helpers ─────────────────────────────────────────────────
 
     def _wk(self, server_id: str, name: str) -> str:
@@ -6010,6 +6293,14 @@ class TUI:
         self.input_win.erase()
         self.input_win.border()
 
+        # BNC indicator in top-right corner of the border
+        if self._bouncer_detached and self._bouncer_enabled:
+            try:
+                _, w = self.input_win.getmaxyx()
+                self.input_win.addstr(0, max(2, w - 8), "[BNC]", curses.A_BOLD)
+            except curses.error:
+                pass
+
         self._draw_tabs()
 
         # Show current send-target in the prompt so the user always knows where
@@ -6812,6 +7103,12 @@ class TUI:
         h["seen"]         = self._slash_seen
         h["tell"]         = self._slash_tell
         h["x0"]           = self._slash_x0
+        h["bouncer"]      = self._slash_bouncer
+        h["bnc"]          = self._slash_bouncer
+        h["detach"]       = self._slash_detach
+        h["attach"]       = self._slash_attach
+        h["pgp"]          = self._slash_pgp
+        h["tor"]          = self._slash_tor
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -7514,7 +7811,8 @@ class TUI:
         srv_raw_queue: asyncio.Queue = asyncio.Queue()
         new_scoring   = ScoringEngine(self.client.scoring.ai_detector)
         new_client    = IRCClient(new_host, new_port, nick, srv_raw_queue,
-                                  new_scoring, use_ssl=use_ssl)
+                                  new_scoring, use_ssl=use_ssl,
+                                  use_tor=self._use_tor)
         new_ctx = ServerContext(new_sid, new_client)
         self.servers[new_sid] = new_ctx
 
@@ -8070,6 +8368,176 @@ class TUI:
         client.send_raw(f"PRIVMSG *status :{text}")
         await self.ui_queue.put(("status", f">>> *status: {text}"))
 
+    # ── BNC (built-in bouncer) ──────────────────────────────────────────────
+    async def _slash_bouncer(self, args, extra, line):
+        text = line[9:].strip().lower()  # strip "/bouncer "
+        parts = text.split()
+        sub = parts[0] if parts else ""
+        if sub == "on":
+            self._bouncer_enabled = True
+            self._save_bouncer_config()
+            await self.ui_queue.put(("status", "BNC enabled — messages will buffer when detached"))
+        elif sub == "off":
+            self._bouncer_enabled = False
+            self._save_bouncer_config()
+            await self.ui_queue.put(("status", "BNC disabled"))
+        elif sub == "status":
+            await self.ui_queue.put(("status",
+                f"BNC: {'ON' if self._bouncer_enabled else 'OFF'}  "
+                f"Detached: {self._bouncer_detached}  "
+                f"Buffered: {self._bouncer_buffer.count}"))
+        elif sub in ("detach", "hide"):
+            self._bouncer_detached = True
+            self._save_bouncer_config()
+            await self.ui_queue.put(("status", "BNC: detached (IRC stays connected, messages buffer)"))
+        elif sub in ("attach", "show"):
+            await self._do_attach()
+        elif sub == "replay":
+            n = self._bouncer_buffer.replay(self.ui_queue)
+            await self.ui_queue.put(("status", f"BNC: replayed {n} buffered messages"))
+        elif sub == "clear":
+            self._bouncer_buffer.clear()
+            await self.ui_queue.put(("status", "BNC: buffer cleared"))
+        else:
+            await self.ui_queue.put(("status",
+                "Usage: /bouncer on|off|status|detach|attach|replay|clear"))
+
+    async def _slash_detach(self, args, extra, line):
+        """Convenience alias: /detach"""
+        if self._bouncer_enabled:
+            self._bouncer_detached = True
+            self._save_bouncer_config()
+            await self.ui_queue.put(("status", "BNC: detached"))
+        else:
+            await self.ui_queue.put(("status", "BNC is off — enable with /bouncer on"))
+
+    async def _slash_attach(self, args, extra, line):
+        """Convenience alias: /attach"""
+        if self._bouncer_detached:
+            await self._do_attach()
+        else:
+            await self.ui_queue.put(("status", "BNC: already attached"))
+
+    async def _do_attach(self) -> None:
+        self._bouncer_detached = False
+        n = self._bouncer_buffer.replay(self.ui_queue)
+        self._save_bouncer_config()
+        await self.ui_queue.put(("status", f"BNC: attached — replayed {n} buffered messages"))
+
+    def _save_bouncer_config(self) -> None:
+        cfg = load_irc_config()
+        cfg.setdefault("bouncer", {})["enabled"]  = self._bouncer_enabled
+        cfg.setdefault("bouncer", {})["detached"] = self._bouncer_detached
+        cfg.setdefault("gpg", {})["key_fingerprint"] = self._gpg_key_fp
+        save_irc_config(cfg)
+
+    # ── PGP / GPG ───────────────────────────────────────────────────────────
+    async def _slash_pgp(self, args, extra, line):
+        text = line[5:].strip().lower()
+        parts = text.split(maxsplit=2)
+        sub = parts[0] if parts else ""
+        if not self._gpg_enabled:
+            await self.ui_queue.put(("status", "GPG binary not found — set IRC_GPG_BINARY"))
+            return
+        if sub == "key":
+            fp = parts[1] if len(parts) > 1 else ""
+            if not fp:
+                await self.ui_queue.put(("status", f"Current key: {self._gpg_key_fp or '(none)'}"))
+                return
+            self._gpg_key_fp = fp
+            self._save_bouncer_config()
+            await self.ui_queue.put(("status", f"GPG default key set to {fp}"))
+        elif sub == "encrypt":
+            rest = (parts[1] if len(parts) > 1 else "") + (" " + parts[2] if len(parts) > 2 else "")
+            if not rest or " " not in rest:
+                await self.ui_queue.put(("status", "Usage: /pgp encrypt <recipient> <message>"))
+                return
+            recip, *msg_parts = rest.split(" ", 1)
+            msg = msg_parts[0] if msg_parts else ""
+            ct = _gpg_encrypt(msg, recip)
+            if ct:
+                win = self.get_current_window()
+                win.add_line(f"[PGP] encrypted for {recip}: {ct[:120]}...")
+                await self.ui_queue.put(("status", "Message encrypted (ciphertext shown in window)"))
+            else:
+                await self.ui_queue.put(("status", f"GPG encryption failed (key for {recip}?)"))
+        elif sub == "decrypt":
+            rest = (parts[1] if len(parts) > 1 else "") + (" " + parts[2] if len(parts) > 2 else "")
+            pt = _gpg_decrypt(rest)
+            if pt:
+                win = self.get_current_window()
+                win.add_line(f"[PGP] decrypted: {pt}")
+                await self.ui_queue.put(("status", "Message decrypted"))
+            else:
+                await self.ui_queue.put(("status", "GPG decryption failed"))
+        elif sub == "sign":
+            rest = (parts[1] if len(parts) > 1 else "") + (" " + parts[2] if len(parts) > 2 else "")
+            sig = _gpg_sign(rest, self._gpg_key_fp)
+            if sig:
+                win = self.get_current_window()
+                win.add_line(f"[PGP] signature: {sig[:120]}...")
+                await self.ui_queue.put(("status", "Message signed"))
+            else:
+                await self.ui_queue.put(("status", "GPG signing failed"))
+        elif sub == "verify":
+            # /pgp verify <message> <base64-signature>
+            if len(parts) < 3:
+                await self.ui_queue.put(("status", "Usage: /pgp verify <message> <signature>"))
+                return
+            key = _gpg_verify(parts[1], parts[2])
+            if key:
+                await self.ui_queue.put(("status", f"Verified — signed by {key}"))
+            else:
+                await self.ui_queue.put(("status", "GPG verification failed"))
+        elif sub in ("list", "keys"):
+            try:
+                proc = subprocess.run(
+                    [GPG_BINARY, "--list-keys", "--keyid-format", "long"],
+                    capture_output=True, timeout=10,
+                )
+                out = proc.stdout.decode("utf-8", errors="replace")
+                win = self.get_current_window()
+                win.add_line("--- GPG public keys ---")
+                for line_text in out.splitlines():
+                    win.add_line(f"  {line_text}")
+            except Exception as e:
+                await self.ui_queue.put(("status", f"GPG keys failed: {e}"))
+        else:
+            await self.ui_queue.put(("status",
+                "Usage: /pgp key [fp] | encrypt <nick> <msg> | decrypt <b64> | "
+                "sign <msg> | verify <msg> <sig> | list"))
+
+    # ── Tor ─────────────────────────────────────────────────────────────────
+    async def _slash_tor(self, args, extra, line):
+        text = (args + " " + extra).strip().lower()
+        parts = text.split()
+        sub = parts[0] if parts else ""
+        if sub == "on":
+            self._use_tor = True
+            self.client.use_tor = True
+            for ctx in self.servers.values():
+                ctx.client.use_tor = True
+            self._save_tor_config()
+            await self.ui_queue.put(("status", "Tor enabled — new connections route through SOCKS5"))
+        elif sub == "off":
+            self._use_tor = False
+            self.client.use_tor = False
+            for ctx in self.servers.values():
+                ctx.client.use_tor = False
+            self._save_tor_config()
+            await self.ui_queue.put(("status", "Tor disabled — new connections use direct TCP"))
+        elif sub in ("status", ""):
+            await self.ui_queue.put(("status",
+                f"Tor: {'ON' if self._use_tor else 'OFF'}  "
+                f"proxy: {TOR_PROXY_HOST}:{TOR_PROXY_PORT}"))
+        else:
+            await self.ui_queue.put(("status", "Usage: /tor on|off|status"))
+
+    def _save_tor_config(self) -> None:
+        cfg = load_irc_config()
+        cfg.setdefault("tor", {})["enabled"] = self._use_tor
+        save_irc_config(cfg)
+
     async def _slash_jitsi(self, args, extra, line):
         win = self.get_current_window()
         if win.is_channel or win.name in ("*status*", "*dashboard*"):
@@ -8623,6 +9091,7 @@ class TUI:
         _H("Connection")
         _E("/server [-ssl] <host> [port]", "Add a parallel server connection (SSL with -ssl, else plain)")
         _E("/reconnect",                   "Drop and re-establish the current connection")
+        _E("/tor on|off|status",           "Route IRC connections through Tor SOCKS5 proxy")
         _E("/replay [on|off|n]",           "Request chat history replay via CHATHISTORY (needs /replay on)")
         _E("/register <account|*> <email> <pw>","Register an account via draft/account-registration")
         _E("/pem [/path/to.pem]",          "Generate NIST P-256 key pair for SASL ECDSA auth")
@@ -8643,6 +9112,18 @@ class TUI:
         _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
         _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
         _C("  Left-click a nick in userlist or chat → /query    Left-click header → switch channel")
+        _C("")
+        _H("BNC & GPG & Tor")
+        _E("/bouncer on|off|status|detach|attach|replay","Built-in bouncer: buffer msgs when detached, replay on attach")
+        _E("/detach",                         "Shortcut for /bouncer detach")
+        _E("/attach",                         "Shortcut for /bouncer attach")
+        _E("/pgp key [fp]",                   "Set signing key; with no arg, show current key")
+        _E("/pgp encrypt <nick> <msg>",       "Encrypt a message for nick's GPG key")
+        _E("/pgp decrypt <b64>",              "Decrypt a base64-encoded GPG message")
+        _E("/pgp sign <msg>",                 "Sign a message with your GPG key")
+        _E("/pgp verify <msg> <sig>",         "Verify a detached signature")
+        _E("/pgp list",                       "List GPG public keys in your keyring")
+        _E("/tor on|off|status",              "Route IRC connections through Tor SOCKS5 proxy")
         _C("")
         _H("Plugins")
         _E("/loadplugin <path>",   "Load a Python plugin file; its setup(api) is called")
@@ -8696,6 +9177,10 @@ class TUI:
             "  /autotranslate  toggle CJK → English (default: on)",
             "── Connection ─────────────────────────────────────────────",
             "  /server [-ssl] <host> [port]  (parallel; -ssl for TLS)  /reconnect",
+            "── BNC & GPG & Tor ─────────────────────────────────────────",
+            "  /bouncer on|off|status|detach|attach|replay   built-in BNC",
+            "  /pgp encrypt|decrypt|sign|verify|key|list     GPG crypto",
+            "  /tor on|off|status                            Tor SOCKS5 proxy",
             "── Interface ──────────────────────────────────────────────",
             "  /win <n>  /close (/wc)  /clear  /links  /list [pat]  /lf <kw|min=n>",
             "  /alias [name] [expansion]  list/set/remove command aliases",
@@ -9622,6 +10107,9 @@ class TUI:
             try:
                 while n < 64:
                     event = self.ui_queue.get_nowait()
+                    # Buffer to disk when detached (bouncer mode)
+                    if self._bouncer_detached and self._bouncer_enabled:
+                        self._bouncer_buffer.append(*event)
                     try:
                         await self.handle_event(event)
                     except Exception as _ev_exc:
@@ -9633,12 +10121,21 @@ class TUI:
             except asyncio.QueueEmpty:
                 pass
 
-            # ── 3b. Outgoing +typing=paused after 5 s of inactivity ──────────────
+            # ── 3b. When detached, buffer incoming events to disk ────────────────
+            if self._bouncer_detached and self._bouncer_enabled and n > 0:
+                pass  # events were already consumed by handle_event above
+
+            # ── 3c. Outgoing +typing=paused after 5 s of inactivity ──────────────
             if (self._typing_out_state == "active"
                     and self._typing_out_target
                     and self.input_buffer.strip()
                     and time.monotonic() - self._typing_last_key >= 5.0):
                 self._send_typing("paused")
+
+            # ── 3d. When detached, skip rendering entirely ───────────────────────
+            if self._bouncer_detached and self._bouncer_enabled:
+                await asyncio.sleep(0.016)
+                continue
 
             # ── 4. Dashboard auto-refresh ─────────────────────────────────────────
             now = time.monotonic()
@@ -9701,7 +10198,9 @@ async def main_curses(stdscr, ai_detector: EnsembleAIDetector):
 
     ui_queue: asyncio.Queue = asyncio.Queue()
     scoring_engine = ScoringEngine(ai_detector)
-    client = IRCClient(DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, ui_queue, scoring_engine)
+    _use_tor = load_irc_config().get("tor", {}).get("enabled", False)
+    client = IRCClient(DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, ui_queue, scoring_engine,
+                       use_tor=_use_tor)
     tui = TUI(stdscr, ui_queue, client)
 
     # Initial dashboard
