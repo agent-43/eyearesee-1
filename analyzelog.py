@@ -2470,6 +2470,12 @@ class _Color:
             cls.enabled = False
 
 
+_STRIP_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][0-9;]*\x1b\\|\x1b[\(\)][A-Z]")
+
+def strip_ansi(text: str) -> str:
+    return _STRIP_ANSI_RE.sub("", text)
+
+
 def _color_score(x) -> str:
     """Color a score float by threshold (red ≥ 0.8, yellow ≥ 0.5, green else)."""
     if not isinstance(x, float):
@@ -3581,6 +3587,287 @@ def start_web_server(port: int = 8088, daemon: bool = True) -> HTTPServer:
     t.start()
     return server
 
+# ---------- Web Portal (port 80, dashboard + terminal) --------------------------
+
+@dataclass
+class _DashboardData:
+    log_path: str = ""
+    entries_count: int = 0
+    top_users: list[dict] = field(default_factory=list)
+    hourly: list[dict] = field(default_factory=list)
+    max_hour: int = 0
+    highest_scores: list[dict] = field(default_factory=list)
+    alerts: list[dict] = field(default_factory=list)
+    flagged: list[dict] = field(default_factory=list)
+    prompt: str = "(log) "
+
+def _build_dashboard_data() -> _DashboardData:
+    data = _DashboardData()
+    shell = _current_shell.get("shell")
+    if not shell:
+        return data
+    state = shell.state
+    entries = state.entries
+    data.log_path = state.log_path
+    data.entries_count = len(entries)
+    data.prompt = shell.prompt
+
+    score_keys = ("heu", "bino", "cls", "llama")
+    if entries:
+        user_counts = Counter(e.user for e in entries if e.user)
+        top = user_counts.most_common(15)
+        for user, count in top:
+            u_scores: dict[str, float] = {}
+            u_entries = [e for e in entries if e.user == user]
+            for k in score_keys:
+                vals = []
+                for e in u_entries:
+                    s = _scores_from_raw(e.raw)
+                    v = s.get(k)
+                    if isinstance(v, (int, float)):
+                        vals.append(float(v))
+                u_scores[k] = statistics.mean(vals) if vals else 0.0
+            data.top_users.append({"user": user, "count": count, "scores": u_scores})
+
+        hourly_counts: Counter[int] = Counter()
+        for e in entries:
+            if e.ts:
+                hourly_counts[e.ts.hour] += 1
+        if hourly_counts:
+            data.max_hour = max(hourly_counts.values())
+            for h in range(24):
+                data.hourly.append({"h": h, "cnt": hourly_counts.get(h, 0)})
+
+        # highest scores
+        all_scores: list[tuple[float, str]] = []
+        for e in entries:
+            if e.user:
+                s = _scores_from_raw(e.raw)
+                vals = [v for k in score_keys for v in [s.get(k)] if isinstance(v, (int, float))]
+                if vals:
+                    all_scores.append((statistics.mean(vals), e.user))
+        all_scores.sort(key=lambda x: -x[0])
+        for score, user in all_scores[:10]:
+            data.highest_scores.append({"user": user, "score": score})
+
+    # alerts
+    if state.alert_engine:
+        for rule in state.alert_engine.rules:
+            data.alerts.append({"name": rule.name, "message": rule.message or "", "enabled": rule.enabled})
+
+    # flagged entries
+    for e in entries:
+        s = _scores_from_raw(e.raw)
+        if s.get("flag") and len(data.flagged) < 10:
+            data.flagged.append({"user": e.user or "?", "text": e.text or ""})
+
+    return data
+
+_WEBPORTAL_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>analyzelog</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;color:#00ff41;font-family:Consolas,monospace;font-size:14px;height:100vh;display:flex;flex-direction:column}
+#output{flex:1;overflow-y:auto;padding:12px;white-space:pre-wrap;word-wrap:break-word;line-height:1.5}
+#output div{margin:0}
+#input-line{display:flex;align-items:center;padding:8px 12px;background:#000;border-top:1px solid #0a3a0a}
+#prompt{color:#00ff41;white-space:pre}
+#input{flex:1;background:#0a0a0a;border:1px solid #0a3a0a;color:#00ff41;font:inherit;padding:6px 8px;outline:none;margin-left:4px}
+#input:focus{border-color:#00ff41}
+#input::placeholder{color:#0a3a0a}
+#mode-bar{display:flex;gap:0;padding:4px 0;background:#0a0a0a;border-bottom:1px solid #0a3a0a}
+#mode-bar button{background:#000;color:#00ff41;border:1px solid #0a3a0a;padding:4px 12px;cursor:pointer;font:inherit;font-size:13px}
+#mode-bar button.active{background:#0a3a0a;color:#fff}
+#mode-bar button:first-child{border-radius:4px 0 0 4px}
+#mode-bar button:last-child{border-radius:0 4px 4px 0}
+#dash{flex:1;overflow-y:auto;padding:8px 12px;display:none}
+#dash table{width:100%;border-collapse:collapse;margin-bottom:12px}
+#dash th,#dash td{text-align:left;padding:2px 6px;border-bottom:1px solid #0a3a0a;font-size:13px}
+#dash th{color:#00ff41;font-weight:bold;border-bottom:2px solid #0a3a0a}
+#dash .sc0{color:#00ff41}
+#dash .sc1{color:#ffff00}
+#dash .sc2{color:#ff4444}
+#dash .bar{display:inline-block;height:10px;background:#00ff41;border-radius:2px;vertical-align:middle;margin-right:4px;min-width:2px}
+#dash .bar-warn{background:#ffff00}
+#dash .bar-danger{background:#ff4444}
+#dash .pane{display:inline-block;vertical-align:top;width:24%;padding:0 6px}
+::-webkit-scrollbar{width:8px}
+::-webkit-scrollbar-track{background:#000}
+::-webkit-scrollbar-thumb{background:#0a3a0a;border-radius:4px}
+</style>
+</head>
+<body>
+<div id="mode-bar"><button id="m-term" class="active">Terminal</button><button id="m-dash">Dashboard</button></div>
+<div id="output"></div>
+<div id="dash"></div>
+<div id="input-line"><span id="prompt">(log) </span><input type="text" id="input" autofocus spellcheck="false" autocomplete="off"></div>
+<script>
+var o=document.getElementById('output'),i=document.getElementById('input'),p=document.getElementById('prompt'),h=[],hi=-1,d=document.getElementById('dash'),mt=document.getElementById('m-term'),md=document.getElementById('m-dash'),dashTimer=null,SCORE_KEYS=["heu","bino","cls","llama"];
+function a(t){var x=document.createElement('div');x.textContent=t;o.appendChild(x);o.scrollTop=o.scrollHeight}
+function renderDash(data){
+ var h='<div style="color:#00ff41;font-weight:bold;margin-bottom:6px">DASHBOARD &mdash; '+esc(data.log_path)+' ('+data.entries_count+' entries)</div>';
+ h+='<div style="display:flex;gap:8px;flex-wrap:wrap">';
+ h+='<div class="pane"><table><tr><th>#</th><th>MSGS</th>';
+ SCORE_KEYS.forEach(function(k){h+='<th>'+k+'</th>'});
+ h+='<th>USER</th></tr>';
+ data.top_users.forEach(function(u,j){
+  h+='<tr><td>'+(j+1)+'</td><td>'+u.count+'</td>';
+  SCORE_KEYS.forEach(function(k){var v=u.scores[k]||0;h+='<td class="'+(v<0.4?'sc0':v<0.7?'sc1':'sc2')+'">'+v.toFixed(2)+'</td>'});
+  h+='<td>'+esc(u.user)+'</td></tr>';
+ });
+ h+='</table></div>';
+ h+='<div class="pane"><table><tr><th>HR</th><th colspan="2">ACTIVITY</th></tr>';
+ var mh=data.max_hour||1;
+ data.hourly.forEach(function(r){
+  var bw=Math.round(r.cnt/mh*40),cls=r.cnt/mh<0.3?'':r.cnt/mh<0.7?'bar-warn':'bar-danger';
+  h+='<tr><td>'+('0'+r.h).slice(-2)+'</td><td><span class="bar '+cls+'" style="width:'+bw+'px"></span></td><td>'+r.cnt+'</td></tr>';
+ });
+ h+='</table></div>';
+ h+='<div class="pane"><table><tr><th>SCORE</th><th>USER</th></tr>';
+ data.highest_scores.forEach(function(r){
+  var s=r.score||0;h+='<tr><td class="'+(s<0.4?'sc0':s<0.7?'sc1':'sc2')+'">'+s.toFixed(2)+'</td><td>'+esc(r.user)+'</td></tr>';
+ });
+ h+='</table></div>';
+ h+='<div class="pane"><table><tr><th colspan="2">ALERTS</th></tr>';
+ if(data.alerts.length){
+  data.alerts.forEach(function(r){
+   var ic=r.enabled?'&#9679;':'&#9678;';var c=r.enabled?'#00ff41':'#555';
+   h+='<tr><td style="color:'+c+'">'+ic+'</td><td>'+esc(r.name)+': '+esc((r.message||'').slice(0,40))+'</td></tr>';
+  });
+ }else{h+='<tr><td colspan="2" style="color:#888">(no alert engine)</td></tr>'}
+ if(data.flagged.length){
+  h+='<tr><td colspan="2" style="color:#ff4444;font-weight:bold;padding-top:8px">RECENT FLAGGED</td></tr>';
+  data.flagged.forEach(function(f){
+   h+='<tr><td colspan="2" style="color:#ffff00">'+esc(f.user)+': '+esc((f.text||'').slice(0,40))+'</td></tr>';
+  });
+ }
+ h+='</table></div></div>';
+ d.innerHTML=h;
+}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function setMode(m){
+ if(m==='dash'){
+  o.style.display='none';d.style.display='block';
+  mt.className='';md.className='active';
+  i.disabled=true;i.style.opacity='0.3';
+  if(dashTimer){clearInterval(dashTimer)}
+  function ld(){fetch('/api/dashboard').then(function(r){return r.json()}).then(renderDash).catch(function(){})}
+  dashTimer=setInterval(ld,2000);ld();
+ }else{
+  o.style.display='flex';d.style.display='none';
+  md.className='';mt.className='active';
+  i.disabled=false;i.style.opacity='1';i.focus();
+  if(dashTimer){clearInterval(dashTimer);dashTimer=null}
+ }
+}
+mt.addEventListener('click',function(){setMode('term')});
+md.addEventListener('click',function(){setMode('dash')});
+i.addEventListener('keydown',function(e){
+ if(e.key==='Enter'){
+  var c=this.value.trim();if(!c)return;
+  a(p.textContent+c);h.push(c);hi=h.length;this.value='';
+  fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:c})})
+  .then(function(r){return r.json()}).then(function(d){if(d.output)a(d.output);if(d.prompt)p.textContent=d.prompt})
+  .catch(function(e){a('Error: '+e.message)})
+ }else if(e.key==='ArrowUp'){e.preventDefault();if(hi>0){hi--;this.value=h[hi]}}
+ else if(e.key==='ArrowDown'){e.preventDefault();if(hi<h.length-1){hi++;this.value=h[hi]}else{hi=h.length;this.value=''}}
+});
+document.getElementById('out-clear')&&document.getElementById('out-clear').addEventListener('click',function(){o.innerHTML=''});
+fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:''})})
+.then(function(r){return r.json()}).then(function(d){if(d.output)a(d.output);if(d.prompt)p.textContent=d.prompt})
+.catch(function(e){a('Error: '+e.message)});
+</script>
+</body>
+</html>"""
+
+class WebPortalHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/dashboard":
+            data = _build_dashboard_data()
+            self._json_response(json.dumps({
+                "log_path": data.log_path,
+                "entries_count": data.entries_count,
+                "top_users": data.top_users,
+                "hourly": data.hourly,
+                "max_hour": data.max_hour,
+                "highest_scores": data.highest_scores,
+                "alerts": data.alerts,
+                "flagged": data.flagged,
+            }, default=str))
+        else:
+            self._html_response(_WEBPORTAL_HTML)
+
+    def do_POST(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/command":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8") if length else "{}"
+            try:
+                data = json.loads(body)
+            except (json.JSONDecodeError, ValueError):
+                data = {}
+            command = data.get("command", "")
+            shell = _current_shell.get("shell")
+            output = ""
+            prompt = "(log) "
+            if shell:
+                prompt = shell.prompt
+                if command:
+                    old_pager = shell.state.pager_enabled
+                    old_color = _Color.enabled
+                    shell.state.pager_enabled = False
+                    _Color.enabled = False
+                    old_stdout = sys.stdout
+                    old_stderr = sys.stderr
+                    buf = io.StringIO()
+                    sys.stdout = buf
+                    sys.stderr = buf
+                    try:
+                        shell.onecmd(command)
+                    except SystemExit:
+                        pass
+                    except Exception as exc:
+                        buf.write(f"Error: {exc}")
+                    sys.stdout = old_stdout
+                    sys.stderr = old_stderr
+                    _Color.enabled = old_color
+                    shell.state.pager_enabled = old_pager
+                    output = strip_ansi(buf.getvalue().rstrip())
+                    prompt = shell.prompt
+                else:
+                    output = strip_ansi(shell.intro.rstrip())
+            self._json_response(json.dumps({"output": output, "prompt": prompt}))
+        else:
+            self.send_error(404)
+
+    def _json_response(self, data: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(data.encode())
+
+    def _html_response(self, html: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(html.encode())
+
+    def log_message(self, format, *args) -> None:
+        pass
+
+
+def start_webportal(port: int = 80) -> HTTPServer:
+    server = HTTPServer(("0.0.0.0", port), WebPortalHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
+
+
 # ---------- Slack/Discord webhook (#25) ---------------------------------------
 
 def send_webhook(url: str, message: str, webhook_type: str = "slack") -> bool:
@@ -3662,6 +3949,7 @@ class ShellState:
     alert_engine: AlertEngine = field(default_factory=AlertEngine)
     aggregator: MultiLogAggregator = field(default_factory=MultiLogAggregator)
     web_server: "HTTPServer | None" = None
+    web_portal_server: "HTTPServer | None" = None
     webhook_url: str = ""
     webhook_type: str = "slack"
     cron_output: str = ""
@@ -5320,6 +5608,29 @@ class LogShell(cmd.Cmd):
                 self.state.web_server.shutdown()
                 self.state.web_server = None
                 print("Web server stopped.")
+            else:
+                print("(not running)")
+
+    def do_webportal(self, arg: str) -> None:
+        """webportal {enable | disable | status}   Start/stop the web-based console on port 80."""
+        parts = self._split(arg)
+        sub = parts[0].lower() if parts else "status"
+        if sub == "status":
+            if self.state.web_portal_server:
+                print(f"Web portal running on port {self.state.web_portal_server.server_port}")
+            else:
+                print("(web portal not running)")
+        elif sub == "enable":
+            if self.state.web_portal_server:
+                print("(web portal already running)")
+                return
+            self.state.web_portal_server = start_webportal(80)
+            print("Web portal enabled at http://localhost:80")
+        elif sub == "disable":
+            if self.state.web_portal_server:
+                self.state.web_portal_server.shutdown()
+                self.state.web_portal_server = None
+                print("Web portal disabled.")
             else:
                 print("(not running)")
 
