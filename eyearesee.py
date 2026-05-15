@@ -612,6 +612,64 @@ _SPAM_DOMAINS = frozenset({
 })
 
 
+# ── x0.at upload support ──────────────────────────────────────────────────
+try:
+    from PIL import Image as _PILImage
+    PIL_AVAILABLE = True
+except ImportError:
+    _PILImage = None
+    PIL_AVAILABLE = False
+
+_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif"})
+
+def _compress_image(filepath: str, max_size: int = 1920, quality: int = 85) -> Optional[bytes]:
+    """Compress an image file. Returns compressed JPEG bytes or None on failure."""
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        img = _PILImage.open(filepath)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        w, h = img.size
+        if w > max_size or h > max_size:
+            ratio = min(max_size / w, max_size / h)
+            img = img.resize((int(w * ratio), int(h * ratio)), _PILImage.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+def _upload_to_x0(filepath: str) -> Optional[str]:
+    """Upload a file to x0.at. Returns the URL or None on failure."""
+    try:
+        compressed = _compress_image(filepath)
+        data: bytes
+        if compressed is not None:
+            data = compressed
+        else:
+            with open(filepath, "rb") as f:
+                data = f.read()
+        boundary = uuid.uuid4().hex
+        body = (
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="image.jpg"\r\n'
+            b"Content-Type: application/octet-stream\r\n\r\n"
+            + data +
+            b"\r\n--" + boundary.encode() + b"--\r\n"
+        )
+        req = urllib.request.Request(
+            "https://x0.at/",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            url = resp.read().decode("utf-8").strip()
+            return url if url else None
+    except Exception:
+        return None
+
+
 def _parse_server_time(ts: str) -> str:
     """Convert IRCv3 server-time tag value (ISO 8601 UTC) to local [HH:MM] string."""
     try:
@@ -2307,6 +2365,9 @@ class EnsembleAIDetector:
             return "PEFT not available"
         if not self._init_lora():
             return "failed to init LoRA"
+        # Limit PyTorch to 1 thread so BLAS doesn't starve the event loop
+        _old_torch_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
         from torch.utils.data import DataLoader, TensorDataset
         texts = positive_texts + negative_texts
         labels = [1] * len(positive_texts) + [0] * len(negative_texts)
@@ -2334,9 +2395,9 @@ class EnsembleAIDetector:
             self._lora_model.save_pretrained(output_path)
         except Exception as e:
             return f"save failed: {e}"
+        finally:
+            torch.set_num_threads(_old_torch_threads)
         self._lora_loaded = True
-        # Swap reference so _classifier_score picks up the adapted model
-        # (already handled via _lora_loaded flag in _classifier_score)
         return output_path
 
 # =========================
@@ -6428,6 +6489,7 @@ class TUI:
         h["explain"]      = self._slash_explain
         h["fingerprint"]  = self._slash_fingerprint
         h["cluster"]      = self._slash_cluster
+        h["x0"]           = self._slash_x0
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -6464,6 +6526,16 @@ class TUI:
                 else:
                     self._active_client().send_raw(line[1:])
         else:
+            stripped_line = line.strip()
+            ext = os.path.splitext(stripped_line)[1].lower()
+            if ext in _IMAGE_EXTENSIONS and os.path.isfile(stripped_line):
+                await self.ui_queue.put(("status", f"Auto-uploading {stripped_line} to x0.at\u2026"))
+                loop = asyncio.get_event_loop()
+                url = await loop.run_in_executor(_IO_EXECUTOR, _upload_to_x0, stripped_line)
+                if url:
+                    line = url
+                else:
+                    await self.ui_queue.put(("status", "x0.at auto-upload failed, sending as text."))
             await self._send_plain_text(line)
         self._chat_dirty = True
         self._input_dirty = True
@@ -8118,6 +8190,8 @@ class TUI:
         _E("/react <emoji>",                "React to last message with +react TAGMSG (IRCv3 message-tags)")
         _E("/ml <l1> | <l2> | ...",         "Send multiline message via draft/multiline batch")
         _E("/redact [reason]",              "Redact last message in this window (message-redaction)")
+        _E("/tagmsg <target> key=val[;k=v]","Send a TAGMSG with client-only tags to a target")
+        _E("/x0 <path>",                    "Upload an image file to x0.at and share the URL")
         _C("")
         _H("Channels")
         _E("/join <channel>",               "Join a channel (# is added automatically if omitted)")
@@ -8127,6 +8201,7 @@ class TUI:
         _E("/kick <chan> <nick> [reason]",  "Kick a user from the channel")
         _E("/invite <nick> [channel]",      "Invite a user to a channel")
         _E("/mode [channel] [modes]",       "Get or set channel modes (no args = show current)")
+        _E("/autojoin +<chan> | -<chan> | list | clear","Add/remove/list/clear auto-join channels")
         _C("")
         _H("Operator")
         _E("/op <nick>",    "Grant operator status  (+o)")
@@ -8147,6 +8222,9 @@ class TUI:
         _E("/unignore <nick>",              "Stop ignoring nick")
         _E("/away [message]",               "Set away status with optional message")
         _E("/back",                         "Remove away status")
+        _E("/monitor + nick[,…] | - | list | clear | status","Watch nicks for online/offline notifications")
+        _E("/whox [target] [fields]",       "Send a WHOX query with extended fields")
+        _E("/cluster <nick>",               "Show a nick's social circle (adjacency + targets)")
         _C("")
         _H("Services & CTCP")
         _E("/ns <command>",                 "Send command to NickServ  (e.g. /ns identify pw)")
@@ -8160,11 +8238,17 @@ class TUI:
         _E("/unbot <nick>",                 "Remove confirmed-bot status and fingerprint for nick")
         _E("/aitoggle",                     "Enable or disable AI scoring (detection)")
         _E("/logtoggle",                    "Enable or disable AI detection logging to disk (default: on)")
+        _E("/learn_tell <phrase>",          "Add n-grams from a phrase to the AI blocklist")
+        _E("/forget_tell <phrase>",         "Remove n-grams of a phrase from the AI blocklist")
+        _E("/scan_watermark [text]",        "Scan recent msgs or text for LLM watermark patterns")
+        _E("/fingerprint <nick> [min_sim]", "Compare a nick's linguistic fingerprint against all others")
         _C("")
         _H("AI Integration  (Claude + OpenAI + Ollama)")
         _E("/askai [model] <question>",   "Ask AI a question; answer shown in dashboard")
         _E("/summarize [n] [model]",      "Summarize last n msgs in current window (default 50)")
         _E("/model [key]",                "Set/list AI models: opus sonnet haiku gpt4o gpt4 gpt35")
+        _E("/vibe <channel> [n] [model]", "Analyze channel culture using AI")
+        _E("/explain <nick> [model]",     "Analyze a user's behavior using AI")
         _E("/api",                        "Show AI provider key status (Claude/OpenAI/Ollama)")
         _E("/api <VAR_NAME> <value>",     "Set an API key in environment: ANTHROPIC_API_KEY OPENAI_API_KEY OLLAMA_URL")
         _spec = AI_MODELS.get(self.ai_chat_model, {})
@@ -8176,6 +8260,9 @@ class TUI:
         _H("Connection")
         _E("/server [-ssl] <host> [port]", "Add a parallel server connection (SSL with -ssl, else plain)")
         _E("/reconnect",                   "Drop and re-establish the current connection")
+        _E("/replay [on|off|n]",           "Request chat history replay via CHATHISTORY (needs /replay on)")
+        _E("/register <account|*> <email> <pw>","Register an account via draft/account-registration")
+        _E("/pem [/path/to.pem]",          "Generate NIST P-256 key pair for SASL ECDSA auth")
         _C("")
         _H("Windows & Navigation")
         _C("  Tab bar (above input): [1:status] [2:dash] [*3:##chat]  * = unread")
@@ -8203,6 +8290,8 @@ class TUI:
         _E("/quit [message]", "Send quit message and exit")
         _E("/help",           "Brief one-line command reference")
         _E("/commands",       "This full command list")
+        _E("/mute",           "Toggle mention beep on/off (highlight stays active)")
+        _E("/linkpreview",    "Toggle automatic URL link preview on/off")
         _C("")
         self.current_window_index = 0
         self._chat_dirty = True
@@ -8635,6 +8724,27 @@ class TUI:
         for name, cmds in plugins:
             cmds_str = "  ".join(f"/{c}" for c in cmds) if cmds else "(no commands)"
             await self.ui_queue.put(("status", f"[plugin] {name}  {cmds_str}"))
+
+    async def _slash_x0(self, args, extra, line):
+        path = args.strip()
+        if not path:
+            await self.ui_queue.put(("status", "Usage: /x0 <path/to/image>"))
+            return
+        if not os.path.isfile(path):
+            await self.ui_queue.put(("status", f"File not found: {path}"))
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in _IMAGE_EXTENSIONS:
+            await self.ui_queue.put(("status",
+                f"Unsupported file type '{ext}'. Supported: {', '.join(sorted(_IMAGE_EXTENSIONS))}"))
+            return
+        await self.ui_queue.put(("status", f"Uploading {path} to x0.at\u2026"))
+        loop = asyncio.get_event_loop()
+        url = await loop.run_in_executor(_IO_EXECUTOR, _upload_to_x0, path)
+        if url:
+            await self.ui_queue.put(("status", f"Uploaded: {url}"))
+        else:
+            await self.ui_queue.put(("status", "x0.at upload failed."))
 
     def _handle_key(self, ch: int) -> bool:
         """Process a single keycode synchronously.  Returns True if the key was
