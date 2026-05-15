@@ -4701,6 +4701,11 @@ class TUI:
         self._targets: Dict[str, Counter] = {}
         self._ch_activity: Dict[str, Counter] = {}
 
+        # /seen tracking: nick_lower → (unix_ts, message_preview, channel)
+        self._seen_times: Dict[str, Tuple[float, str, str]] = {}
+        # /tell queue: nick_lower → [(from_nick, msg, timestamp), ...]
+        self._tell_queue: Dict[str, List[Tuple[str, str, float]]] = {}
+
         # Performance caches — maintained incrementally to avoid per-frame rebuilds
         # NOTE: _suspect_nicks and _sorted_users are now aliased from the active
         # ServerContext; see _sync_ctx().
@@ -4709,16 +4714,6 @@ class TUI:
         self._mention_re: Optional[re.Pattern] = None   # matches our nick in message body
         self._mention_re_nick: str = ""                  # nick the regex was compiled for
         self._dashboard_dirty = False             # needs rebuild?
-
-        # Mouse support
-        try:
-            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
-            # Some terminals need this to enable mouse reporting
-            print("\033[?1003h", end="")
-        except Exception:
-            pass
-        self._tab_regions: List[Tuple[int, int, int]] = []  # (start_x, end_x, win_index)
-        self._user_list_nicks: List[str] = []               # nicks currently shown in userlist
         self._dashboard_last_update = 0.0         # last rebuild timestamp
         self._dashboard_ota_interval = 5.0        # auto-refresh interval while dashboard is visible
         # "suspects" = normal auto-refreshing suspects view
@@ -5697,9 +5692,7 @@ class TUI:
             thresh      = self.ai_suspect_threshold
             attr_sus    = self._attr_suspect
             attr_normal = self._attr_normal
-            self._user_list_nicks = []
             for i, nick in enumerate(users[:self.chat_height - 2]):
-                self._user_list_nicks.append(nick)
                 ai_pct = self.user_ai_scores.get(nick, 0)
                 mode_char = self._highest_prefix(modes.get(nick, set()))
                 display_nick = (mode_char + nick) if mode_char else nick
@@ -5711,6 +5704,53 @@ class TUI:
                         attr_sus if ai_pct >= thresh else attr_normal)
                 except curses.error:
                     break
+
+    def _handle_tab_click(self, mx: int) -> None:
+        """Switch to the window whose tab label was clicked."""
+        _, w = self.input_win.getmaxyx()
+        usable = w - 2
+
+        multi_server = len(self.servers) > 1
+        labels: List[str] = []
+        for i, win in enumerate(self.windows):
+            name = win.name
+            if name == "*status*":
+                short = "status"
+            elif name == "*dashboard*":
+                short = "dash"
+            elif name.startswith("#"):
+                short = name[:14]
+            else:
+                short = f">{name[:10]}"
+            if multi_server and win.server_id and win.server_id != self._primary_server_id:
+                host = win.server_id.split(":")[0]
+                short = f"{host[:8]}:{short}"
+            is_active = (i == self.current_window_index)
+            has_unread = (name in self._unread_windows and not is_active)
+            labels.append(f"[{'*' if has_unread else ''}{i + 1}:{short}]")
+
+        widths = [len(l) + 1 for l in labels]
+        active = self.current_window_index
+        start = 0
+        if sum(widths) > usable:
+            for j in range(active + 1):
+                if sum(widths[j:active + 1]) <= usable:
+                    start = j
+                    break
+
+        col = 1
+        for i in range(start, len(labels)):
+            label = labels[i]
+            lw = len(label)
+            if col + lw + 1 > usable:
+                break
+            if col <= mx < col + lw:
+                self.current_window_index = i
+                self.current_channel = None
+                self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                self.dirty = True
+                return
+            col += lw + 1
 
     def _draw_tabs(self) -> None:
         """Draw the window tab strip on row 1 of input_win.
@@ -5756,7 +5796,6 @@ class TUI:
                     break
 
         col = 1
-        self._tab_regions = []
         for i in range(start, len(labels)):
             label = labels[i]
             lw = len(label)
@@ -5772,7 +5811,6 @@ class TUI:
                 attr = curses.A_DIM
             try:
                 self.input_win.addstr(1, col, label, attr)
-                self._tab_regions.append((col, col + lw, i))
             except curses.error:
                 pass
             col += lw + 1   # +1 space between tabs
@@ -6062,6 +6100,23 @@ class TUI:
                     self._targets.setdefault(nick, Counter())[maybe] += 1
         self.user_scores[nick] = u_score
         self.user_ai_scores[nick] = rolling_ai
+
+        # /seen tracking
+        nick_lower = nick.lower()
+        msg_preview = (msg[:80] + "\u2026") if len(msg) > 80 else msg
+        self._seen_times[nick_lower] = (time.time(), msg_preview, target)
+
+        # /tell delivery
+        if nick_lower in self._tell_queue and self._tell_queue[nick_lower]:
+            pending = self._tell_queue.pop(nick_lower)
+            _tell_sw = self.window_by_name.get("*status*")
+            if _tell_sw:
+                for _from, _tell_msg, _ts in pending:
+                    _tell_sw.add_line(
+                        f"-!- Tell from {_from} ({time.strftime('%H:%M', time.localtime(_ts))}): "
+                        f"{_tell_msg}")
+                self._chat_dirty = True
+
         if win is not self.get_current_window():
             self._unread_windows.add(win_name)
             self._input_dirty = True
@@ -6503,6 +6558,8 @@ class TUI:
         h["explain"]      = self._slash_explain
         h["fingerprint"]  = self._slash_fingerprint
         h["cluster"]      = self._slash_cluster
+        h["seen"]         = self._slash_seen
+        h["tell"]         = self._slash_tell
         h["x0"]           = self._slash_x0
 
     async def handle_input_line(self, line: str) -> None:
@@ -8131,6 +8188,37 @@ class TUI:
         self._save_aliases()
         await self.ui_queue.put(("status", f"Alias set: {name} → {expansion}"))
 
+    async def _slash_seen(self, args, extra, line):
+        nick = (args + " " + extra).strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /seen <nick>"))
+            return
+        nl = nick.lower()
+        info = self._seen_times.get(nl)
+        if not info:
+            await self.ui_queue.put(("status", f"[seen] No record of '{nick}' in this session"))
+            return
+        ts, preview, channel = info
+        dt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        await self.ui_queue.put(("status",
+            f"[seen] {nick} was last seen in {channel} at {dt}: {preview}"))
+
+    async def _slash_tell(self, args, extra, line):
+        parts = (args + " " + extra).strip().split(maxsplit=1)
+        if len(parts) < 2:
+            await self.ui_queue.put(("status", "Usage: /tell <nick> <message>"))
+            return
+        target_nick, tell_msg = parts
+        tl = target_nick.lower()
+        if tl == self._active_client().nick.lower():
+            await self.ui_queue.put(("status", "[tell] You can't tell yourself"))
+            return
+        now = time.time()
+        self._tell_queue.setdefault(tl, []).append(
+            (self._active_client().nick, tell_msg, now))
+        await self.ui_queue.put(("status",
+            f"[tell] Message for {target_nick} queued ({len(self._tell_queue[tl])} pending)"))
+
     async def _slash_mute(self, args, extra, line):
         self.mention_beep_muted = not self.mention_beep_muted
         state = "muted" if self.mention_beep_muted else "unmuted"
@@ -8236,6 +8324,8 @@ class TUI:
         _E("/unignore <nick>",              "Stop ignoring nick")
         _E("/away [message]",               "Set away status with optional message")
         _E("/back",                         "Remove away status")
+        _E("/seen <nick>",                  "Show when a nick was last seen in this session")
+        _E("/tell <nick> <text>",           "Queue a message for delivery when nick next speaks")
         _E("/monitor + nick[,…] | - | list | clear | status","Watch nicks for online/offline notifications")
         _E("/whox [target] [fields]",       "Send a WHOX query with extended fields")
         _E("/cluster <nick>",               "Show a nick's social circle (adjacency + targets)")
@@ -8292,6 +8382,7 @@ class TUI:
         _C("  Ctrl+N  next window    Tab/Shift+Tab  nick completion    PgUp/PgDn  scroll")
         _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
         _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
+        _C("  Left-click a nick in userlist or chat → /query    Left-click header → switch channel")
         _C("")
         _H("Plugins")
         _E("/loadplugin <path>",   "Load a Python plugin file; its setup(api) is called")
@@ -8351,6 +8442,8 @@ class TUI:
             "  /theme <1-5>  /userlist  Ctrl+N next window",
             "  Tab/Shift+Tab nick-complete  PgUp/Dn scroll",
             "  Left-click a highlighted URL line to open it in the browser",
+            "  Left-click a nick in userlist or chat to open a DM /query",
+            "  Left-click the userlist header to jump to that channel window",
             "  Tab bar: [1:status] [2:dash] [*3:##chat]  * = unread",
             "  /quit [msg]  /commands  (full list)  /help  (this)",
             "  /redraw [channel]  force repaint + reload userlist from server",
@@ -8972,77 +9065,98 @@ class TUI:
                 _, mx, my, _, bstate = curses.getmouse()
             except curses.error:
                 return False
-
-            # 1. Handle Scroll Wheel
-            # BUTTON4_PRESSED = Up, BUTTON5_PRESSED = Down
-            # Some platforms/curses use different values, but these are common.
-            if bstate & (curses.BUTTON4_PRESSED | 0x10000): # Wheel Up
-                win = self.get_current_window()
-                self._wrap_window(win)
-                max_off = max(0, len(win.wrapped_cache) - self._content_height)
-                win.scroll_offset = min(win.scroll_offset + 3, max_off)
-                self._chat_dirty = True
-                self.dirty = True
-                return True
-            elif bstate & (0x200000 | 0x2000000): # Wheel Down (BUTTON5_PRESSED)
-                win = self.get_current_window()
-                win.scroll_offset = max(0, win.scroll_offset - 3)
-                self._chat_dirty = True
-                self.dirty = True
-                return True
-
-            # 2. Check for Click (Button 1)
-            # 0x001F covers release, press, click, double, triple for button 1
+            # Fire on any button-1 event (press or click) regardless of platform
+            # constant differences between ncurses and pdcurses/windows-curses.
+            # Values 1-16 cover: released, pressed, clicked, double, triple.
             if not (bstate & 0x001F):
                 return False
-
-            # A. Click on Tab Bar (height - 3)
-            if my == self.height - 3:
-                for start_x, end_x, win_idx in self._tab_regions:
-                    if start_x <= mx <= end_x:
-                        self.current_window_index = win_idx
-                        self._chat_dirty = self._userlist_dirty = True
-                        self.dirty = True
-                        return True
-
-            # B. Click on User List
-            if mx >= self.width - self.userlist_width and my < self.height - 4:
-                # Header is row 0 of user_win, nicks start at row 1
-                nick_idx = my - 1
-                if 0 <= nick_idx < len(self._user_list_nicks):
-                    nick = self._user_list_nicks[nick_idx]
-                    # Logic: WHOIS the user on click
-                    self._active_client().cmd_whois(nick)
-                    # Also switch to AI dashboard to show their profile?
-                    for i, w in enumerate(self.windows):
-                        if w.name == "*dashboard*":
-                            self.current_window_index = i
-                            break
-                    self._chat_dirty = self._userlist_dirty = True
-                    self.dirty = True
-                    return True
-
-            # C. Click on Chat Area (URL detection)
             chat_w = self.chat_win.getmaxyx()[1]
-            if my >= 1 and my < self.chat_height and mx < chat_w:
-                win = self.get_current_window()
-                self._wrap_window(win)
-                total     = len(win.wrapped_cache)
-                offset    = win.scroll_offset
-                end_idx   = total - offset
-                start_idx = max(0, end_idx - self._content_height)
-                line_idx  = start_idx + (my - 1)
-                if line_idx < total:
-                    url = win.url_map.get(line_idx)
-                    if url:
-                        try:
-                            webbrowser.open(url)
-                            self.window_by_name["*status*"].add_line(f"Opening: {url}")
-                            self._chat_dirty = True
+            if my >= self.chat_height:
+                # Tab bar is on input_win row 1 (absolute row = chat_height + 1)
+                if my == self.chat_height + 1:
+                    self._handle_tab_click(mx)
+                return False
+
+            # Userlist column: click on nick → /query, click on header → switch window
+            if mx >= chat_w and mx < self.width:
+                # Determine which channel the userlist is showing
+                cur_win = self.get_current_window()
+                if cur_win.is_channel and cur_win.name in self.channel_users:
+                    disp_ch = cur_win.name
+                elif self.current_channel and self.current_channel in self.channel_users:
+                    disp_ch = self.current_channel
+                else:
+                    disp_ch = None
+
+                if my == 0 and disp_ch:
+                    # Click on header → switch to that channel window
+                    for i, w in enumerate(self.windows):
+                        if w.name == disp_ch:
+                            self.current_window_index = i
+                            self.current_channel = disp_ch
+                            self._chat_dirty = self._userlist_dirty = self._input_dirty = True
                             self.dirty = True
-                        except Exception:
-                            pass
-                        return True
+                            return True
+                elif my >= 1 and disp_ch:
+                    # Click on a nick → open /query
+                    if disp_ch not in self._sorted_users:
+                        self._sorted_users[disp_ch] = self._sort_users_by_mode(disp_ch)
+                    users = self._sorted_users[disp_ch]
+                    nick_idx = my - 1
+                    if nick_idx < len(users):
+                        target_nick = users[nick_idx]
+                        # Open /query via ensure_window + switch
+                        win = self.ensure_window(target_nick, is_channel=False)
+                        for i, w in enumerate(self.windows):
+                            if w is win:
+                                self.current_window_index = i
+                                self.current_channel = None
+                                self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                                self.dirty = True
+                                return True
+                return False
+
+            if my < 1:
+                return False
+            # Left-click in chat area: open URL if the clicked line is a URL line
+            win = self.get_current_window()
+            self._wrap_window(win)
+            total     = len(win.wrapped_cache)
+            offset    = win.scroll_offset
+            end_idx   = total - offset
+            start_idx = max(0, end_idx - self._content_height)
+            line_idx  = start_idx + (my - 1)  # row 0 is the title bar
+            if line_idx >= total:
+                return False
+            url = win.url_map.get(line_idx)
+            if url:
+                try:
+                    webbrowser.open(url)
+                except Exception:
+                    pass
+                self.window_by_name["*status*"].add_line(f"Opening: {url}")
+                self._chat_dirty = True
+                self.dirty = True
+            else:
+                # No URL — check if click is on a nick in the line → open /query
+                line_text = win.wrapped_cache[line_idx]
+                nick_match = re.match(
+                    r'^(?:\[?\d{2}:\d{2}\]?\s*)?(?:\[↑\]\s*)?<(\S+)>', line_text)
+                if not nick_match:
+                    nick_match = re.match(
+                        r'^(?:\[?\d{2}:\d{2}\]?\s*)?(?:\[↑\]\s*)?\*\s*(\S+)', line_text)
+                if nick_match:
+                    target = nick_match.group(1)
+                    our_nick = self._active_client().nick
+                    if target.lower() != our_nick.lower():
+                        qwin = self.ensure_window(target, is_channel=False)
+                        for i, w in enumerate(self.windows):
+                            if w is qwin:
+                                self.current_window_index = i
+                                self.current_channel = None
+                                self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                                self.dirty = True
+                                return True
 
         elif 32 <= ch <= 1114111:
             try:
