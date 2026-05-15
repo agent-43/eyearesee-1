@@ -1,6976 +1,9457 @@
 #!/usr/bin/env python3
-"""Log analyzer for ai_scores.log (overridable via --log).
-
-Defaults to ai_scores.log (JSONL with fields: ts, dt, sess, nick, target,
-msg, flag, scores: heu/bino/cls/llama). Also handles other common shapes:
-  - IRC chat:   [HH:MM(:SS)] <nick> message    or    [HH:MM] * nick action
-  - JSON Lines: {"timestamp": "...", ...}      (e.g. detections.log)
-  - Syslog-ish: YYYY-MM-DD HH:MM:SS[,ms] [LEVEL] component: message
-
-Usage:
-  python analyzelog.py                                # ai_scores.log full report
-  python analyzelog.py --log other.log
-  python analyzelog.py --top 20
-  python analyzelog.py --user cfuser                  # filter + LLM behavior analysis
-  python analyzelog.py --user cfuser --no-llm
-
-  # New batch modes:
-  python analyzelog.py --batch --since 2024-01-01 --until 2024-02-01
-  python analyzelog.py --batch --flagged "llama>0.8 heu>0.5"
-  python analyzelog.py --batch --similar
-  python analyzelog.py --batch --bursts cfuser
-  python analyzelog.py --batch --diff other.log
-  python analyzelog.py --batch --export-edges edges.csv
-  python analyzelog.py --watch                        # live tail
-"""
-
-from __future__ import annotations
-
-import argparse
+import asyncio
 import atexit
-import cmd
-import contextlib
-import csv
-import hashlib
-import io
-import itertools
-import json
-import math
-import os
-import pydoc
-import re
-import shlex
-import shutil
-import statistics
+import base64
+import getpass
+import webbrowser
+import importlib.util
+import logging
+import socket
+import subprocess
 import sys
-import threading
-import time
-import urllib.request
-import urllib.error
-from collections import Counter
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Any, Iterable, Iterator, Sequence
-
-try:
-    import readline  # type: ignore[import-not-found]
-except ImportError:
-    readline = None  # type: ignore[assignment]
-if readline and not hasattr(readline, "backend"):
-    readline.backend = "readline"  # Python 3.13 compat
-
-import sqlite3
-import html as html_mod
+import unicodedata
 import urllib.parse
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from queue import Queue
-from collections import deque
-import enum
+import urllib.request
+import hashlib
+import hmac
+import heapq
+import io
+import json
+import re
+import ssl
+import time
+import os
+import random
+import uuid
+import warnings
+from collections import Counter, deque, OrderedDict
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+from math import log, log2
+from typing import Optional, Dict, List, Tuple, Callable
 
+# =========================
+# CLI flags — parsed before any optional imports or install code runs
+# =========================
+_NO_AI:         bool = "--no-ai"              in sys.argv
+_NO_INSTALL:    bool = "--no-install"         in sys.argv
+_REQUIRE_VENV:  bool = "--require-virtualenv" in sys.argv
+
+# =========================
+# Anthropic (optional)
+# =========================
 try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    MATPLOTLIB_OK = True
+    import anthropic as _anthropic_mod
+    ANTHROPIC_AVAILABLE = True
 except ImportError:
-    MATPLOTLIB_OK = False
+    _anthropic_mod = None  # type: ignore
+    ANTHROPIC_AVAILABLE = False
 
+# =========================
+# OpenAI (optional)
+# =========================
 try:
-    import pandas as pd
-    PANDAS_OK = True
+    import openai as _openai_mod
+    OPENAI_AVAILABLE = True
 except ImportError:
-    PANDAS_OK = False
+    _openai_mod = None  # type: ignore
+    OPENAI_AVAILABLE = False
 
+# =========================
+# cryptography (optional — needed for SASL ECDSA-NIST256P-CHALLENGE)
+# =========================
 try:
-    from statsmodels.tsa.holtwinters import SimpleExpSmoothing
-    STATSMODELS_OK = True
+    from cryptography.hazmat.primitives.asymmetric import ec as _ecdsa_ec
+    from cryptography.hazmat.primitives import hashes as _ecdsa_hashes
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key as _load_pem_private_key
+    CRYPTOGRAPHY_AVAILABLE = True
 except ImportError:
-    STATSMODELS_OK = False
+    _ecdsa_ec = None            # type: ignore
+    _ecdsa_hashes = None        # type: ignore
+    _load_pem_private_key = None  # type: ignore
+    CRYPTOGRAPHY_AVAILABLE = False
 
+# =========================
+# Curses (Windows-aware)
+# =========================
 try:
     import curses
-    CURSES_OK = True
-except ImportError:
-    CURSES_OK = False
-
-try:
-    import pyperclip as _pyperclip
-    PYPERCLIP_OK = True
-except ImportError:
-    PYPERCLIP_OK = False
-
-
-# ---------- parsing ----------------------------------------------------------
-
-IRC_MSG_RE = re.compile(r"^\[(?P<ts>\d{1,2}:\d{2}(?::\d{2})?)\]\s+<(?P<nick>[^>]+)>\s+(?P<msg>.*)$")
-IRC_ACT_RE = re.compile(r"^\[(?P<ts>\d{1,2}:\d{2}(?::\d{2})?)\]\s+\*\s+(?P<rest>.*)$")
-SYSLOG_RE = re.compile(
-    r"^(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:[+-]\d{2}:?\d{2}|Z)?)"
-    r"\s+\[?(?P<level>[A-Z]{3,8})\]?\s+(?P<comp>[\w.\-/:]+):\s*(?P<msg>.*)$"
-)
-ERROR_TOKENS = re.compile(r"\b(error|exception|failed|failure|critical|fatal|traceback|denied)\b", re.I)
-
-
-@dataclass
-class Entry:
-    raw: str
-    ts: datetime | None
-    user: str | None
-    level: str | None
-    event: str | None
-    target: str | None
-    text: str
-    fmt: str
-
-
-def _parse_iso(ts: str) -> datetime | None:
-    ts = ts.replace(",", ".")
-    if ts.endswith("Z"):
-        ts = ts[:-1] + "+00:00"
+except ModuleNotFoundError:
+    # _curses is missing — typical on Windows builds that ship without it.
+    # windows_curses may be installed in a site-packages directory not yet on
+    # sys.path (user-site, a parallel Python install, etc.).  Widen the search
+    # before giving up.
+    import pathlib
+    import site as _site
+    _extra: list = []
     try:
-        return datetime.fromisoformat(ts)
-    except ValueError:
-        return None
-
-
-def _compact_json_text(obj: dict) -> str:
-    dt = obj.get("dt") or obj.get("timestamp") or obj.get("ts")
-    nick = obj.get("nick") or obj.get("user") or obj.get("source") or ""
-    target = obj.get("target") or obj.get("channel") or ""
-    msg = obj.get("msg") or obj.get("message") or ""
-    flag = obj.get("flag") or obj.get("severity") or ""
-    typ = obj.get("type") or obj.get("event_type") or ""
-    scores = []
-    for k in ("heu", "bino", "cls", "llama"):
-        if k in obj:
-            scores.append(f"{k}={obj[k]}")
-    score_str = " ".join(scores)
-
-    parts = []
-    if dt:
-        parts.append(str(dt))
-    if typ:
-        parts.append(f"[{typ}]")
-    if nick:
-        parts.append(str(nick))
-    if target:
-        parts.append(f"→{target}")
-    if flag:
-        parts.append(f"({flag})")
-    if score_str:
-        parts.append(score_str)
-    if msg:
-        parts.append(f": {msg}")
-    if not parts:
-        return json.dumps({k: v for k, v in obj.items() if k != "hmac"}, default=str)
-    return " ".join(parts)
-
-
-def _flatten_json_user(obj) -> str | None:
-    if not isinstance(obj, dict):
-        return None
-    for key in ("user", "username", "nick", "source", "host", "process", "name"):
-        v = obj.get(key)
-        if isinstance(v, str) and v:
-            return v
-    details = obj.get("details") or obj.get("payload")
-    if isinstance(details, dict):
-        return _flatten_json_user(details)
-    return None
-
-
-def parse_line(line: str) -> Entry | None:
-    line = line.rstrip("\r\n")
-    if not line.strip():
-        return None
-
-    if line.lstrip().startswith("{"):
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            obj = None
-        if isinstance(obj, dict):
-            ts_str = obj.get("timestamp") or obj.get("dt") or obj.get("ts") or obj.get("time")
-            ts = None
-            if isinstance(ts_str, str):
-                ts = _parse_iso(ts_str)
-            elif isinstance(obj.get("ts"), (int, float)):
-                try:
-                    ts = datetime.fromtimestamp(float(obj["ts"]))
-                except (OSError, OverflowError, ValueError):
-                    ts = None
-            user = _flatten_json_user(obj)
-            level = obj.get("severity") or obj.get("level") or obj.get("flag")
-            event = obj.get("event_type") or obj.get("event") or obj.get("type")
-            payload = obj.get("payload")
-            if event is None and isinstance(payload, dict):
-                event = payload.get("type") or payload.get("action")
-            target = obj.get("target") or obj.get("channel")
-            text = _compact_json_text(obj)
-            return Entry(line, ts, user, str(level) if level else None,
-                         str(event) if event else None,
-                         str(target) if target else None, text, "json")
-
-    m = SYSLOG_RE.match(line)
-    if m:
-        ts = _parse_iso(m["ts"])
-        return Entry(line, ts, m["comp"], m["level"], None, None, m["msg"], "syslog")
-
-    m = IRC_MSG_RE.match(line)
-    if m:
-        ts = _parse_irc_time(m["ts"])
-        return Entry(line, ts, m["nick"], None, "msg", None, m["msg"], "irc")
-
-    m = IRC_ACT_RE.match(line)
-    if m:
-        ts = _parse_irc_time(m["ts"])
-        rest = m["rest"]
-        nick = rest.split(" ", 1)[0] if rest else None
-        event = "action"
-        for kw in ("joined", "left", "quit", "is now known", "kicked", "set mode", "Topic"):
-            if kw in rest:
-                event = kw.split()[0].lower()
-                break
-        return Entry(line, ts, nick, None, event, None, rest, "irc")
-
-    return Entry(line, None, None, None, None, None, line, "raw")
-
-
-def _parse_irc_time(ts: str) -> datetime | None:
-    parts = ts.split(":")
-    try:
-        h, mi = int(parts[0]), int(parts[1])
-        s = int(parts[2]) if len(parts) > 2 else 0
-        return datetime(1970, 1, 1, h, mi, s)
-    except (ValueError, IndexError):
-        return None
-
-
-def iter_entries(path: str) -> Iterator[Entry]:
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            e = parse_line(line)
-            if e is not None:
-                yield e
-
-
-# ---------- analysis ---------------------------------------------------------
-
-SCORE_KEYS = ("heu", "bino", "cls", "llama")
-
-
-def line_matches_user(entry: Entry, user: str) -> bool:
-    u = user.lower()
-    if entry.user and entry.user.lower() == u:
-        return True
-    return u in entry.raw.lower()
-
-
-_NICK_BOUNDARY = re.compile(r"[A-Za-z0-9_\-\[\]\\^{}|`]")
-
-
-def _mentions(text: str, nick: str) -> bool:
-    if not text or not nick:
-        return False
-    nl = nick.lower()
-    tl = text.lower()
-    start = 0
-    while True:
-        i = tl.find(nl, start)
-        if i < 0:
-            return False
-        before = tl[i - 1] if i > 0 else ""
-        after = tl[i + len(nl)] if i + len(nl) < len(tl) else ""
-        if not _NICK_BOUNDARY.match(before) and not _NICK_BOUNDARY.match(after):
-            return True
-        start = i + 1
-
-
-def _scores_from_raw(raw: str) -> dict:
-    if not raw.lstrip().startswith("{"):
-        return {}
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    keys = ("heu", "bino", "cls", "llama", "msg_len", "msg", "flag", "target")
-    return {k: obj.get(k) for k in keys if k in obj}
-
-
-def build_profile(entries: list[Entry], user: str) -> dict:
-    u = user.lower()
-    authored = [e for e in entries if e.user and e.user.lower() == u]
-    mentions = [e for e in entries if e.user and e.user.lower() != u
-                and _mentions(e.text or e.raw, user)]
-
-    channels: Counter = Counter()
-    flags: Counter = Counter()
-    score_sums = {k: 0.0 for k in SCORE_KEYS}
-    score_counts = {k: 0 for k in SCORE_KEYS}
-    msg_lens: list[int] = []
-    by_hour: Counter = Counter()
-    by_day: Counter = Counter()
-    samples: list[str] = []
-    first_ts: datetime | None = None
-    last_ts: datetime | None = None
-
-    for e in authored:
-        if e.target:
-            channels[e.target] += 1
-        if e.level:
-            flags[e.level] += 1
-        if e.ts:
-            by_hour[e.ts.hour] += 1
-            by_day[e.ts.date().isoformat()] += 1
-            if first_ts is None or e.ts < first_ts:
-                first_ts = e.ts
-            if last_ts is None or e.ts > last_ts:
-                last_ts = e.ts
-
-        scores = _scores_from_raw(e.raw)
-        for k in SCORE_KEYS:
-            v = scores.get(k)
-            if isinstance(v, (int, float)):
-                score_sums[k] += float(v)
-                score_counts[k] += 1
-        if isinstance(scores.get("msg_len"), int):
-            msg_lens.append(scores["msg_len"])
-        elif scores.get("msg"):
-            msg_lens.append(len(str(scores["msg"])))
-
-        samples.append(e.text)
-
-    score_means = {k: (score_sums[k] / score_counts[k]) if score_counts[k] else None
-                   for k in SCORE_KEYS}
-    msg_len_mean = (sum(msg_lens) / len(msg_lens)) if msg_lens else None
-
-    return {
-        "user": user,
-        "authored": len(authored),
-        "mentioned_by_others": len(mentions),
-        "channels": channels,
-        "flags": flags,
-        "score_means": score_means,
-        "msg_len_mean": msg_len_mean,
-        "by_hour": dict(sorted(by_hour.items())),
-        "by_day": dict(sorted(by_day.items())),
-        "first_ts": first_ts,
-        "last_ts": last_ts,
-        "samples": samples,
-    }
-
-
-def _fmt_score(x):
-    return f"{x:.3f}" if isinstance(x, float) else "—"
-
-
-def _fmt_dt(d):
-    return d.strftime("%Y-%m-%d %H:%M") if d else "—"
-
-
-def _peak_hours(by_hour: dict) -> str:
-    if not by_hour:
-        return "—"
-    top = sorted(by_hour.items(), key=lambda kv: -kv[1])[:3]
-    return ", ".join(f"{h:02d}h({n})" for h, n in top)
-
-
-def _top_str(counter: Counter, n: int) -> str:
-    if not counter:
-        return ""
-    return ", ".join(f"{k}({v})" for k, v in counter.most_common(n))
-
-
-def _fmt_num(x):
-    if x is None:
-        return "—"
-    return f"{x:.1f}"
-
-
-def print_compare_table(pa: dict, pb: dict) -> None:
-    print_compare_table_n([pa, pb])
-
-
-def print_compare_table_n(profiles: list[dict]) -> None:
-    rows = [
-        ("Authored lines", lambda p: str(p["authored"])),
-        ("Mentioned by others", lambda p: str(p["mentioned_by_others"])),
-        ("First seen", lambda p: _fmt_dt(p["first_ts"])),
-        ("Last seen", lambda p: _fmt_dt(p["last_ts"])),
-        ("Active days", lambda p: str(len(p["by_day"]))),
-        ("Peak hours", lambda p: _peak_hours(p["by_hour"])),
-        ("Top channels", lambda p: _top_str(p["channels"], 3) or "—"),
-        ("Flags", lambda p: _top_str(p["flags"], 4) or "—"),
-        ("Mean msg_len", lambda p: _fmt_num(p["msg_len_mean"])),
-        ("heu mean", lambda p: _fmt_score(p["score_means"]["heu"])),
-        ("bino mean", lambda p: _fmt_score(p["score_means"]["bino"])),
-        ("cls mean", lambda p: _fmt_score(p["score_means"]["cls"])),
-        ("llama mean", lambda p: _fmt_score(p["score_means"]["llama"])),
-    ]
-    label_w = max(len(r[0]) for r in rows)
-    cells = [[fn(p) for p in profiles] for _, fn in rows]
-    headers = [p["user"] for p in profiles]
-    col_w = max(20, max(len(h) for h in headers),
-                max((len(c) for row in cells for c in row), default=0))
-    print("  " + "METRIC".ljust(label_w) + "   " + "   ".join(h.ljust(col_w) for h in headers))
-    print("  " + "-" * label_w + "   " + "   ".join("-" * col_w for _ in headers))
-    for (label, _), row in zip(rows, cells):
-        print("  " + label.ljust(label_w) + "   " + "   ".join(c.ljust(col_w) for c in row))
-
-
-def line_is_interaction(entry: Entry, a: str, b: str) -> bool:
-    if not entry.user:
-        return False
-    nick = entry.user.lower()
-    a_l, b_l = a.lower(), b.lower()
-    if nick == a_l:
-        other = b
-    elif nick == b_l:
-        other = a
-    else:
-        return False
-    if entry.target and entry.target.lower() == other.lower():
-        return True
-    return _mentions(entry.text or entry.raw, other)
-
-
-def summarize(entries: Iterable[Entry], top_n: int) -> dict:
-    total = 0
-    formats: Counter = Counter()
-    users: Counter = Counter()
-    events: Counter = Counter()
-    levels: Counter = Counter()
-    targets: Counter = Counter()
-    by_hour: Counter = Counter()
-    by_day: Counter = Counter()
-    errors: list[str] = []
-    first_ts: datetime | None = None
-    last_ts: datetime | None = None
-
-    for e in entries:
-        total += 1
-        formats[e.fmt] += 1
-        if e.user:
-            users[e.user] += 1
-        if e.event:
-            events[e.event] += 1
-        if e.level:
-            levels[e.level.upper()] += 1
-        if e.target:
-            targets[e.target] += 1
-        if e.ts:
-            by_hour[e.ts.hour] += 1
-            by_day[e.ts.date().isoformat()] += 1
-            if first_ts is None or e.ts < first_ts:
-                first_ts = e.ts
-            if last_ts is None or e.ts > last_ts:
-                last_ts = e.ts
-        if (e.level and e.level.upper() in {"ERROR", "CRITICAL", "FATAL", "HIGH", "SUS", "SUSPICIOUS"}) \
-                or ERROR_TOKENS.search(e.text or ""):
-            if len(errors) < 25:
-                errors.append(e.raw)
-
-    return {
-        "total": total,
-        "formats": formats,
-        "top_users": users.most_common(top_n),
-        "top_events": events.most_common(top_n),
-        "top_targets": targets.most_common(top_n),
-        "levels": dict(levels),
-        "by_hour": dict(sorted(by_hour.items())),
-        "by_day": dict(sorted(by_day.items())),
-        "first_ts": first_ts,
-        "last_ts": last_ts,
-        "errors": errors,
-    }
-
-
-def print_report(s: dict) -> None:
-    print(f"Total entries: {s['total']}")
-    print(f"Formats: {dict(s['formats'])}")
-    if s["first_ts"] or s["last_ts"]:
-        print(f"Time range: {s['first_ts']}  →  {s['last_ts']}")
-    if s["levels"]:
-        print(f"Levels/severities: {s['levels']}")
-
-    if s["top_users"]:
-        print("\nTop users / sources:")
-        for name, n in s["top_users"]:
-            print(f"  {n:>7}  {name}")
-
-    if s["top_events"]:
-        print("\nTop events:")
-        for name, n in s["top_events"]:
-            print(f"  {n:>7}  {name}")
-
-    if s.get("top_targets"):
-        print("\nTop targets / channels:")
-        for name, n in s["top_targets"]:
-            print(f"  {n:>7}  {name}")
-
-    if s["by_hour"]:
-        print("\nActivity by hour:")
-        peak = max(s["by_hour"].values()) or 1
-        for h, n in s["by_hour"].items():
-            bar = "█" * int(40 * n / peak)
-            print(f"  {h:02d}  {n:>7}  {bar}")
-
-    if s["by_day"] and len(s["by_day"]) > 1:
-        print("\nActivity by day:")
-        peak = max(s["by_day"].values()) or 1
-        for d, n in s["by_day"].items():
-            bar = "█" * int(40 * n / peak)
-            print(f"  {d}  {n:>7}  {bar}")
-
-    if s["errors"]:
-        print(f"\nError-like entries (showing {len(s['errors'])}):")
-        for line in s["errors"]:
-            print(f"  {line[:200]}")
-
-
-# ---------- time / score / fingerprint helpers ------------------------------
-
-def parse_iso_arg(s: str) -> datetime | None:
-    """User-supplied datetime: ISO, '5h ago', 'now'."""
-    if not s:
-        return None
-    s = s.strip().replace(",", ".")
-    if s.lower() == "now":
-        return datetime.now()
-    m = re.match(r"^(\d+)\s*([smhd])\s*(?:ago)?$", s, re.I)
-    if m:
-        amt = int(m.group(1))
-        unit = m.group(2).lower()
-        units = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
-        return datetime.now() - timedelta(**{units[unit]: amt})
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    for attempt in (s, s.replace(" ", "T")):
-        try:
-            return datetime.fromisoformat(attempt)
-        except ValueError:
-            pass
-    try:
-        return datetime.strptime(s, "%Y-%m-%d")
-    except ValueError:
-        return None
-
-
-def in_time_range(ts: datetime | None, since: datetime | None,
-                  until: datetime | None) -> bool:
-    if since is None and until is None:
-        return True
-    if ts is None:
-        return False
-    if since and ts < since:
-        return False
-    if until and ts > until:
-        return False
-    return True
-
-
-def apply_time_filter(entries: Iterable[Entry], since: datetime | None,
-                      until: datetime | None) -> list[Entry]:
-    if since is None and until is None:
-        return list(entries) if not isinstance(entries, list) else entries
-    return [e for e in entries if in_time_range(e.ts, since, until)]
-
-
-_SCORE_OP_RE = re.compile(
-    r"^(?P<key>[A-Za-z_]+)\s*(?P<op>>=|<=|==|=|!=|>|<)\s*(?P<val>-?\d+(?:\.\d+)?)$"
-)
-
-
-def parse_score_filter(expr: str) -> list[tuple[str, str, float]]:
-    """Parse 'llama>0.8 heu<0.3' into list of (key, op, value)."""
-    out: list[tuple[str, str, float]] = []
-    for tok in expr.split():
-        m = _SCORE_OP_RE.match(tok)
-        if not m:
-            raise ValueError(f"bad score expression: {tok!r}")
-        op = m["op"]
-        if op == "=":
-            op = "=="
-        out.append((m["key"], op, float(m["val"])))
-    return out
-
-
-def _cmp(op: str, a: float, b: float) -> bool:
-    return {
-        "==": a == b, "!=": a != b,
-        ">": a > b, "<": a < b,
-        ">=": a >= b, "<=": a <= b,
-    }[op]
-
-
-def matches_score_filter(entry: Entry,
-                         filters: Sequence[tuple[str, str, float]]) -> bool:
-    if not filters:
-        return True
-    scores = _scores_from_raw(entry.raw)
-    for key, op, val in filters:
-        v = scores.get(key)
-        if not isinstance(v, (int, float)):
-            return False
-        if not _cmp(op, float(v), val):
-            return False
-    return True
-
-
-def collect_scores(entries: Iterable[Entry], user: str | None = None
-                   ) -> dict[str, list[float]]:
-    out: dict[str, list[float]] = {k: [] for k in SCORE_KEYS}
-    u = user.lower() if user else None
-    for e in entries:
-        if u and not (e.user and e.user.lower() == u):
-            continue
-        scores = _scores_from_raw(e.raw)
-        for k in SCORE_KEYS:
-            v = scores.get(k)
-            if isinstance(v, (int, float)):
-                out[k].append(float(v))
-    return out
-
-
-def population_score_stats(entries: Iterable[Entry]
-                           ) -> dict[str, tuple[float, float, int]]:
-    pool = collect_scores(entries)
-    res: dict[str, tuple[float, float, int]] = {}
-    for k, vals in pool.items():
-        if len(vals) >= 2:
-            res[k] = (statistics.mean(vals), statistics.pstdev(vals), len(vals))
-        elif len(vals) == 1:
-            res[k] = (vals[0], 0.0, 1)
-        else:
-            res[k] = (0.0, 0.0, 0)
-    return res
-
-
-def histogram(values: list[float], bins: int = 10,
-              lo: float | None = None, hi: float | None = None
-              ) -> tuple[list[int], list[tuple[float, float]]]:
-    if not values:
-        return [], []
-    if lo is None:
-        lo = min(values)
-    if hi is None:
-        hi = max(values)
-    if hi <= lo:
-        hi = lo + 1.0
-    edges = [lo + (hi - lo) * i / bins for i in range(bins + 1)]
-    counts = [0] * bins
-    for v in values:
-        idx = int((v - lo) / (hi - lo) * bins)
-        if idx == bins:
-            idx = bins - 1
-        if 0 <= idx < bins:
-            counts[idx] += 1
-    intervals = [(edges[i], edges[i + 1]) for i in range(bins)]
-    return counts, intervals
-
-
-def percentiles(values: list[float], ps: Sequence[int] = (10, 25, 50, 75, 90)
-                ) -> dict[int, float]:
-    if not values:
-        return {}
-    s = sorted(values)
-    out: dict[int, float] = {}
-    for p in ps:
-        if len(s) == 1:
-            out[p] = s[0]
-            continue
-        rank = (p / 100) * (len(s) - 1)
-        lo = int(rank)
-        hi = min(lo + 1, len(s) - 1)
-        frac = rank - lo
-        out[p] = s[lo] * (1 - frac) + s[hi] * frac
-    return out
-
-
-def print_score_dist(label: str, scores_by_key: dict[str, list[float]],
-                     bins: int = 10) -> None:
-    print(f"\nScore distributions for {label}:")
-    for key in SCORE_KEYS:
-        vals = scores_by_key.get(key) or []
-        if not vals:
-            print(f"  {key:6s}  (no data)")
-            continue
-        pcs = percentiles(vals)
-        m = statistics.mean(vals)
-        sd = statistics.pstdev(vals) if len(vals) > 1 else 0.0
-        print(f"  {key:6s}  n={len(vals):<5d}  mean={m:.3f}  stdev={sd:.3f}"
-              f"  p10={pcs[10]:.2f}  p50={pcs[50]:.2f}  p90={pcs[90]:.2f}")
-        counts, intervals = histogram(vals, bins, 0.0, 1.0)
-        peak = max(counts) or 1
-        for c, (a, b) in zip(counts, intervals):
-            bar = "█" * int(20 * c / peak)
-            print(f"          [{a:.2f},{b:.2f})  {c:>5d}  {bar}")
-
-
-def zscores_for_user(profile: dict,
-                     pop: dict[str, tuple[float, float, int]]
-                     ) -> dict[str, float | None]:
-    out: dict[str, float | None] = {}
-    means = profile.get("score_means", {})
-    for k in SCORE_KEYS:
-        um = means.get(k)
-        pm, ps, n = pop.get(k, (0.0, 0.0, 0))
-        if um is None or ps == 0 or n == 0:
-            out[k] = None
-        else:
-            out[k] = (um - pm) / ps
-    return out
-
-
-def print_zscores(profile: dict, pop: dict[str, tuple[float, float, int]]) -> None:
-    z = zscores_for_user(profile, pop)
-    print(f"\nZ-scores for {profile['user']} vs population:")
-    for k in SCORE_KEYS:
-        pm, ps, n = pop.get(k, (0.0, 0.0, 0))
-        um = profile["score_means"].get(k)
-        zk = z[k]
-        u_str = f"{um:.3f}" if isinstance(um, float) else "—"
-        z_str = f"{zk:+.2f}σ" if isinstance(zk, float) else "—"
-        print(f"  {k:6s}  user={u_str}  pop_mean={pm:.3f}  pop_sd={ps:.3f}"
-              f"  n={n}   z={z_str}")
-
-
-def user_fingerprint(profile: dict) -> list[float]:
-    vec: list[float] = []
-    sm = profile.get("score_means", {})
-    for k in SCORE_KEYS:
-        v = sm.get(k)
-        vec.append(float(v) if isinstance(v, float) else 0.0)
-    by_hour = profile.get("by_hour") or {}
-    total = sum(by_hour.values()) or 1
-    for h in range(24):
-        vec.append(by_hour.get(h, 0) / total)
-    msg_len = profile.get("msg_len_mean")
-    vec.append((float(msg_len) / 200.0) if msg_len else 0.0)
-    return vec
-
-
-def cosine(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(y * y for y in b))
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
-
-
-def find_similar_users(entries: list[Entry], min_lines: int = 5,
-                       threshold: float = 0.95, top: int = 20
-                       ) -> list[tuple[str, str, float, int, int]]:
-    counts: Counter = Counter(e.user for e in entries if e.user)
-    candidates = sorted(u for u, n in counts.items() if n >= min_lines)
-    profiles = {u: build_profile(entries, u) for u in candidates}
-    fps = {u: user_fingerprint(p) for u, p in profiles.items()}
-    pairs: list[tuple[str, str, float, int, int]] = []
-    for i, a in enumerate(candidates):
-        for b in candidates[i + 1:]:
-            sim = cosine(fps[a], fps[b])
-            if sim >= threshold:
-                pairs.append((a, b, sim, profiles[a]["authored"],
-                              profiles[b]["authored"]))
-    pairs.sort(key=lambda p: -p[2])
-    return pairs[:top]
-
-
-def print_similar_users(pairs: list[tuple[str, str, float, int, int]]) -> None:
-    if not pairs:
-        print("\nNo user pairs above similarity threshold.")
-        return
-    print("\nMost-similar user pairs (cosine over score+hour fingerprint):")
-    print(f"  {'sim':>8}   {'user A':<20} {'(lines)':>9}    {'user B':<20} {'(lines)':>9}")
-    for a, b, sim, na, nb in pairs:
-        print(f"  {sim:>8.4f}   {a:<20} ({na:>7})    {b:<20} ({nb:>7})")
-
-
-def detect_bursts(entries: list[Entry], user: str, window_seconds: int = 60,
-                  z_threshold: float = 3.0
-                  ) -> list[tuple[datetime, int, float]]:
-    u = user.lower()
-    timestamps = [e.ts for e in entries
-                  if e.ts and e.user and e.user.lower() == u]
-    if len(timestamps) < 5:
-        return []
-    timestamps.sort()
-    bins: Counter = Counter()
-    start_epoch = int(timestamps[0].timestamp())
-    for t in timestamps:
-        bucket = int(t.timestamp() - start_epoch) // window_seconds
-        bins[bucket] += 1
-    counts = list(bins.values())
-    mean = statistics.mean(counts)
-    sd = statistics.pstdev(counts) if len(counts) > 1 else 0.0
-    if sd == 0:
-        return []
-    bursts: list[tuple[datetime, int, float]] = []
-    for b, c in sorted(bins.items()):
-        z = (c - mean) / sd
-        if z >= z_threshold:
-            ts = datetime.fromtimestamp(start_epoch + b * window_seconds)
-            bursts.append((ts, c, z))
-    return bursts
-
-
-def print_bursts(user: str, bursts: list[tuple[datetime, int, float]],
-                 window_seconds: int) -> None:
-    if not bursts:
-        print(f"\nNo bursts detected for {user} (window={window_seconds}s).")
-        return
-    print(f"\nBursts for {user} (window={window_seconds}s):")
-    for ts, c, z in bursts:
-        print(f"  {ts}  count={c:<5d}  z={z:.2f}σ")
-
-
-REPLY_PREFIX_RE = re.compile(r"^\s*([A-Za-z0-9_\-\[\]\\^{}|`]+)\s*[:,]\s+")
-MENTION_RE = re.compile(r"@([A-Za-z0-9_\-\[\]\\^{}|`]+)")
-
-
-def detect_reply_target(entry: Entry, known_nicks_lower: set[str]) -> str | None:
-    text = entry.text or entry.raw or ""
-    own = entry.user.lower() if entry.user else None
-    m = REPLY_PREFIX_RE.match(text)
-    if m:
-        cand = m.group(1)
-        if cand.lower() in known_nicks_lower and cand.lower() != own:
-            return cand
-    m = MENTION_RE.search(text)
-    if m:
-        cand = m.group(1)
-        if cand.lower() in known_nicks_lower and cand.lower() != own:
-            return cand
-    return None
-
-
-def build_edge_graph(entries: list[Entry]) -> Counter:
-    nicks_lower = {e.user.lower() for e in entries if e.user}
-    edges: Counter = Counter()
-    for e in entries:
-        if not e.user:
-            continue
-        tgt = detect_reply_target(e, nicks_lower)
-        if tgt:
-            edges[(e.user, tgt)] += 1
-    return edges
-
-
-def build_thread_for_user(entries: list[Entry], user: str
-                          ) -> list[tuple[Entry, str | None]]:
-    nicks_lower = {e.user.lower() for e in entries if e.user}
-    out: list[tuple[Entry, str | None]] = []
-    u = user.lower()
-    for e in entries:
-        if not e.user:
-            continue
-        author = e.user.lower()
-        text = e.text or e.raw or ""
-        if author == u:
-            tgt = detect_reply_target(e, nicks_lower)
-            out.append((e, tgt))
-        elif _mentions(text, user):
-            out.append((e, user))
-    return out
-
-
-# ---------- NEW: Session detection (#5) --------------------------------------
-
-@dataclass
-class Session:
-    user: str
-    start: datetime
-    end: datetime
-    line_count: int
-    targets: list[str] = field(default_factory=list)
-
-def detect_sessions(entries: list[Entry], user: str, gap_minutes: int = 30) -> list[Session]:
-    u = user.lower()
-    user_entries = sorted(
-        [e for e in entries if e.ts and e.user and e.user.lower() == u],
-        key=lambda e: e.ts
-    )
-    if not user_entries:
-        return []
-    sessions: list[Session] = []
-    cur_start = user_entries[0].ts
-    cur_end = user_entries[0].ts
-    cur_count = 1
-    cur_targets: list[str] = []
-    if user_entries[0].target:
-        cur_targets.append(user_entries[0].target)
-    for e in user_entries[1:]:
-        gap = (e.ts - cur_end).total_seconds() / 60
-        if gap > gap_minutes:
-            sessions.append(Session(user, cur_start, cur_end, cur_count, cur_targets))
-            cur_start = e.ts
-            cur_count = 0
-            cur_targets = []
-        cur_end = e.ts
-        cur_count += 1
-        if e.target:
-            cur_targets.append(e.target)
-    sessions.append(Session(user, cur_start, cur_end, cur_count, cur_targets))
-    return sessions
-
-# ---------- NEW: Response time analysis (#6) ---------------------------------
-
-@dataclass
-class ResponseTime:
-    responder: str
-    responded_to: str
-    delay_seconds: float
-    ts: datetime
-
-def compute_response_times(entries: list[Entry], window_seconds: int = 300) -> list[ResponseTime]:
-    nicks = {e.user for e in entries if e.user}
-    nicks_lower = {e.user.lower() for e in entries if e.user}
-    sorted_entries = sorted([e for e in entries if e.ts], key=lambda e: e.ts)
-    result: list[ResponseTime] = []
-    for i, e in enumerate(sorted_entries):
-        if not e.user:
-            continue
-        tgt = detect_reply_target(e, nicks_lower)
-        if tgt:
-            # look back for the most recent message from tgt
-            for j in range(i - 1, -1, -1):
-                prev = sorted_entries[j]
-                if prev.user and prev.user.lower() == tgt.lower() and prev.ts:
-                    delay = (e.ts - prev.ts).total_seconds()
-                    if delay <= window_seconds:
-                        result.append(ResponseTime(e.user, tgt, delay, e.ts))
-                    break
-    return result
-
-# ---------- NEW: Sentiment analysis (#4) -------------------------------------
-
-SENTIMENT_POS = re.compile(r"\b(good|great|awesome|thanks|nice|love|perfect|helpful|excellent|amazing|beautiful|wonderful|fantastic|brilliant|outstanding|superb|glad|happy|correct|agree|works|fixed|solved|appreciate|thank|please|yes|ok|okay)\b", re.I)
-SENTIMENT_NEG = re.compile(r"\b(bad|terrible|awful|hate|ugly|horrible|wrong|broken|fails|failed|error|crash|stupid|annoying|useless|worst|sucks|horrible|crap|damn|bug|issue|problem|disaster|fault|never|refuse|reject|no|not|can't|cannot|won't)\b", re.I)
-SENTIMENT_AGREE = re.compile(r"\b(agree|yes|correct|right|indeed|exactly|true|same)\b", re.I)
-SENTIMENT_DISAGREE = re.compile(r"\b(disagree|no|wrong|incorrect|false|nonsense|dispute|reject)\b", re.I)
-
-@dataclass
-class SentimentScore:
-    positive: float
-    negative: float
-    agreement: float
-    disagreement: float
-    compound: float
-
-def score_sentiment(text: str) -> SentimentScore:
-    pos = len(SENTIMENT_POS.findall(text))
-    neg = len(SENTIMENT_NEG.findall(text))
-    agr = len(SENTIMENT_AGREE.findall(text))
-    dagr = len(SENTIMENT_DISAGREE.findall(text))
-    total = pos + neg + 1
-    return SentimentScore(
-        positive=pos / total,
-        negative=neg / total,
-        agreement=agr / (agr + dagr + 1),
-        disagreement=dagr / (agr + dagr + 1),
-        compound=(pos - neg) / total,
-    )
-
-def user_sentiment(entries: list[Entry], user: str) -> dict:
-    u = user.lower()
-    texts = [e.text or e.raw for e in entries if e.user and e.user.lower() == u and (e.text or e.raw)]
-    if not texts:
-        return {}
-    scores = [score_sentiment(t) for t in texts]
-    return {
-        "user": user,
-        "n": len(scores),
-        "mean_positive": statistics.mean(s.compound for s in scores),
-        "mean_compound": statistics.mean(s.compound for s in scores),
-        "pos_rate": sum(1 for s in scores if s.compound > 0) / len(scores),
-        "neg_rate": sum(1 for s in scores if s.compound < 0) / len(scores),
-        "agree_rate": statistics.mean(s.agreement for s in scores),
-    }
-
-# ---------- NEW: Topic/keyword extraction (#3) --------------------------------
-
-STOPWORDS = set("the a an is in to of and it you that on for with as at by this are be has have had not was were will can its or do if from they what which who " "all about but just like so up no out one also get would could".split())
-
-def extract_keywords(texts: list[str], top_n: int = 20) -> list[tuple[str, int]]:
-    counter: Counter = Counter()
-    token_re = re.compile(r"[A-Za-z][A-Za-z0-9_\-']{2,}")
-    for t in texts:
-        for tok in token_re.findall(t.lower()):
-            if tok not in STOPWORDS and len(tok) > 2:
-                counter[tok] += 1
-    return counter.most_common(top_n)
-
-def extract_ngrams(texts: list[str], n: int = 2, top_n: int = 20) -> list[tuple[str, int]]:
-    counter: Counter = Counter()
-    token_re = re.compile(r"[A-Za-z][A-Za-z0-9_\-']{2,}")
-    for t in texts:
-        tokens = [tok for tok in token_re.findall(t.lower()) if tok not in STOPWORDS and len(tok) > 2]
-        for i in range(len(tokens) - n + 1):
-            gram = " ".join(tokens[i:i + n])
-            counter[gram] += 1
-    return counter.most_common(top_n)
-
-def user_topics(entries: list[Entry], user: str, top_n: int = 15) -> dict:
-    u = user.lower()
-    texts = [e.text or e.raw for e in entries if e.user and e.user.lower() == u and (e.text or e.raw)]
-    return {
-        "user": user,
-        "keywords": extract_keywords(texts, top_n),
-        "bigrams": extract_ngrams(texts, 2, top_n),
-        "trigrams": extract_ngrams(texts, 3, top_n),
-    }
-
-# ---------- NEW: Sequence mining (#14) ----------------------------------------
-
-@dataclass
-class SequencePattern:
-    pattern: tuple[str, ...]
-    count: int
-    avg_gap_seconds: float
-
-def find_common_sequences(entries: list[Entry], window_minutes: int = 10, max_gap_seconds: int = 600, min_support: int = 3) -> list[SequencePattern]:
-    sorted_e = sorted([e for e in entries if e.ts and e.user], key=lambda e: e.ts)
-    chains: list[list[str]] = []
-    cur: list[str] = []
-    cur_ts: datetime | None = None
-    for e in sorted_e:
-        if cur_ts is not None and (e.ts - cur_ts).total_seconds() > max_gap_seconds:
-            if len(cur) >= 2:
-                chains.append(cur)
-            cur = []
-        cur.append(e.user.lower())
-        cur_ts = e.ts
-    if len(cur) >= 2:
-        chains.append(cur)
-
-    pair_counter: Counter = Counter()
-    pair_gaps: dict[tuple[str, str], list[float]] = {}
-    for chain in chains:
-        for i in range(len(chain) - 1):
-            pair = (chain[i], chain[i + 1])
-            pair_counter[pair] += 1
-    result: list[SequencePattern] = []
-    for (a, b), cnt in pair_counter.most_common():
-        if cnt >= min_support:
-            gaps: list[float] = []
-            for chain in chains:
-                for i in range(len(chain) - 1):
-                    if chain[i] == a and chain[i + 1] == b:
-                        gaps.append(0.0)  # simplified
-            avg_gap = statistics.mean(gaps) if gaps else 0.0
-            result.append(SequencePattern((a, b), cnt, avg_gap))
-    return result[:20]
-
-# ---------- NEW: Anomaly detection (#8) --------------------------------------
-
-@dataclass
-class Anomaly:
-    user: str
-    metric: str
-    value: float
-    expected: float
-    zscore: float
-    day: str | None = None
-    hour: int | None = None
-
-def detect_anomalies(entries: list[Entry], user: str, z_threshold: float = 2.5) -> list[Anomaly]:
-    u = user.lower()
-    user_entries = [e for e in entries if e.user and e.user.lower() == u and e.ts]
-    if len(user_entries) < 7:
-        return []
-    result: list[Anomaly] = []
-    by_day: dict[str, list[Entry]] = {}
-    for e in user_entries:
-        if e.ts:
-            d = e.ts.date().isoformat()
-            by_day.setdefault(d, []).append(e)
-    day_counts = [len(v) for v in by_day.values()]
-    if len(day_counts) >= 3:
-        mean = statistics.mean(day_counts)
-        sd = statistics.pstdev(day_counts) if len(day_counts) > 1 else 0.0
-        if sd > 0:
-            for d, entries_for_day in by_day.items():
-                z = (len(entries_for_day) - mean) / sd
-                if abs(z) >= z_threshold:
-                    result.append(Anomaly(user, "daily_volume", len(entries_for_day), mean, z, day=d))
-    by_hour: dict[int, list[Entry]] = {}
-    for e in user_entries:
-        if e.ts:
-            by_hour.setdefault(e.ts.hour, []).append(e)
-    hour_counts = [len(v) for v in by_hour.values()]
-    if len(hour_counts) >= 3:
-        mean_h = statistics.mean(hour_counts)
-        sd_h = statistics.pstdev(hour_counts) if len(hour_counts) > 1 else 0.0
-        if sd_h > 0:
-            for h, entries_for_hour in by_hour.items():
-                z = (len(entries_for_hour) - mean_h) / sd_h
-                if abs(z) >= z_threshold:
-                    result.append(Anomaly(user, "hourly_volume", len(entries_for_hour), mean_h, z, hour=h))
-    return result
-
-# ---------- NEW: User lifecycle (#10) -----------------------------------------
-
-@dataclass
-class LifecycleStage:
-    user: str
-    first_seen: datetime | None
-    last_seen: datetime | None
-    active_days: int
-    total_days: int
-    activity_trend: str
-    stages: list[tuple[str, datetime, datetime]]  # (stage_name, start, end)
-
-def analyze_lifecycle(entries: list[Entry], user: str, gap_days: int = 14) -> LifecycleStage:
-    u = user.lower()
-    user_entries = sorted(
-        [e for e in entries if e.user and e.user.lower() == u and e.ts],
-        key=lambda e: e.ts
-    )
-    if not user_entries:
-        return LifecycleStage(user, None, None, 0, 0, "unknown", [])
-    first = user_entries[0].ts
-    last = user_entries[-1].ts
-    total_days = max((last - first).days, 1)
-    active_dates = {e.ts.date() for e in user_entries if e.ts}
-    active_days = len(active_dates)
-    # trend: compare first half to second half activity density
-    midpoint = first + (last - first) / 2
-    first_half = sum(1 for e in user_entries if e.ts and e.ts <= midpoint)
-    second_half = sum(1 for e in user_entries if e.ts and e.ts > midpoint)
-    if first_half == 0:
-        trend = "new"
-    elif second_half / first_half > 1.3:
-        trend = "growing"
-    elif second_half / first_half < 0.7:
-        trend = "declining"
-    else:
-        trend = "stable"
-    # detect stages: active periods separated by gaps
-    stages: list[tuple[str, datetime, datetime]] = []
-    stage_start = user_entries[0].ts
-    stage_end = user_entries[0].ts
-    for e in user_entries[1:]:
-        gap = (e.ts - stage_end).days
-        if gap > gap_days:
-            stages.append(("active", stage_start, stage_end))
-            stage_start = e.ts
-        stage_end = e.ts
-    stages.append(("active", stage_start, stage_end))
-    return LifecycleStage(user, first, last, active_days, total_days, trend, stages)
-
-# ---------- NEW: Pattern-of-life analysis (#11) -------------------------------
-
-@dataclass
-class PatternOfLife:
-    user: str
-    hourly_profile: dict[int, float]  # hour -> normalized activity
-    weekday_profile: dict[int, float]  # day -> normalized
-    peak_hour: int | None
-    quiet_hours: list[int]
-    consistency_score: float  # 0-1 how consistent the pattern is
-
-def pattern_of_life(entries: list[Entry], user: str) -> PatternOfLife:
-    u = user.lower()
-    user_entries = [e for e in entries if e.user and e.user.lower() == u and e.ts]
-    if len(user_entries) < 10:
-        return PatternOfLife(user, {}, {}, None, [], 0.0)
-    hourly: Counter = Counter()
-    weekly: Counter = Counter()
-    for e in user_entries:
-        if e.ts:
-            hourly[e.ts.hour] += 1
-            weekly[e.ts.weekday()] += 1
-    total_h = max(sum(hourly.values()), 1)
-    total_w = max(sum(weekly.values()), 1)
-    hour_profile = {h: hourly.get(h, 0) / total_h for h in range(24)}
-    week_profile = {d: weekly.get(d, 0) / total_w for d in range(7)}
-    peak_hour = max(range(24), key=lambda h: hourly.get(h, 0)) if hourly else None
-    mean_h = statistics.mean([hourly.get(h, 0) for h in range(24)])
-    sd_h = statistics.pstdev([hourly.get(h, 0) for h in range(24)]) or 1
-    quiet = [h for h in range(24) if (hourly.get(h, 0) - mean_h) / sd_h < -1]
-    # consistency: coefficient of variation across days
-    if len(user_entries) >= 3:
-        by_day: dict[str, int] = {}
-        for e in user_entries:
-            if e.ts:
-                by_day[e.ts.date().isoformat()] = by_day.get(e.ts.date().isoformat(), 0) + 1
-        counts = list(by_day.values())
-        cv = statistics.pstdev(counts) / (statistics.mean(counts) or 1)
-        consistency = max(0.0, min(1.0, 1.0 - cv))
-    else:
-        consistency = 0.0
-    return PatternOfLife(user, hour_profile, week_profile, peak_hour, quiet, consistency)
-
-# ---------- NEW: Alert rules engine (#13) -------------------------------------
-
-@dataclass
-class AlertRule:
-    name: str
-    field: str  # user|target|level|score_key
-    op: str  # == != > < contains matches
-    value: str
-    message: str
-    enabled: bool = True
-
-class AlertEngine:
-    def __init__(self) -> None:
-        self.rules: list[AlertRule] = []
-
-    def add(self, rule: AlertRule) -> None:
-        self.rules.append(rule)
-
-    def remove(self, name: str) -> bool:
-        before = len(self.rules)
-        self.rules = [r for r in self.rules if r.name != name]
-        return len(self.rules) < before
-
-    def evaluate(self, entry: Entry) -> list[str]:
-        out: list[str] = []
-        for rule in self.rules:
-            if not rule.enabled:
-                continue
-            val: str | None = None
-            if rule.field == "user":
-                val = entry.user
-            elif rule.field == "target":
-                val = entry.target
-            elif rule.field == "level":
-                val = entry.level
-            elif rule.field in SCORE_KEYS:
-                scores = _scores_from_raw(entry.raw)
-                sv = scores.get(rule.field)
-                val = str(sv) if sv is not None else None
-            else:
-                val = entry.raw
-            if val is None:
-                continue
-            matched = False
-            if rule.op == "==":
-                matched = val.lower() == rule.value.lower()
-            elif rule.op == "!=":
-                matched = val.lower() != rule.value.lower()
-            elif rule.op == ">":
-                try:
-                    matched = float(val) > float(rule.value)
-                except ValueError:
-                    matched = False
-            elif rule.op == "<":
-                try:
-                    matched = float(val) < float(rule.value)
-                except ValueError:
-                    matched = False
-            elif rule.op == "matches":
-                try:
-                    matched = bool(re.search(rule.value, val, re.I))
-                except re.error:
-                    matched = False
-            elif rule.op == "contains":
-                matched = rule.value.lower() in val.lower()
-            if matched:
-                out.append(rule.message.format(val=val, user=entry.user or "?", target=entry.target or "?"))
-        return out
-
-# ---------- NEW: Multi-log correlation (#12) ----------------------------------
-
-@dataclass
-class Correlation:
-    event_a: str
-    event_b: str
-    count: int
-    avg_delay_seconds: float
-
-def correlate_logs(log_a_entries: list[Entry], log_b_entries: list[Entry],
-                   window_seconds: int = 60) -> list[Correlation]:
-    events_a = [(e.ts, e.event or e.user or e.level or "?") for e in log_a_entries if e.ts]
-    events_b = [(e.ts, e.event or e.user or e.level or "?") for e in log_b_entries if e.ts]
-    events_a.sort(key=lambda x: x[0])
-    events_b.sort(key=lambda x: x[0])
-    pair_counts: Counter = Counter()
-    pair_delays: dict[tuple[str, str], list[float]] = {}
-    for tsa, eva in events_a:
-        for tsb, evb in events_b:
-            delay = abs((tsb - tsa).total_seconds())
-            if delay <= window_seconds:
-                pair_counts[(eva, evb)] += 1
-                pair_delays.setdefault((eva, evb), []).append(delay)
-    result: list[Correlation] = []
-    for (ea, eb), cnt in pair_counts.most_common(30):
-        delays = pair_delays.get((ea, eb), [0.0])
-        avg_d = statistics.mean(delays) if delays else 0.0
-        result.append(Correlation(ea, eb, cnt, avg_d))
-    return result
-
-# ---------- Log template mining (#1) ------------------------------------------
-
-TEMPLATE_VAR_RE = re.compile(r"\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b|0x[0-9a-fA-F]+|[0-9a-fA-F]{8,}|(?<=/)[a-zA-Z0-9._-]+(?=/)")
-
-def extract_log_templates(entries: list[Entry], top_n: int = 20) -> list[tuple[str, int, str]]:
-    counter: Counter = Counter()
-    sample_lines: dict[str, str] = {}
-    for e in entries:
-        text = e.text or e.raw
-        template = TEMPLATE_VAR_RE.sub("{}", text)
-        template = re.sub(r"([\"']).*?(\1)", r'\1{}\1', template)
-        template = re.sub(r"\b[a-f0-9]{8,}\b", "{}", template, flags=re.I)
-        template = re.sub(r"\d{2,}", "{}", template)
-        counter[template] += 1
-        if template not in sample_lines:
-            sample_lines[template] = text[:200]
-    out: list[tuple[str, int, str]] = []
-    for template, count in counter.most_common(top_n):
-        out.append((template[:200], count, (sample_lines.get(template) or template)[:200]))
-    return out
-
-# ---------- Change-point detection (#2) ---------------------------------------
-
-@dataclass
-class ChangePoint:
-    user: str
-    metric: str
-    at: datetime
-    before_val: float
-    after_val: float
-    effect_size: float
-
-def detect_change_points(entries: list[Entry], user: str, window_days: int = 3) -> list[ChangePoint]:
-    u = user.lower()
-    user_entries = sorted(
-        [e for e in entries if e.ts and e.user and e.user.lower() == u],
-        key=lambda e: e.ts
-    )
-    if len(user_entries) < 10:
-        return []
-    windows: list[tuple[datetime, list[Entry]]] = []
-    if not user_entries or not user_entries[0].ts:
-        return []
-    cur_start = user_entries[0].ts
-    while cur_start <= user_entries[-1].ts:
-        win_end = cur_start + timedelta(days=window_days)
-        win = [e for e in user_entries if cur_start <= e.ts < win_end]
-        if win:
-            windows.append((cur_start, win))
-        cur_start = win_end
-
-    results: list[ChangePoint] = []
-    for i in range(1, len(windows)):
-        prev_count = len(windows[i - 1][1])
-        cur_count = len(windows[i][1])
-        if prev_count > 0 and cur_count > 0:
-            effect = (cur_count - prev_count) / (prev_count + cur_count)
-            if abs(effect) > 0.5:
-                results.append(ChangePoint(user, "volume", windows[i][0], prev_count, cur_count, effect))
-        # score changes
-        prev_scores = [v for e in windows[i - 1][1] for v in _scores_from_raw(e.raw).values() if isinstance(v, (int, float))]
-        cur_scores = [v for e in windows[i][1] for v in _scores_from_raw(e.raw).values() if isinstance(v, (int, float))]
-        if prev_scores and cur_scores:
-            prev_m = statistics.mean(prev_scores)
-            cur_m = statistics.mean(cur_scores)
-            pooled_sd = (statistics.pstdev(prev_scores) + statistics.pstdev(cur_scores)) / 2 or 1
-            effect = (cur_m - prev_m) / pooled_sd
-            if abs(effect) > 0.8:
-                results.append(ChangePoint(user, "score_shift", windows[i][0], prev_m, cur_m, effect))
-    return results
-
-# ---------- Root cause tracing (#3) -------------------------------------------
-
-@dataclass
-class RootCause:
-    preceding_user: str
-    preceding_event: str
-    correlation: float
-    avg_lag_seconds: float
-    occurrences: int
-
-def trace_root_causes(entries: list[Entry], target_user: str,
-                      lookback_seconds: int = 120, min_occurrences: int = 2) -> list[RootCause]:
-    u = target_user.lower()
-    sorted_e = sorted([e for e in entries if e.ts], key=lambda e: e.ts)
-    target_times: list[datetime] = []
-    for e in sorted_e:
-        if e.user and e.user.lower() == u:
-            target_times.append(e.ts)
-
-    causes: Counter = Counter()
-    lags: dict[tuple[str, str], list[float]] = {}
-    for tt in target_times:
-        seen: set[tuple[str, str]] = set()
-        for e in sorted_e:
-            if not e.user or not e.ts or e.user.lower() == u:
-                continue
-            lag = (tt - e.ts).total_seconds()
-            if 0 < lag <= lookback_seconds:
-                key = (e.user, e.event or e.level or "msg")
-                if key not in seen:
-                    causes[key] += 1
-                    lags.setdefault(key, []).append(lag)
-                    seen.add(key)
-
-    total_target = len(target_times) or 1
-    results: list[RootCause] = []
-    for (preceding_user, preceding_event), cnt in causes.most_common(30):
-        if cnt >= min_occurrences:
-            avg_lag = statistics.mean(lags.get((preceding_user, preceding_event), [0]))
-            results.append(RootCause(preceding_user, preceding_event, cnt / total_target, avg_lag, cnt))
-    return results
-
-# ---------- Forecasting (#4) ---------------------------------------------------
-
-@dataclass
-class Forecast:
-    daily_counts: dict[str, int]
-    predictions: list[tuple[str, float]]
-    trend: str  # increasing | decreasing | stable
-
-def forecast_activity(entries: list[Entry], user: str | None = None,
-                      days_ahead: int = 7) -> Forecast:
-    if user:
-        u = user.lower()
-        filtered = [e for e in entries if e.ts and e.user and e.user.lower() == u]
-    else:
-        filtered = [e for e in entries if e.ts]
-    if not filtered:
-        return Forecast({}, [], "unknown")
-    by_day: dict[str, int] = {}
-    for e in filtered:
-        if e.ts:
-            d = e.ts.date().isoformat()
-            by_day[d] = by_day.get(d, 0) + 1
-    dates = sorted(by_day.keys())
-    counts = [by_day[d] for d in dates]
-    if len(counts) < 3:
-        return Forecast(by_day, [], "unknown")
-
-    # simple approach: average of last few days + linear extrapolation
-    recent = counts[-min(len(counts), 5):]
-    avg = statistics.mean(recent)
-    # linear trend
-    n = len(counts)
-    xs = list(range(n))
-    mean_x = statistics.mean(xs)
-    mean_y = statistics.mean(counts)
-    num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, counts))
-    den = sum((x - mean_x) ** 2 for x in xs) or 1
-    slope = num / den
-    if slope > 0.5:
-        trend = "increasing"
-    elif slope < -0.5:
-        trend = "decreasing"
-    else:
-        trend = "stable"
-
-    predictions: list[tuple[str, float]] = []
-    last_date = datetime.fromisoformat(dates[-1])
-    for i in range(1, days_ahead + 1):
-        pred_date = (last_date + timedelta(days=i)).isoformat()[:10]
-        pred_val = max(0, avg + slope * (n + i))
-        predictions.append((pred_date, round(pred_val, 1)))
-    return Forecast(by_day, predictions, trend)
-
-# ---------- Multi-factor anomaly score (#5) -----------------------------------
-
-@dataclass
-class MultiFactorAnomaly:
-    user: str
-    composite_score: float
-    daily_z: float | None
-    hourly_z: float | None
-    sentiment_z: float | None
-
-def multi_factor_anomaly(entries: list[Entry], user: str) -> MultiFactorAnomaly | None:
-    u = user.lower()
-    user_entries = [e for e in entries if e.user and e.user.lower() == u and e.ts]
-    if len(user_entries) < 10:
-        return None
-    all_entries = [e for e in entries if e.ts]
-
-    # daily volume z-score
-    by_day_all: Counter = Counter()
-    for e in all_entries:
-        if e.ts:
-            by_day_all[e.ts.date()] += 1
-    by_day_user: Counter = Counter()
-    for e in user_entries:
-        if e.ts:
-            by_day_user[e.ts.date()] += 1
-    day_vals_all = list(by_day_all.values())
-    day_vals_user = list(by_day_user.values())
-    daily_z: float | None = None
-    if len(day_vals_all) >= 3:
-        m = statistics.mean(day_vals_all)
-        s = statistics.pstdev(day_vals_all) or 1
-        daily_z = (statistics.mean(day_vals_user) - m) / s if day_vals_user else 0
-
-    # hourly z-score
-    by_hour_user: Counter = Counter()
-    for e in user_entries:
-        if e.ts:
-            by_hour_user[e.ts.hour] += 1
-    by_hour_all: Counter = Counter()
-    for e in all_entries:
-        if e.ts:
-            by_hour_all[e.ts.hour] += 1
-    hourly_z: float | None = None
-    h_vals_all = [by_hour_all.get(h, 0) for h in range(24)]
-    h_vals_user = [by_hour_user.get(h, 0) for h in range(24)]
-    if len(h_vals_all) >= 3:
-        m_h = statistics.mean(h_vals_all)
-        s_h = statistics.pstdev(h_vals_all) or 1
-        hourly_z = (statistics.mean(h_vals_user) - m_h) / s_h
-
-    # sentiment z-score vs population
-    sent_user = user_sentiment(entries, user)
-    pop_sents = [user_sentiment(entries, u2)["mean_compound"]
-                 for u2 in {e.user for e in entries if e.user}
-                 if u2.lower() != u and user_sentiment(entries, u2)]
-    sentiment_z: float | None = None
-    if pop_sents and sent_user:
-        m_s = statistics.mean(pop_sents)
-        s_s = statistics.pstdev(pop_sents) or 1
-        sentiment_z = (sent_user["mean_compound"] - m_s) / s_s
-
-    factors = [v for v in [daily_z, hourly_z, sentiment_z] if v is not None]
-    composite = statistics.mean(factors) if factors else 0.0
-    return MultiFactorAnomaly(user, composite, daily_z, hourly_z, sentiment_z)
-
-# ---------- Matplotlib chart export (#6) --------------------------------------
-
-def chart_timeline(entries: list[Entry], path: str,
-                   user: str | None = None) -> bool:
-    if not MATPLOTLIB_OK:
-        print("matplotlib not installed; try: pip install matplotlib")
-        return False
-    if user:
-        u = user.lower()
-        filtered = [e for e in entries if e.ts and e.user and e.user.lower() == u]
-    else:
-        filtered = [e for e in entries if e.ts]
-    if not filtered:
-        print("(no data to chart)")
-        return False
-    by_day: Counter = Counter()
-    for e in filtered:
-        if e.ts:
-            by_day[e.ts.date()] += 1
-    dates = sorted(by_day.keys())
-    counts = [by_day[d] for d in dates]
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.bar(range(len(dates)), counts, color="#4a9eff")
-    ax.set_xticks(range(len(dates)))
-    ax.set_xticklabels([str(d)[5:] for d in dates], rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("Entries" + (f" ({user})" if user else ""))
-    ax.set_title("Activity Timeline")
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"Chart saved to {path}")
-    return True
-
-
-# ---------- Web portal (interactive browser console) --------------------------
-
-_WEBPORTAL_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>analyzelog</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#000;color:#00ff41;font-family:Consolas,monospace;font-size:14px;height:100vh;display:flex;flex-direction:column}
-#output{flex:1;overflow-y:auto;padding:12px;white-space:pre-wrap;word-wrap:break-word;line-height:1.5}
-#output div{margin:0}
-#input-line{display:flex;align-items:center;padding:8px 12px;background:#000;border-top:1px solid #0a3a0a}
-#prompt{color:#00ff41;white-space:pre}
-#input{flex:1;background:#0a0a0a;border:1px solid #0a3a0a;color:#00ff41;font:inherit;padding:6px 8px;outline:none;margin-left:4px}
-#input:focus{border-color:#00ff41}
-#input::placeholder{color:#0a3a0a}
-::-webkit-scrollbar{width:8px}
-::-webkit-scrollbar-track{background:#000}
-::-webkit-scrollbar-thumb{background:#0a3a0a;border-radius:4px}
-</style>
-</head>
-<body>
-<div id="output"></div>
-<div id="input-line"><span id="prompt">(log) </span><input type="text" id="input" autofocus spellcheck="false" autocomplete="off"></div>
-<script>
-var o=document.getElementById('output'),i=document.getElementById('input'),p=document.getElementById('prompt'),h=[],hi=-1;
-function a(t){var d=document.createElement('div');d.textContent=t;o.appendChild(d);o.scrollTop=o.scrollHeight}
-i.addEventListener('keydown',function(e){
- if(e.key==='Enter'){
-  var c=this.value.trim();if(!c)return;
-  a(p.textContent+c);h.push(c);hi=h.length;this.value='';
-  fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:c})})
-  .then(function(r){return r.json()}).then(function(d){if(d.output)a(d.output);if(d.prompt)p.textContent=d.prompt})
-  .catch(function(e){a('Error: '+e.message)})
- }else if(e.key==='ArrowUp'){e.preventDefault();if(hi>0){hi--;this.value=h[hi]}}
- else if(e.key==='ArrowDown'){e.preventDefault();if(hi<h.length-1){hi++;this.value=h[hi]}else{hi=h.length;this.value=''}}
-});
-fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:''})})
-.then(function(r){return r.json()}).then(function(d){if(d.output)a(d.output);if(d.prompt)p.textContent=d.prompt})
-.catch(function(e){a('Error: '+e.message)});
-</script>
-</body>
-</html>"""
-
-_webportal_server: HTTPServer | None = None
-_webportal_shell_ref: "LogShell | None" = None
-
-
-class WebPortalHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        if urllib.parse.urlparse(self.path).path in ("/", "/index.html"):
-            body = _WEBPORTAL_HTML.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-cache")
-            self.close_connection = True
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_error(404)
-
-    def do_POST(self) -> None:
-        if urllib.parse.urlparse(self.path).path == "/api/command":
-            shell = _webportal_shell_ref
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length) if content_length else b"{}"
-            data: dict = {}
-            if body:
-                try:
-                    data = json.loads(body)
-                except json.JSONDecodeError:
-                    data = {}
-            cmd = data.get("command", "").strip()
-            if shell is None:
-                out = "(shell not available)\n"
-                pr = "(no shell) "
-            elif not cmd:
-                out = "analyzelog web portal. Type 'commands' for reference.\n"
-                pr = shell.prompt
-            elif cmd.lower() in ("quit", "exit", "q"):
-                out = "Type 'webportal disable' to stop the web portal.\n"
-                pr = shell.prompt
-            else:
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    try:
-                        shell.onecmd(cmd)
-                    except Exception as exc:
-                        print(f"Error: {exc}")
-                out = buf.getvalue()
-                shell._refresh_prompt()
-                pr = shell.prompt
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"output": out, "prompt": pr}, default=str).encode("utf-8"))
-        else:
-            self.send_error(404)
-
-    def log_message(self, format: str, *args: Any) -> None:
+        _extra.append(_site.getusersitepackages())
+    except Exception:
         pass
-
-
-def start_webportal(shell: "LogShell", host: str = "127.0.0.1", port: int = 80) -> HTTPServer:
-    global _webportal_shell_ref
-    _webportal_shell_ref = shell
-    server = HTTPServer((host, port), WebPortalHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    return server
-
-
-# ---------- Interactive data frame (#7) ---------------------------------------
-
-def dataframe_view(entries: list[Entry], expr: str = "") -> str:
-    if not PANDAS_OK:
-        return "pandas not installed; try: pip install pandas"
-    rows = []
-    for e in entries:
-        rows.append({
-            "ts": e.ts.isoformat() if e.ts else None,
-            "user": e.user,
-            "target": e.target,
-            "level": e.level,
-            "event": e.event,
-            "text": (e.text or "")[:200],
-        })
-    df = pd.DataFrame(rows)
-    if expr.strip():
-        try:
-            result = eval(expr, {"pd": pd, "df": df, "np": __import__("numpy", on_error=lambda: None)})
-            return str(result)
-        except Exception as exc:
-            return f"Error: {exc}"
-    return str(df.head(50))
-
-# ---------- Recurrence detection (#8) -----------------------------------------
-
-@dataclass
-class Recurrence:
-    user: str
-    pattern_type: str  # daily|weekly|hourly
-    confidence: float  # 0-1
-    description: str
-
-def detect_recurrence(entries: list[Entry], user: str) -> list[Recurrence]:
-    u = user.lower()
-    user_entries = [e for e in entries if e.ts and e.user and e.user.lower() == u]
-    if len(user_entries) < 7:
-        return []
-    results: list[Recurrence] = []
-
-    # weekly recurrence: check if active on consistent weekdays
-    by_weekday: Counter = Counter()
-    for e in user_entries:
-        if e.ts:
-            by_weekday[e.ts.weekday()] += 1
-    if by_weekday:
-        max_wd = max(by_weekday.values())
-        active_wds = [d for d, n in by_weekday.items() if n >= max_wd * 0.5]
-        confidence = max_wd / (sum(by_weekday.values()) or 1)
-        if len(active_wds) <= 3 and confidence > 0.3:
-            wd_names = [("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[d] for d in sorted(active_wds)]
-            results.append(Recurrence(user, "weekly", confidence, f"Active on {', '.join(wd_names)}"))
-
-    # hourly recurrence
-    by_hour_r: Counter = Counter()
-    for e in user_entries:
-        if e.ts:
-            by_hour_r[e.ts.hour] += 1
-    if by_hour_r:
-        peak_h = max(by_hour_r, key=by_hour_r.get)
-        peak_n = by_hour_r[peak_h]
-        total_h = sum(by_hour_r.values())
-        conf_h = peak_n / total_h if total_h > 0 else 0
-        if conf_h > 0.25:
-            results.append(Recurrence(user, "hourly", conf_h,
-                                      f"Peak activity at {peak_h}:00 ({conf_h:.0%} of all activity)"))
-
-    # daily recurrence: are they appearing nearly every day?
-    if len(user_entries) >= 3:
-        dates = sorted({e.ts.date() for e in user_entries if e.ts})
-        span = (dates[-1] - dates[0]).days or 1
-        coverage = len(dates) / span
-        if coverage > 0.5:
-            results.append(Recurrence(user, "daily", coverage,
-                                      f"Active on {len(dates)}/{span} days ({coverage:.0%})"))
-
-    return results
-
-# ---------- Churn prediction (#9) ---------------------------------------------
-
-@dataclass
-class ChurnPrediction:
-    user: str
-    risk_score: float  # 0-1
-    factors: list[str]
-
-def predict_churn(entries: list[Entry], user: str) -> ChurnPrediction:
-    u = user.lower()
-    user_entries = [e for e in entries if e.ts and e.user and e.user.lower() == u]
-    if len(user_entries) < 5:
-        return ChurnPrediction(user, 0.0, ["insufficient data"])
-
-    dates = sorted({e.ts.date() for e in user_entries if e.ts})
-    factors: list[str] = []
-    score = 0.0
-
-    # factor 1: recency (how long since last seen)
-    if dates:
-        days_since_last = (datetime.now().date() - dates[-1]).days
-        if days_since_last > 7:
-            score += 0.3
-            factors.append(f"last active {days_since_last}d ago")
-        elif days_since_last > 3:
-            score += 0.15
-
-    # factor 2: activity trend (declining?)
-    if len(user_entries) >= 6:
-        half = len(user_entries) // 2
-        first_half = user_entries[:half]
-        second_half = user_entries[half:]
-        if second_half and first_half:
-            ratio = len(second_half) / len(first_half)
-            if ratio < 0.5:
-                score += 0.3
-                factors.append(f"activity declined {ratio:.0%} (recent vs earlier)")
-
-    # factor 3: sentiment trend
-    s = user_sentiment(entries, user)
-    if s and s.get("mean_compound", 0) < -0.1:
-        score += 0.2
-        factors.append(f"negative sentiment ({s['mean_compound']:.2f})")
-
-    # factor 4: narrowing targets (fewer channels/targets recently)
-    half = max(len(user_entries) // 2, 1)
-    recent_targets = {e.target for e in user_entries[-half:] if e.target}
-    early_targets = {e.target for e in user_entries[:half] if e.target}
-    if early_targets and len(recent_targets) < len(early_targets) * 0.5:
-        score += 0.2
-        factors.append("narrowing engagement (fewer targets)")
-
-    risk = min(1.0, score)
-    return ChurnPrediction(user, risk, factors)
-
-# ---------- Pareto analysis (#10) ---------------------------------------------
-
-@dataclass
-class ParetoResult:
-    category: str  # users|events|targets
-    items: list[tuple[str, int, float]]  # name, count, cumulative%
-    top_80_pct_count: int  # how many items account for 80% of activity
-
-def pareto_analysis(entries: list[Entry], category: str = "users",
-                    top_n: int = 50) -> ParetoResult:
-    counter: Counter = Counter()
-    for e in entries:
-        if category == "users" and e.user:
-            counter[e.user] += 1
-        elif category == "events" and e.event:
-            counter[e.event] += 1
-        elif category == "targets" and e.target:
-            counter[e.target] += 1
-        elif category == "levels" and e.level:
-            counter[e.level] += 1
-    if not counter:
-        return ParetoResult(category, [], 0)
-    total = sum(counter.values()) or 1
-    running = 0
-    items: list[tuple[str, int, float]] = []
-    top_80_count = 0
-    for name, count in counter.most_common(top_n):
-        running += count
-        cum_pct = running / total * 100
-        items.append((name, count, cum_pct))
-        if cum_pct < 80:
-            top_80_count += 1
-    return ParetoResult(category, items, top_80_count)
-
-# ---------- Dashboard mode (#16) - curses real-time TUI -----------------------
-
-_DASH_REFRESH_SEC = 2.0
-
-def _dashboard_curses(stdscr, entries_access, alert_engine, log_path) -> None:
-    if not CURSES_OK:
-        return
-    curses.curs_set(0)
-    curses.use_default_colors()
-    stdscr.nodelay(True)
-    last_refresh = 0.0
-    pause = False
-    while True:
-        now = time.time()
-        if now - last_refresh >= _DASH_REFRESH_SEC and not pause:
-            last_refresh = now
-            try:
-                stdscr.erase()
-                maxy, maxx = stdscr.getmaxyx()
-                if maxy < 10 or maxx < 30:
-                    stdscr.addstr(0, 0, "Terminal too small")
-                    stdscr.refresh()
-                    continue
-                entries = entries_access()
-                col_w = maxx // 3
-                # Left panel: top users
-                users: Counter = Counter()
-                for e in entries:
-                    if e.user:
-                        users[e.user] += 1
-                top_users = users.most_common(15)
-                header = f"DASHBOARD  {log_path}  ({len(entries)} entries)"
-                stdscr.attron(curses.A_BOLD)
-                stdscr.addstr(0, 0, header[:maxx-1])
-                stdscr.attroff(curses.A_BOLD)
-                stdscr.addstr(1, 0, "─" * min(maxx-1, 60))
-                stdscr.addstr(2, 0, "TOP USERS", curses.A_BOLD)
-                row = 3
-                for i, (u, c) in enumerate(top_users):
-                    if row >= maxy - 2:
-                        break
-                    label = f" {i+1:2d} {c:>5d}  {u[:col_w-12]}"
-                    stdscr.addstr(row, 0, label[:col_w-1])
-                    row += 1
-                # Middle panel: hourly histogram
-                mid_x = col_w
-                hist: Counter = Counter()
-                for e in entries:
-                    if e.ts:
-                        hist[e.ts.hour] += 1
-                stdscr.addstr(2, mid_x, "HOURLY ACTIVITY", curses.A_BOLD)
-                max_h = max(hist.values()) or 1
-                row = 3
-                for h in range(24):
-                    if row >= maxy - 2:
-                        break
-                    cnt = hist.get(h, 0)
-                    bar_w = int(cnt / max_h * (col_w - 8))
-                    stdscr.addstr(row, mid_x, f"{h:02d} {'█' * bar_w:<{col_w-8}} {cnt}")
-                    row += 1
-                # Right panel: alerts + recent flagged
-                right_x = mid_x * 2
-                stdscr.addstr(2, right_x, "ALERTS / FLAGGED", curses.A_BOLD)
-                alerts = []
-                if alert_engine:
-                    for rule in alert_engine.rules:
-                        if rule.enabled:
-                            alerts.append(f" {rule.name}: {rule.message[:30]}")
-                row = 3
-                for a in alerts[:maxy-6]:
-                    if row >= maxy - 2:
-                        break
-                    stdscr.addstr(row, right_x, a[:maxx-right_x-1])
-                    row += 1
-                # Bottom bar
-                status = " PAUSED" if pause else " LIVE"
-                stdscr.attron(curses.A_REVERSE)
-                stdscr.addstr(maxy-1, 0, f" {status}  [Q]uit [P]ause [R]efresh  ".ljust(maxx-1))
-                stdscr.attroff(curses.A_REVERSE)
-                stdscr.refresh()
-            except curses.error:
-                pass
-        # Key handling
-        try:
-            key = stdscr.getch()
-        except curses.error:
-            key = -1
-        if key == ord("q") or key == ord("Q"):
-            break
-        elif key == ord("p") or key == ord("P"):
-            pause = not pause
-        elif key == ord("r") or key == ord("R"):
-            last_refresh = 0.0
-        elif key == ord("d"):
-            _dashboard_drill(stdscr, entries, entries_access)
-        elif key != -1:
-            pass
-        time.sleep(0.1)
-
-def _dashboard_drill(stdscr, entries, entries_access) -> None:
-    """Sub-screen: pick a user to drill into."""
-    users = sorted({e.user for e in entries if e.user})
-    if not users:
-        return
-    curses.curs_set(0)
-    curses.use_default_colors()
-    sel = 0
-    offset = 0
-    max_vis = 20
-    while True:
-        try:
-            stdscr.erase()
-            maxy, maxx = stdscr.getmaxyx()
-            stdscr.addstr(0, 0, "SELECT USER (up/down, enter to drill, q back)", curses.A_BOLD)
-            visible = users[offset:offset+max_vis]
-            for i, u in enumerate(visible):
-                attr = curses.A_REVERSE if i == sel - offset else 0
-                stdscr.addstr(2 + i, 2, f" {u[:maxx-4]} ", attr)
-            stdscr.refresh()
-            key = stdscr.getch()
-            if key == ord("q"):
-                break
-            elif key == curses.KEY_UP and sel > 0:
-                sel -= 1
-                if sel < offset:
-                    offset = max(0, offset - 1)
-            elif key == curses.KEY_DOWN and sel < len(users) - 1:
-                sel += 1
-                if sel - offset >= max_vis:
-                    offset = min(len(users) - max_vis, offset + 1)
-            elif key == ord("\n") or key == ord("\r"):
-                _dashboard_user_detail(stdscr, users[sel], entries_access)
-                curses.curs_set(0)
-        except curses.error:
-            break
-
-def _dashboard_user_detail(stdscr, user, entries_access) -> None:
-    user_entries = [e for e in entries_access() if e.user and e.user.lower() == user.lower()]
-    if not user_entries:
-        return
-    curses.curs_set(0)
-    curses.use_default_colors()
-    offset = 0
-    rows = 15
-    while True:
-        try:
-            stdscr.erase()
-            maxy, maxx = stdscr.getmaxyx()
-            stdscr.addstr(0, 0, f"USER: {user}  ({len(user_entries)} lines) [q] back", curses.A_BOLD)
-            visible = user_entries[offset:offset+rows]
-            for i, e in enumerate(visible):
-                ts = e.dt or e.ts
-                text = e.text or e.raw[:80]
-                line = f" {ts:%H:%M} {text[:maxx-14]}"
-                stdscr.addstr(2 + i, 0, line[:maxx-1])
-            stdscr.addstr(maxy-1, 0, " ↑↓ scroll  q back", curses.A_REVERSE)
-            stdscr.refresh()
-            key = stdscr.getch()
-            if key == ord("q"):
-                break
-            elif key == curses.KEY_UP and offset > 0:
-                offset -= 1
-            elif key == curses.KEY_DOWN and offset < len(user_entries) - rows:
-                offset += 1
-        except curses.error:
-            break
-
-def run_dashboard(entries, alert_engine, log_path="ai_scores.log") -> None:
-    if not CURSES_OK:
-        print("curses not available; install via 'pip install windows-curses' on Windows")
-        return
-    entries_shared = entries
-    def _access():
-        return entries_shared
     try:
-        curses.wrapper(lambda stdscr: _dashboard_curses(stdscr, _access, alert_engine, log_path))
-    except KeyboardInterrupt:
+        _extra.extend(_site.getsitepackages())
+    except Exception:
         pass
-
-# ---------- Watch-mode alerting (feature a) -----------------------------------
-
-# Global holder for shell state access from callbacks
-_current_shell: dict[str, Any] = {}
-def _set_current_shell(shell) -> None:
-    _current_shell["shell"] = shell
-
-def watch_with_alerts(log_path: str, engine: AlertEngine, webhook_url: str = "", webhook_type: str = "slack",
-                      poll: float = 2.0) -> None:
-    def cb(new_entries: list[Entry]) -> None:
-        for entry in new_entries:
-            alerts = engine.evaluate(entry)
-            if alerts:
-                for msg in alerts:
-                    print(f"\r ALERT: {msg}")
-                if webhook_url:
-                    send_webhook(webhook_url, "\n".join(alerts), webhook_type)
-    watch_loop(log_path, cb, poll=poll)
-
-# ---------- Forecast-aware anomaly (feature b) --------------------------------
-
-def forecast_aware_anomaly(entries: list[Entry], user: str, z: float = 2.5,
-                           forecast_days: int = 7) -> dict:
-    """Detect anomalies using forecasted baseline instead of simple mean."""
-    base = forecast_activity(entries, user, forecast_days)
-    user_entries = [e for e in entries if line_matches_user(e, user)]
-    daily: Counter = Counter()
-    for e in user_entries:
-        if e.ts:
-            daily[e.ts.date()] += 1
-    if not daily:
-        return {"user": user, "anomalies": [], "note": "insufficient data"}
-    if not base.get("forecast"):
-        # fall back to standard anomaly
-        return detect_anomalies(entries, user, z)
-    anomalies = []
-    forecast_map = {f["date"]: f.get("predicted", 0) for f in base["forecast"] if isinstance(f, dict)}
-    today = datetime.now().date()
-    for date_key, actual in sorted(daily.items()):
-        expected = forecast_map.get(str(date_key), forecast_map.get(date_key, None))
-        if expected is not None:
-            dev = abs(actual - expected)
-            if dev > z * (base.get("rmse", 1) or 1):
-                anomalies.append({"date": str(date_key), "actual": actual, "expected": expected})
-    return {"user": user, "anomalies": anomalies, "forecast_based": True}
-
-# ---------- Alert fatigue scoring (feature c) ---------------------------------
-
-@dataclass
-class AlertFatigueScore:
-    rule_name: str
-    fires_total: int
-    fires_last_hour: int
-    signal_rate: float  # 0-1, lower = more fatigued
-    suggestion: str
-
-def alert_fatigue_scores(engine: AlertEngine, recent_entries: list[Entry],
-                         window_hours: int = 1) -> list[AlertFatigueScore]:
-    now = datetime.now()
-    window_ago = now - timedelta(hours=window_hours)
-    recent_set = [e for e in recent_entries if e.ts and e.ts >= window_ago]
-    scores: list[AlertFatigueScore] = []
-    for rule in engine.rules:
-        if not rule.enabled:
-            continue
-        total = 0
-        last_hour = 0
-        for e in recent_set:
-            vals = []
-            if rule.field == "user":
-                vals = [e.user]
-            elif rule.field in SCORE_KEYS:
-                sv = _scores_from_raw(e.raw).get(rule.field)
-                if sv is not None:
-                    vals = [str(sv)]
-            else:
-                vals = [e.raw]
-            for v in vals:
-                if v is None:
-                    continue
-                try:
-                    if rule.op == "==" and v.lower() == rule.value.lower():
-                        total += 1
-                        if e.ts and e.ts >= window_ago:
-                            last_hour += 1
-                    elif rule.op == ">" and float(v) > float(rule.value):
-                        total += 1
-                        if e.ts and e.ts >= window_ago:
-                            last_hour += 1
-                except (ValueError, TypeError):
-                    pass
-        total_fires = total
-        hourly_rate = last_hour / max(1, window_hours)
-        signal_rate = max(0.0, 1.0 - min(1.0, hourly_rate / 10.0))
-        if signal_rate < 0.3:
-            suggestion = "Consider raising threshold or disabling"
-        elif signal_rate < 0.7:
-            suggestion = "Monitor; may need tuning"
-        else:
-            suggestion = "Healthy signal rate"
-        scores.append(AlertFatigueScore(rule.name, total_fires, last_hour, signal_rate, suggestion))
-    return scores
-
-# ---------- Drill-down HTML report (feature d) --------------------------------
-
-def write_html_report_drilldown(path: str, summary: dict, profiles: list[dict] | None = None) -> None:
-    """Enhanced HTML report with collapsible user sections."""
-    html_parts = ['<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">',
-                  '<title>Log Analysis Report</title>',
-                  '<style>body{font-family:sans-serif;margin:20px}',
-                  '.section{cursor:pointer;background:#f0f0f0;padding:8px;margin:4px 0;border-radius:4px}',
-                  '.section:hover{background:#e0e0e0}',
-                  '.content{display:none;padding:8px;border-left:3px solid #ccc;margin:0 0 8px 8px}',
-                  '.active .content{display:block}',
-                  'table{border-collapse:collapse;width:100%}',
-                  'td,th{border:1px solid #ddd;padding:6px;text-align:left}',
-                  '</style>',
-                  '<script>function toggle(e){e.classList.toggle("active")}</script>',
-                  '</head><body>']
-    html_parts.append(f"<h1>Log Analysis Report</h1>")
-    html_parts.append(f"<p>Total entries: {summary.get('total', 0):,}</p>")
-    # Collapsible sections
-    for title, data_key in [("Users", "users"), ("Targets/Channels", "targets"),
-                             ("Events", "events"), ("Levels", "levels")]:
-        items = summary.get(data_key, {})
-        if items:
-            html_parts.append(f'<div class="section" onclick="toggle(this)">▸ <b>{title}</b> ({len(items)})</div>')
-            html_parts.append(f'<div class="content">')
-            html_parts.append("<table><tr><th>Name</th><th>Count</th></tr>")
-            for name, count in sorted(items.items(), key=lambda x: -x[1])[:30]:
-                html_parts.append(f"<tr><td>{html_mod.escape(name)}</td><td>{count}</td></tr>")
-            html_parts.append("</table></div>")
-    # Profiles
-    if profiles:
-        for prof in profiles:
-            user = prof.get("user", "?")
-            html_parts.append(f'<div class="section" onclick="toggle(this)">▸ <b>Profile: {html_mod.escape(user)}</b></div>')
-            html_parts.append(f'<div class="content"><pre>{html_mod.escape(json.dumps(prof, indent=2, default=str))}</pre></div>')
-    html_parts.append("</body></html>")
+    # Also scan sibling Lib/site-packages of the running interpreter
+    _extra.append(str(pathlib.Path(sys.executable).parent / "Lib" / "site-packages"))
+    _extra.append(str(pathlib.Path(sys.executable).parent.parent / "Lib" / "site-packages"))
+    for _p in _extra:
+        if _p and _p not in sys.path:
+            sys.path.insert(0, _p)
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(html_parts))
-    except OSError as exc:
-        print(f"Error writing HTML: {exc}", file=sys.stderr)
+        import windows_curses  # type: ignore
+    except ImportError:
+        if _NO_INSTALL:
+            sys.exit("windows-curses not found and --no-install is set. "
+                     "Run without --no-install or: pip install windows-curses")
+        print("windows-curses not found — installing...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "windows-curses"])
+    import curses
 
-# ---------- Session-aware metrics (feature e) ---------------------------------
+# =========================
+# Config
+# =========================
+DEFAULT_SERVER = "irc.libera.chat"
+DEFAULT_PORT = 6697
+DEFAULT_NICK = "cfuser"
+DEFAULT_CHANNEL = "##anime"
+NICKSERV_PASSWORD = os.environ.get("IRC_NICKSERV_PASSWORD", "")
+# SASL mechanism and credential paths.  Supported mechanisms:
+#   PLAIN                    — password in IRC_NICKSERV_PASSWORD [default]
+#   SCRAM-SHA-256            — RFC-5802 SCRAM (password in IRC_NICKSERV_PASSWORD)
+#   EXTERNAL                 — TLS client certificate (IRC_SASL_CERT + IRC_SASL_KEY)
+#   ECDSA-NIST256P-CHALLENGE — EC challenge-response (IRC_SASL_KEY; needs 'cryptography' pkg)
+SASL_MECHANISM = os.environ.get("IRC_SASL_MECHANISM", "PLAIN").upper()
+SASL_CERT      = os.environ.get("IRC_SASL_CERT", "")   # path to PEM client certificate
+SASL_KEY       = os.environ.get("IRC_SASL_KEY", "")    # path to PEM private key
 
-def session_response_times(entries: list[Entry], user_a: str, user_b: str,
-                           gap_minutes: int = 30) -> list[dict]:
-    """Compute response times grouped by session."""
-    sessions = detect_sessions(entries, user_a, gap_minutes)
-    results = []
-    for sess in sessions:
-        a_entries = [e for e in sess.entries if line_matches_user(e, user_a)]
-        b_entries = [e for e in sess.entries if line_matches_user(e, user_b)]
-        if not a_entries or not b_entries:
-            continue
-        a_times = sorted([e.ts for e in a_entries if e.ts])
-        b_times = sorted([e.ts for e in b_entries if e.ts])
-        if not a_times or not b_times:
-            continue
-        for at in a_times:
-            future = [bt for bt in b_times if bt > at]
-            if future:
-                delay = (future[0] - at).total_seconds()
-                results.append({"session_start": str(sess.start), "responder": user_b,
-                                "delay_seconds": delay, "type": "a_to_b"})
-        for bt in b_times:
-            future = [at for at in a_times if at > bt]
-            if future:
-                delay = (future[0] - bt).total_seconds()
-                results.append({"session_start": str(sess.start), "responder": user_a,
-                                "delay_seconds": delay, "type": "b_to_a"})
-    return results
+MAX_MESSAGES = 500
+USER_HISTORY_WINDOW = 200
+AI_SUSPECT_THRESHOLD = 70
+# _NO_AI / _NO_INSTALL are defined early (before imports) — see top of file.
+# AI detection logging: enabled by default.  Set IRC_AI_LOG=0 to disable at startup.
+# Can also be toggled at runtime with /logtoggle.
+_ai_logging_enabled: bool = os.environ.get("IRC_AI_LOG", "1") not in ("0", "false", "no", "off")
+_AUTOJOIN_CHANNELS: set = set()
 
-# ---------- Influence chain tracking (feature f) ------------------------------
+# All data files are placed next to the script so they are writable regardless
+# of the working directory the user launches from (e.g. C:\Windows\system32).
+_SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
+AI_LOG_PATH        = os.path.join(_SCRIPT_DIR, "ai_scores.log")
+INPUT_HISTORY_PATH = os.path.join(_SCRIPT_DIR, "irc_input_history.txt")
+IRC_CONFIG_PATH    = os.path.join(_SCRIPT_DIR, "irc_config.json")
+INPUT_HISTORY_MAX  = 500
+CHAT_LOG_DIR       = os.path.join(_SCRIPT_DIR, "chat_logs")
+LINK_LOG_DIR       = os.path.join(_SCRIPT_DIR, "link_logs")
+CHAT_LOG_LOAD      = 500
+# User-contributed tell-phrases learned via /learn_tell
+USER_TELL_PATH     = os.path.join(_SCRIPT_DIR, "user_tell_phrases.json")
+# Sentence embedding model for semantic-drift detection
+EMBEDDING_MODEL: str = os.environ.get("IRC_EMBEDDING_MODEL", "")  # e.g. "all-MiniLM-L6-v2"
 
-def influence_chains(entries: list[Entry], seed_user: str, max_hops: int = 3,
-                     window_seconds: int = 300) -> list[list[dict]]:
-    """Trace multi-hop reply chains: A→B→C within a time window per hop."""
-    hop_map: dict[str, list[Entry]] = {}
-    for e in entries:
-        if e.target:
-            hop_map.setdefault(e.target.lower(), []).append(e)
-    chains: list[list[dict]] = []
-    def _walk(current_user: str, depth: int, chain: list, visited: set) -> None:
-        if depth >= max_hops:
-            return
-        replied = hop_map.get(current_user.lower(), [])
-        for re in replied:
-            if re.user and re.user.lower() not in visited and re.ts:
-                next_user = re.user
-                chain.append({"user": next_user, "ts": str(re.ts), "text": (re.text or re.raw)[:100]})
-                visited.add(next_user.lower())
-                _walk(next_user, depth + 1, chain, visited)
-                if len(chain) >= 2:
-                    chains.append(list(chain))
-                chain.pop()
-                visited.discard(next_user.lower())
-    _walk(seed_user, 0, [], {seed_user.lower()})
-    # Filter by window
-    filtered = []
-    for chain in chains:
-        ok = True
-        for i in range(1, len(chain)):
-            t0 = _safe_parse_ts(chain[i-1]["ts"])
-            t1 = _safe_parse_ts(chain[i]["ts"])
-            if t0 and t1 and abs((t1 - t0).total_seconds()) > window_seconds:
-                ok = False
-                break
-        if ok:
-            filtered.append(chain)
-    return filtered
+# AI provider keys
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
+DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY", "")
+GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
+# Ollama: local/offline LLM server.  Override with OLLAMA_URL env var if running elsewhere.
+OLLAMA_URL: str    = os.environ.get("OLLAMA_URL",    "http://127.0.0.1:11434")
+# llama.cpp: local server with OpenAI-compatible API.  Override with LLAMACPP_URL env var.
+LLAMACPP_URL: str  = os.environ.get("LLAMACPP_URL",  "http://127.0.0.1:8033")
+# Modern observer model for Binoculars — replaced distilgpt2 when set.
+# Any HuggingFace causal LM works (e.g. "TinyLlama/TinyLlama-1.1B-Chat-v1.0").
+# Falls back to distilgpt2 if loading fails.
+OBSERVER_MODEL_ID: str = os.environ.get("IRC_OBSERVER_MODEL", "distilgpt2")
 
-def _safe_parse_ts(ts_str: str) -> datetime | None:
+# Unified model registry — key is the short name used in /askai, /summarize, /model.
+# Each entry: provider ("claude"|"openai"|"ollama"|"llamacpp"), api model id, human label.
+# Ollama models require `ollama serve` running locally; no API key needed.
+# Pull models with e.g.:  ollama pull gemma3:4b   or   ollama pull llama3.2
+# llama.cpp models require `llama-server` running at LLAMACPP_URL; model field is advisory.
+AI_MODELS: Dict[str, Dict[str, str]] = {
+    # ── Cloud: Anthropic Claude ───────────────────────────────────────────
+    "opus":    {"provider": "claude",   "id": "claude-opus-4-6",            "label": "Claude Opus 4"},
+    "sonnet":  {"provider": "claude",   "id": "claude-sonnet-4-6",          "label": "Claude Sonnet 4"},
+    "haiku":   {"provider": "claude",   "id": "claude-haiku-4-5-20251001",  "label": "Claude Haiku 4"},
+    # ── Cloud: OpenAI GPT ─────────────────────────────────────────────────
+    "gpt4o":   {"provider": "openai",   "id": "gpt-4o",                     "label": "GPT-4o"},
+    "gpt4":    {"provider": "openai",   "id": "gpt-4-turbo",                "label": "GPT-4 Turbo"},
+    "gpt35":   {"provider": "openai",   "id": "gpt-3.5-turbo",              "label": "GPT-3.5 Turbo"},
+    # ── Cloud: DeepSeek ──────────────────────────────────────────────────
+    "deepseek": {"provider": "deepseek", "id": "deepseek-chat",     "label": "DeepSeek-V3"},
+    "dsr1":     {"provider": "deepseek", "id": "deepseek-reasoner", "label": "DeepSeek-R1"},
+    # ── Cloud: GitHub Copilot ────────────────────────────────────────────
+    "copilot":  {"provider": "copilot",  "id": "gpt-4o",            "label": "Copilot GPT-4o"},
+    "copilot-mini": {"provider": "copilot", "id": "gpt-4o-mini",    "label": "Copilot GPT-4o-mini"},
+    # ── Local/offline: Ollama ─────────────────────────────────────────────
+    "gemma":   {"provider": "ollama",   "id": "gemma3:4b",   "label": "Gemma 3 4B   (Ollama/offline)"},
+    "llama3":  {"provider": "ollama",   "id": "llama3.2",    "label": "Llama 3.2    (Ollama/offline)"},
+    # ── Local/offline: llama.cpp ─────────────────────────────────────────
+    "gemma4":  {"provider": "llamacpp", "id": "gemma-4",     "label": "Gemma 4      (llama.cpp/offline)"},
+    "qwen3":   {"provider": "llamacpp", "id": "qwen3",       "label": "Qwen 3       (llama.cpp/offline)"},
+}
+# Keep CLAUDE_MODELS as a filtered view so existing internal references still work.
+CLAUDE_MODELS: Dict[str, str] = {
+    k: v["id"] for k, v in AI_MODELS.items() if v["provider"] == "claude"
+}
+CLAUDE_DEFAULT_MODEL = "qwen3"    # default model key
+
+# 5 built-in UI colour themes
+# Each row: (name, pair1_fg, pair1_bg, pair2_fg, pair2_bg, pair3_fg, pair3_bg, pair8_fg, pair8_bg)
+#   pair1 = chat title bar    pair2 = userlist header
+#   pair3 = suspect nick      pair8 = /me action line
+# Colours: 0=black 1=red 2=green 3=yellow 4=blue 5=magenta 6=cyan 7=white  -1=terminal default
+THEMES: List[Tuple] = [
+    ("Classic",  6, -1,  5, -1,  3, -1,  2, -1),  # cyan title / magenta users / yellow suspect / green action
+    ("Hacker",   2,  0,  2,  0,  2, -1,  2, -1),  # matrix-green on black
+    ("Ocean",    7,  4,  6,  4,  6, -1,  6, -1),  # white+cyan headers on blue
+    ("Sunset",   0,  3,  1, -1,  1, -1,  3, -1),  # black-on-yellow title / red suspects / yellow action
+    ("Neon",     0,  5,  5, -1,  5, -1,  6, -1),  # black-on-magenta title / magenta suspects / cyan action
+]
+
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+
+# =========================
+# Chat & Input Persistence
+# =========================
+_UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_ACTION_LINE_RE     = re.compile(r'^\[\d{2}:\d{2}\] \* \S')  # "[HH:MM] * nick …"
+_URL_RE             = re.compile(r'https?://[^\s\x00-\x1f\x7f<>"]+')  # bare URL in plain text
+
+# Frozensets for O(1) IRC numeric-reply membership tests in process_line
+_WHOIS_REPLIES = frozenset({"307", "311", "312", "313", "317", "318", "319", "330", "671"})
+_WHO_REPLIES   = frozenset({"352", "314"})
+_SERVER_INFO   = frozenset({"002", "003", "004", "005", "372", "375", "376"})
+# Channel-join error replies — routed to the channel window with the error
+_ERROR_REPLIES = frozenset({"471", "473", "474", "475", "477", "489"})
+# Numeric replies that are safely discarded (end-of-list markers, stats, etc.)
+_SILENT_NUMERICS = frozenset({"315", "333", "366", "265", "266"})
+
+def _chat_log_path(window_name: str) -> str:
+    safe = _UNSAFE_FILENAME_RE.sub("_", window_name) or "_"
+    # Collapse dot-sequences to prevent directory traversal (e.g. ".." → "_")
+    safe = re.sub(r'\.{2,}', '_', safe) or "_"
+    return os.path.join(CHAT_LOG_DIR, safe + ".log")
+
+def load_irc_config() -> dict:
+    """Return saved server/nick/channel config, or {} if none exists."""
     try:
-        return datetime.fromisoformat(ts_str)
-    except (ValueError, TypeError):
-        return None
-
-# ---------- Template-based filtering (feature g) ------------------------------
-
-def filter_by_template(entries: list[Entry], template_id: str) -> list[Entry]:
-    """Filter entries matching a specific template ID (heuristic: first template line)."""
-    tmpls = extract_templates(entries, top_n=100)
-    tmpl = next((t for t in tmpls if t.id == template_id), None)
-    if not tmpl:
-        return []
-    pattern = re.escape(tmpl.pattern).replace(r"\{\*\}", ".*")
-    try:
-        rx = re.compile(pattern)
-    except re.error:
-        return []
-    return [e for e in entries if rx.search(e.raw or "")]
-
-# ---------- Drift monitoring (feature h) --------------------------------------
-
-def drift_detection(entries: list[Entry], user: str,
-                    window_a_days: int = 7, window_b_days: int = 7,
-                    gap_days: int = 0) -> dict:
-    """Compare pattern-of-life profiles across two time windows to detect drift."""
-    now = datetime.now()
-    # Window B = most recent
-    wb_end = now
-    wb_start = now - timedelta(days=window_b_days)
-    # Window A = before the gap
-    wa_end = wb_start - timedelta(days=gap_days)
-    wa_start = wa_end - timedelta(days=window_a_days)
-    entries_a = apply_time_filter(entries, wa_start, wa_end)
-    entries_b = apply_time_filter(entries, wb_start, wb_end)
-    a_user = [e for e in entries_a if line_matches_user(e, user)]
-    b_user = [e for e in entries_b if line_matches_user(e, user)]
-    if not a_user or not b_user:
-        return {"user": user, "drift_detected": False, "note": "insufficient data in both windows"}
-    pol_a = pattern_of_life(a_user, user) if a_user else None
-    pol_b = pattern_of_life(b_user, user) if b_user else None
-    if not pol_a or not pol_b:
-        return {"user": user, "drift_detected": False, "note": "could not compute profile"}
-    # Compare hourly profiles
-    drift_score = 0.0
-    max_val = 0.0
-    for h in range(24):
-        va = pol_a.hourly_profile.get(h, 0)
-        vb = pol_b.hourly_profile.get(h, 0)
-        drift_score += abs(va - vb)
-        max_val = max(max_val, abs(va - vb))
-    avg = drift_score / 24
-    return {"user": user, "drift_score": round(drift_score, 3),
-            "avg_hourly_delta": round(avg, 3),
-            "max_hourly_delta": round(max_val, 3),
-            "drift_detected": drift_score > 0.5 or max_val > 0.2}
-
-# ---------- Behavioral profile persistence (feature i) ------------------------
-
-def save_profile(user: str, entries: list[Entry], path: str) -> str:
-    """Compute and save a user profile to JSON."""
-    prof = build_profile(entries, user)
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(prof, f, indent=2, default=str)
-        return f"Profile for {user} saved to {path}"
-    except OSError as exc:
-        return f"Error saving profile: {exc}"
-
-def load_profile(path: str) -> dict | None:
-    """Load a saved profile from JSON."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"Error loading profile: {exc}", file=sys.stderr)
-        return None
-
-def compare_saved_profiles(paths: list[str]) -> list[dict]:
-    """Compare multiple saved profiles."""
-    profiles = []
-    for p in paths:
-        prof = load_profile(p)
-        if prof:
-            profiles.append(prof)
-    return profiles
-
-# ---------- Auto-tagging (feature j) -----------------------------------------
-
-def auto_tag_user(entries: list[Entry], user: str, llm_url: str, llm_model: str,
-                  max_chunk_chars: int = 12000, cache: LLMCache | None = None) -> str:
-    """Use LLM to auto-tag a user based on their log lines."""
-    user_entries = [e for e in entries if line_matches_user(e, user)]
-    if not user_entries:
-        return f"(no data for {user})"
-    text = "\n".join(e.text or e.raw for e in user_entries[:50])
-    if len(text) > max_chunk_chars:
-        text = text[:max_chunk_chars]
-    prompt = (
-        f"Analyze the following log lines from user '{user}' and assign 3-5 short tags "
-        f"(e.g. 'high-volume', 'error-prone', 'night-owl', 'support-focused', 'bot-like').\n"
-        f"Return only comma-separated tags, no explanation.\n\n{text}"
-    )
-    result = llm_complete(llm_url, llm_model, prompt, max_tokens=100, cache=cache)
-    return result.strip() if result else "(no response)"
-
-def auto_tag_bulk(entries: list[Entry], llm_url: str, llm_model: str,
-                  max_chunk_chars: int = 12000, cache: LLMCache | None = None,
-                  top_n: int = 10) -> dict[str, str]:
-    """Auto-tag top N users by activity."""
-    users: Counter = Counter()
-    for e in entries:
-        if e.user:
-            users[e.user] += 1
-    top = [u for u, _ in users.most_common(top_n)]
-    result: dict[str, str] = {}
-    for u in top:
-        result[u] = auto_tag_user(entries, u, llm_url, llm_model, max_chunk_chars, cache)
-    return result
-
-# ---------- Recurrence breach alert (feature k) -------------------------------
-
-def check_recurrence_breach(entries: list[Entry], user: str,
-                            recent_days: int = 3) -> dict:
-    """Check if a user breaks their established recurrence pattern."""
-    patterns = detect_recurrence(entries, user)
-    if not patterns:
-        return {"user": user, "breach": False, "note": "no pattern established"}
-    now = datetime.now()
-    window_start = now - timedelta(days=recent_days)
-    recent = [e for e in entries if e.ts and e.ts >= window_start and line_matches_user(e, user)]
-    breaches = []
-    for pat in patterns:
-        period = pat.pattern_type
-        if period == "daily":
-            counts: Counter = Counter()
-            for e in recent:
-                if e.ts:
-                    counts[e.ts.date()] += 1
-            expected = sum(counts.values()) / max(1, len(counts))
-            for d, c in sorted(counts.items()):
-                if expected > 0 and c < expected * 0.3:
-                    breaches.append({"date": str(d), "count": c, "expected": round(expected, 1), "period": "daily"})
-        elif period == "weekly":
-            wd_counts: Counter = Counter()
-            for e in recent:
-                if e.ts:
-                    wd_counts[e.ts.weekday()] += 1
-            expected_wd = sum(wd_counts.values()) / max(1, len(wd_counts))
-            for wd, c in sorted(wd_counts.items()):
-                if expected_wd > 0 and c < expected_wd * 0.3:
-                    breaches.append({"weekday": wd, "count": c, "expected": round(expected_wd, 1), "period": "weekly"})
-        elif period == "hourly" and pat.description:
-            h_counts: Counter = Counter()
-            for e in recent:
-                if e.ts:
-                    h_counts[e.ts.hour] += 1
-            import re as _re_h2
-            m = _re_h2.search(r"(\d+):00", pat.description)
-            if m:
-                peak_h = int(m.group(1))
-                if h_counts.get(peak_h, 0) < max(1, sum(h_counts.values()) // max(1, len(h_counts))):
-                    breaches.append({"hour": peak_h, "expected_peak": peak_h, "period": "hourly", "note": "reduced peak activity"})
-    if breaches:
-        return {"user": user, "breach": True, "breaches": breaches[:10], "patterns": [p.pattern_type for p in patterns]}
-    return {"user": user, "breach": False, "patterns": [p.pattern_type for p in patterns]}
-
-# ---------- Config persistence (feature l) ------------------------------------
-
-_SHELL_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".analyzelog_config.json")
-
-def save_shell_config(state: "ShellState") -> None:
-    data: dict[str, Any] = {
-        "webhook_url": state.webhook_url,
-        "webhook_type": state.webhook_type,
-        "plugin_dir": state.plugin_dir,
-        "top_n": state.top_n,
-        "llm_url": state.llm_url,
-        "llm_model": state.llm_model,
-        "max_chunk_chars": state.max_chunk_chars,
-        "rules": [],
-        "ignore_set": sorted(state.ignore_set),
-        "aliases": state.aliases,
-        "notes": state.notes,
-    }
-    for rule in state.alert_engine.rules:
-        data["rules"].append({
-            "name": rule.name, "field": rule.field, "op": rule.op,
-            "value": rule.value, "message": rule.message, "enabled": rule.enabled,
-        })
-    try:
-        with open(_SHELL_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, default=str)
-    except OSError:
-        pass
-
-def load_shell_config(state: "ShellState") -> None:
-    try:
-        with open(_SHELL_CONFIG_PATH, encoding="utf-8") as f:
+        with open(IRC_CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return
-    state.webhook_url = data.get("webhook_url", state.webhook_url)
-    state.webhook_type = data.get("webhook_type", state.webhook_type)
-    state.plugin_dir = data.get("plugin_dir", state.plugin_dir)
-    state.top_n = data.get("top_n", state.top_n)
-    state.llm_url = data.get("llm_url", state.llm_url)
-    state.llm_model = data.get("llm_model", state.llm_model)
-    state.max_chunk_chars = data.get("max_chunk_chars", state.max_chunk_chars)
-    for r in data.get("rules", []):
-        state.alert_engine.add(AlertRule(
-            name=r.get("name", "?"), field=r.get("field", "user"),
-            op=r.get("op", "=="), value=r.get("value", ""),
-            message=r.get("message", ""), enabled=r.get("enabled", True),
-        ))
-    state.ignore_set.update(data.get("ignore_set", []))
-    state.aliases.update(data.get("aliases", {}))
-    state.notes.update(data.get("notes", {}))
+        if isinstance(data, dict):
+            return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return {}
 
-
-# ---------- views (named filter sets) ---------------------------------------
-
-@dataclass
-class View:
-    name: str
-    user: str | None = None
-    target: str | None = None
-    since: datetime | None = None
-    until: datetime | None = None
-    regex: str | None = None
-    score_filter: list[tuple[str, str, float]] = field(default_factory=list)
-
-
-def apply_view(entries: Iterable[Entry], view: View) -> list[Entry]:
-    rx = re.compile(view.regex, re.I) if view.regex else None
-    u = view.user.lower() if view.user else None
-    t = view.target.lower() if view.target else None
-    out: list[Entry] = []
-    for e in entries:
-        if not in_time_range(e.ts, view.since, view.until):
-            continue
-        if u:
-            ok = (e.user and e.user.lower() == u) or (u in (e.raw or "").lower())
-            if not ok:
-                continue
-        if t and not (e.target and e.target.lower() == t):
-            continue
-        if rx and not rx.search(e.raw):
-            continue
-        if view.score_filter and not matches_score_filter(e, view.score_filter):
-            continue
-        out.append(e)
-    return out
-
-
-def view_describe(v: View) -> str:
-    parts = []
-    if v.user:
-        parts.append(f"user={v.user}")
-    if v.target:
-        parts.append(f"target={v.target}")
-    if v.since:
-        parts.append(f"since={v.since.isoformat()}")
-    if v.until:
-        parts.append(f"until={v.until.isoformat()}")
-    if v.regex:
-        parts.append(f"regex={v.regex!r}")
-    if v.score_filter:
-        parts.append("scores=[" + " ".join(f"{k}{op}{val}" for k, op, val in v.score_filter) + "]")
-    return ", ".join(parts) or "(empty)"
-
-
-# ---------- color / spinner / sparkline / config helpers -------------------
-
-class _Color:
-    enabled: bool = True
-    RED = "\033[31m"
-    GREEN = "\033[32m"
-    YELLOW = "\033[33m"
-    CYAN = "\033[36m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    RESET = "\033[0m"
-
-    @classmethod
-    def wrap(cls, s: str, c: str) -> str:
-        return f"{c}{s}{cls.RESET}" if cls.enabled else s
-
-    @classmethod
-    def auto_disable(cls) -> None:
-        if not sys.stdout.isatty():
-            cls.enabled = False
-        if os.environ.get("NO_COLOR"):
-            cls.enabled = False
-
-
-def _color_score(x) -> str:
-    """Color a score float by threshold (red ≥ 0.8, yellow ≥ 0.5, green else)."""
-    if not isinstance(x, float):
-        return _fmt_score(x)
-    s = f"{x:.3f}"
-    if x >= 0.8:
-        return _Color.wrap(s, _Color.RED)
-    if x >= 0.5:
-        return _Color.wrap(s, _Color.YELLOW)
-    return _Color.wrap(s, _Color.GREEN)
-
-
-SPARK_GLYPHS = "▁▂▃▄▅▆▇█"
-
-
-def sparkline(values: list[int]) -> str:
-    if not values:
-        return ""
-    peak = max(values) or 1
-    out = []
-    for v in values:
-        idx = int((v / peak) * (len(SPARK_GLYPHS) - 1))
-        out.append(SPARK_GLYPHS[idx])
-    return "".join(out)
-
-# ---------- ASCII timeline (#1) -----------------------------------------------
-
-def ascii_timeline(entries: list[Entry], user: str | None = None,
-                   width: int = 60, height: int = 12) -> str:
-    if user:
-        u = user.lower()
-        filtered = [e for e in entries if e.ts and e.user and e.user.lower() == u]
-    else:
-        filtered = [e for e in entries if e.ts]
-    if not filtered:
-        return "(no timestamped entries)"
-    ts_min = min(e.ts for e in filtered)
-    ts_max = max(e.ts for e in filtered)
-    span = (ts_max - ts_min).total_seconds() or 1
-    buckets: list[list[str]] = [[] for _ in range(width)]
-    for e in filtered:
-        frac = (e.ts - ts_min).total_seconds() / span
-        col = min(int(frac * width), width - 1)
-        label = (e.user or "?")[:6]
-        buckets[col].append(label)
-    max_per_col = max((len(b) for b in buckets), default=1)
-    lines: list[str] = []
-    for row in range(height - 1, -1, -1):
-        threshold = int(max_per_col * row / height) if height > 0 else 0
-        line_chars: list[str] = []
-        for col in range(width):
-            if len(buckets[col]) >= threshold:
-                line_chars.append("█")
-            elif len(buckets[col]) >= threshold - 1 and row > 0:
-                line_chars.append("▄")
-            else:
-                line_chars.append("·")
-        lines.append("".join(line_chars))
-    lines.append("─" * width)
-    label_lines = [f"  start: {ts_min}", f"  end:   {ts_max}", f"  span:  {ts_max - ts_min}"]
-    if user:
-        label_lines.insert(0, f"  user:  {user}")
-    return "\n".join(lines + label_lines)
-
-# ---------- Calendar heatmap (#2) ---------------------------------------------
-
-CALENDAR_COLORS = [" ", "░", "▒", "▓", "█"]
-
-def calendar_heatmap(entries: list[Entry], user: str | None = None,
-                     months: int = 3) -> str:
-    now = datetime.now()
-    start = now - timedelta(days=months * 31)
-    if user:
-        u = user.lower()
-        filtered = [e for e in entries if e.ts and e.user and e.user.lower() == u]
-    else:
-        filtered = [e for e in entries if e.ts]
-    by_date: Counter = Counter()
-    for e in filtered:
-        by_date[e.ts.date()] += 1
-    all_counts = list(by_date.values())
-    if not all_counts:
-        return "(no data)"
-    max_count = max(all_counts) or 1
-    lines: list[str] = []
-    lines.append(f"  Calendar heatmap for {'user ' + user if user else 'all users'} ({len(by_date)} active days)")
-    lines.append(f"  {CALENDAR_COLORS[0]}=0  {CALENDAR_COLORS[1]}=low  {CALENDAR_COLORS[2]}=med  {CALENDAR_COLORS[3]}=high  {CALENDAR_COLORS[4]}=peak")
-    cur = start
-    week: list[str] = []
-    header = True
-    while cur <= now:
-        if cur.weekday() == 0 and week:
-            lines.append("".join(week))
-            week = []
-        if header:
-            lines.append("  " + " ".join("Mon Tue Wed Thu Fri Sat Sun".split()))
-            header = False
-        count = by_date.get(cur.date(), 0)
-        idx = min(int(count / max_count * 4), 4) if max_count > 0 else 0
-        week.append(CALENDAR_COLORS[idx] + CALENDAR_COLORS[idx])
-        cur += timedelta(days=1)
-    if week:
-        lines.append("".join(week))
-    return "\n".join(lines)
-
-# ---------- ASCII network graph (#7) ------------------------------------------
-
-def ascii_network_graph(edges: Counter, top_n: int = 15, width: int = 50) -> str:
-    top_edges = edges.most_common(top_n)
-    if not top_edges:
-        return "(no edges)"
-    # collect nodes
-    nodes: set[str] = set()
-    for (a, b), _ in top_edges:
-        nodes.add(a)
-        nodes.add(b)
-    max_weight = max(w for _, w in top_edges) or 1
-    lines: list[str] = [f"  Network graph ({len(nodes)} nodes, {len(top_edges)} edges shown)"]
-    # print adjacency list
-    for (a, b), w in top_edges:
-        bar_len = int(w / max_weight * 20)
-        bar = "━" * bar_len + "➤" if bar_len > 0 else "➤"
-        lines.append(f"  {a:<15} {bar:<22} {b:<15}  (w={w})")
-    return "\n".join(lines)
-
-
-class Spinner:
-    """Thread-driven spinner on stderr; no-op when stderr is not a TTY."""
-    GLYPHS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-
-    def __init__(self, msg: str = "working", enabled: bool | None = None) -> None:
-        self.msg = msg
-        if enabled is None:
-            enabled = bool(getattr(sys.stderr, "isatty", lambda: False)())
-        self.enabled = enabled
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def __enter__(self) -> "Spinner":
-        if self.enabled:
-            self._thread = threading.Thread(target=self._spin, daemon=True)
-            self._thread.start()
-        return self
-
-    def __exit__(self, *exc) -> None:
-        if self._thread:
-            self._stop.set()
-            self._thread.join(timeout=1.0)
-            try:
-                sys.stderr.write("\r" + " " * (len(self.msg) + 4) + "\r")
-                sys.stderr.flush()
-            except Exception:  # noqa: BLE001
-                pass
-
-    def _spin(self) -> None:
-        for ch in itertools.cycle(self.GLYPHS):
-            if self._stop.is_set():
-                break
-            try:
-                sys.stderr.write(f"\r{ch} {self.msg} ")
-                sys.stderr.flush()
-            except Exception:  # noqa: BLE001
-                return
-            if self._stop.wait(0.1):
-                return
-
-
-def _config_dir() -> str:
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    p = os.path.join(base, "analyzelog")
+def save_irc_config(cfg: dict) -> None:
+    """Persist all settings to irc_config.json."""
     try:
-        os.makedirs(p, exist_ok=True)
+        with open(IRC_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
     except OSError:
         pass
-    return p
 
 
-def _aliases_path() -> str:
-    return os.path.join(_config_dir(), "aliases.json")
+def _save_autojoin_config() -> None:
+    cfg = load_irc_config()
+    cfg["autojoin"] = sorted(_AUTOJOIN_CHANNELS)
+    save_irc_config(cfg)
 
-
-def _ignore_path() -> str:
-    return os.path.join(_config_dir(), "ignore.json")
-
-
-def _notes_path() -> str:
-    return os.path.join(_config_dir(), "notes.json")
-
-
-def _history_path() -> str:
-    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+def load_input_history() -> List[str]:
+    """Return up to INPUT_HISTORY_MAX lines, most-recent first."""
     try:
-        os.makedirs(base, exist_ok=True)
-    except OSError:
+        with open(INPUT_HISTORY_PATH, "r", encoding="utf-8") as f:
+            lines = [l.rstrip("\n") for l in f if l.strip()]
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+    recent = lines[-INPUT_HISTORY_MAX:]
+    # Trim the file if it grew beyond the cap
+    if len(lines) > INPUT_HISTORY_MAX:
+        try:
+            with open(INPUT_HISTORY_PATH, "w", encoding="utf-8") as f:
+                f.write("\n".join(recent) + "\n")
+        except Exception:
+            pass
+    return list(reversed(recent))
+
+def save_input_history_line(line: str) -> None:
+    global _input_hist_handle
+    try:
+        if _input_hist_handle is None or _input_hist_handle.closed:
+            # buffering=1 → line-buffered: each \n triggers a real write,
+            # so commands are persisted immediately even if the process crashes.
+            _input_hist_handle = _open_append(INPUT_HISTORY_PATH, buffering=1)
+        _input_hist_handle.write(line + "\n")
+    except Exception:
         pass
-    return os.path.join(base, "analyzelog_history")
+
+def load_chat_history(window_name: str) -> List[str]:
+    """Return last CHAT_LOG_LOAD lines for the window.
+
+    Reads backwards from EOF in 8 KB chunks so large log files are never
+    fully loaded — only enough bytes to produce CHAT_LOG_LOAD lines are read.
+    """
+    path = _chat_log_path(window_name)
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            if size == 0:
+                return []
+
+            buf  = b""
+            pos  = size
+            # +1 so a partial line at the start of the read buffer is discarded
+            need = CHAT_LOG_LOAD + 1
+
+            while pos > 0 and buf.count(b"\n") < need:
+                step = min(8192, pos)
+                pos -= step
+                f.seek(pos)
+                buf = f.read(step) + buf
+
+            lines  = buf.decode("utf-8", errors="replace").splitlines()
+            result = [l for l in lines if l.strip()]
+            return result[-CHAT_LOG_LOAD:]
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+def append_chat_line(window_name: str, line: str) -> None:
+    global _chat_log_handles
+    try:
+        handle = _chat_log_handles.get(window_name)
+        if handle is None or handle.closed:
+            os.makedirs(CHAT_LOG_DIR, exist_ok=True)
+            handle = _open_append(_chat_log_path(window_name))
+            _chat_log_handles[window_name] = handle
+        handle.write(line + "\n")
+    except Exception:
+        pass
+
+# =========================
+# IRC Formatting
+# =========================
+# Control codes used by IRC for inline text formatting.
+_IRC_FMT_RE = re.compile(
+    r'\x03(?:\d{1,2}(?:,\d{1,2})?)?'   # \x03[fg][,bg]  colour
+    r'|[\x02\x0F\x16\x1D\x1F\x1E]'      # bold / reset / reverse / italic / underline / strikethrough
+)
+
+# Module-level parse cache: most IRC lines repeat across redraws
+_FMT_PARSE_CACHE: OrderedDict = OrderedDict()
+_FMT_CACHE_MAX = 512
+
+def irc_strip_formatting(text: str) -> str:
+    """Remove all IRC formatting codes, returning plain text."""
+    return _IRC_FMT_RE.sub("", text)
+
+# =========================
+# Wide-character helpers
+# =========================
+# CJK and other "wide" Unicode characters occupy 2 terminal columns each.
+# Python's len() and f-string alignment know nothing about this, so every
+# column calculation must go through these helpers instead.
+
+# Unicode zero-width / presentation constants
+_ZWJ  = '‍'   # ZERO WIDTH JOINER
+_VS15 = '︎'   # VARIATION SELECTOR-15 (text presentation)
+_VS16 = '️'   # VARIATION SELECTOR-16 (emoji presentation)
+
+def _char_width(ch: str) -> int:
+    """Terminal display width of a single Unicode scalar value.
+
+    Returns 0 for combining marks, enclosing marks, and Unicode format
+    characters (categories Mn/Mc/Me/Cf — includes ZWJ U+200D and variation
+    selectors U+FE0E/U+FE0F).  Returns 2 for wide/fullwidth East-Asian
+    characters and for symbol/pictographic emoji in the SMP that Python's
+    unicodedata may classify as EAW 'N' (e.g. U+1F3F3 WHITE FLAG).
+    Returns 1 for everything else.
+
+    Call _next_cluster() when iterating over strings so that ZWJ sequences
+    are counted as one glyph instead of summing each component's width.
+    """
+    cat = unicodedata.category(ch)
+    if cat in ('Mn', 'Mc', 'Me', 'Cf'):
+        return 0
+    eaw = unicodedata.east_asian_width(ch)
+    if eaw in ('W', 'F'):
+        return 2
+    # Some Symbol/Other code points in the emoji blocks are not classified 'W'
+    # by Python's unicodedata even though modern terminals display them as 2-wide.
+    # Cover the Supplementary Multilingual Plane emoji ranges explicitly.
+    if cat == 'So':
+        cp = ord(ch)
+        if 0x1F000 <= cp <= 0x1FAFF:   # Mahjong … Symbols & Pictographs Extended-A
+            return 2
+    return 1
+
+def _next_cluster(s: str, i: int) -> tuple:
+    """Consume one grapheme cluster from *s* starting at index *i*.
+
+    Returns (new_index, visual_width).  Handles:
+      • ZWJ sequences (multi-person emoji, flag sequences like 🏳️‍🌈)
+      • Regional Indicator pairs (🇺🇸 = U+1F1FA U+1F1F8) — two adjacent RIs
+        form one flag glyph; only the base character's width is counted
+      • VS15 / VS16 variation selectors
+      • Unicode combining / enclosing / format characters (Mn, Mc, Me, Cf)
+
+    The cluster's visual width equals that of its base character; all absorbed
+    code points contribute zero additional columns.
+    """
+    n    = len(s)
+    base = s[i]
+    w    = _char_width(base)
+    i   += 1
+
+    # Regional Indicator pair → single emoji flag (🇺🇸, 🇬🇧, …).
+    # Two adjacent RIs together form one glyph; absorb the second RI.
+    if 0x1F1E0 <= ord(base) <= 0x1F1FF:
+        if i < n and 0x1F1E0 <= ord(s[i]) <= 0x1F1FF:
+            i += 1
+        return i, w   # flag clusters carry no further modifiers
+
+    while i < n:
+        nc  = s[i]
+        cat = unicodedata.category(nc)
+        if nc == _ZWJ:
+            i += 1                          # absorb ZWJ itself
+            if i < n and unicodedata.category(s[i]) not in ('Mn', 'Mc', 'Me', 'Cf'):
+                i += 1                      # absorb the next base glyph
+            while i < n and s[i] in (_VS16, _VS15):
+                i += 1                      # absorb any trailing VS on that glyph
+        elif nc in (_VS16, _VS15):
+            i += 1
+        elif cat in ('Mn', 'Mc', 'Me', 'Cf'):
+            i += 1
+        else:
+            break
+    return i, w
+
+def _str_visual_width(s: str) -> int:
+    """Total terminal column width of *s*.
+
+    Wide/fullwidth East-Asian chars count as 2 columns.  ZWJ sequences,
+    variation selectors, and combining marks are folded into their base
+    glyph and contribute no extra columns.
+    """
+    total = 0
+    i     = 0
+    n     = len(s)
+    while i < n:
+        i, w  = _next_cluster(s, i)
+        total += w
+    return total
+
+def _truncate_to_width(s: str, max_cols: int) -> str:
+    """Return the longest prefix of *s* that fits within *max_cols* terminal columns.
+
+    Never splits a grapheme cluster (ZWJ sequence, combining mark, etc.).
+    """
+    cols = 0
+    i    = 0
+    n    = len(s)
+    while i < n:
+        start    = i
+        i, cw    = _next_cluster(s, i)
+        if cols + cw > max_cols:
+            return s[:start]
+        cols += cw
+    return s
+
+def _skip_visual_cols(s: str, skip: int) -> str:
+    """Return the substring of *s* that starts at visual column *skip*.
+
+    Advances by grapheme cluster so ZWJ sequences are never split.
+    """
+    if skip <= 0:
+        return s
+    col = 0
+    i   = 0
+    n   = len(s)
+    while i < n:
+        start    = i
+        i, cw    = _next_cluster(s, i)
+        if col >= skip:
+            return s[start:]
+        col += cw
+    return ""
+
+def _irc_visual_pos(line: str, max_visual: int) -> int:
+    """Return the raw-string index at which the visual column count reaches *max_visual*.
+
+    IRC control codes are zero-width.  Non-control characters are advanced
+    by grapheme cluster so that ZWJ sequences count as a single display cell.
+    """
+    vis = 0
+    i   = 0
+    n   = len(line)
+    while i < n and vis < max_visual:
+        ch = line[i]
+        if ch in ("\x02", "\x1D", "\x1F", "\x16", "\x0F"):
+            i += 1
+        elif ch == "\x03":
+            i += 1
+            for _ in range(2):          # up to 2 fg digits
+                if i < n and line[i].isdigit(): i += 1
+                else: break
+            if i < n and line[i] == ",":
+                i += 1
+                for _ in range(2):      # up to 2 bg digits
+                    if i < n and line[i].isdigit(): i += 1
+                    else: break
+        else:
+            ni, cw = _next_cluster(line, i)
+            if vis + cw > max_visual:
+                break                   # cluster would overflow — stop before it
+            vis += cw
+            i    = ni
+    return i
+
+# =========================
+# CJK detection + translation
+# =========================
+
+def _is_cjk_char(cp: int) -> bool:
+    """Return True if Unicode codepoint *cp* belongs to a CJK/East-Asian script block.
+
+    Covers (Unicode 15.1):
+      Hiragana, Katakana, Katakana Phonetic Extensions, Bopomofo (+Extended),
+      Hangul Syllables, Hangul Jamo Extended A/B, CJK Symbols & Punctuation,
+      CJK Radicals Supplement, Kangxi Radicals, Kanbun, CJK Strokes,
+      Enclosed CJK Letters and Months, CJK Compatibility,
+      CJK Unified Ideographs (main), CJK Compatibility Ideographs (+Supplement),
+      CJK Compatibility Forms, CJK Extensions A–G.
+
+    Integer range comparisons are faster than a compiled regex for the typical
+    short IRC message (< 512 bytes) because there is no per-character regex
+    engine dispatch overhead.
+    """
+    return (
+        0x2E80 <= cp <= 0x2EFF or   # CJK Radicals Supplement
+        0x2F00 <= cp <= 0x2FDF or   # Kangxi Radicals
+        0x3000 <= cp <= 0x303F or   # CJK Symbols and Punctuation
+        0x3040 <= cp <= 0x30FF or   # Hiragana + Katakana
+        0x3100 <= cp <= 0x312F or   # Bopomofo
+        0x3190 <= cp <= 0x319F or   # Kanbun
+        0x31A0 <= cp <= 0x31BF or   # Bopomofo Extended
+        0x31C0 <= cp <= 0x31EF or   # CJK Strokes
+        0x31F0 <= cp <= 0x31FF or   # Katakana Phonetic Extensions
+        0x3200 <= cp <= 0x32FF or   # Enclosed CJK Letters and Months
+        0x3300 <= cp <= 0x33FF or   # CJK Compatibility
+        0x3400 <= cp <= 0x4DBF or   # CJK Extension A
+        0x4E00 <= cp <= 0x9FFF or   # CJK Unified Ideographs
+        0xA960 <= cp <= 0xA97F or   # Hangul Jamo Extended-A
+        0xAC00 <= cp <= 0xD7AF or   # Hangul Syllables (Korean)
+        0xD7B0 <= cp <= 0xD7FF or   # Hangul Jamo Extended-B
+        0xF900 <= cp <= 0xFAFF or   # CJK Compatibility Ideographs
+        0xFE30 <= cp <= 0xFE4F or   # CJK Compatibility Forms
+        0x20000 <= cp <= 0x2A6DF or # CJK Extension B
+        0x2A700 <= cp <= 0x2B73F or # CJK Extension C
+        0x2B740 <= cp <= 0x2B81F or # CJK Extension D
+        0x2B820 <= cp <= 0x2CEAF or # CJK Extension E
+        0x2CEB0 <= cp <= 0x2EBEF or # CJK Extension F
+        0x2F800 <= cp <= 0x2FA1F or # CJK Compatibility Supplement
+        0x30000 <= cp <= 0x3134F    # CJK Extension G (Unicode 13+)
+    )
 
 
-def _load_json(path: str, default):
-    if not os.path.exists(path):
-        return default
+def _has_cjk(text: str, threshold: int = 2) -> bool:
+    """Return True if *text* contains at least *threshold* CJK/East-Asian characters.
+    Exits as soon as the threshold is met — O(threshold) in the common case."""
+    count = 0
+    for ch in text:
+        if _is_cjk_char(ord(ch)):
+            count += 1
+            if count >= threshold:
+                return True
+    return False
+
+
+# ── Dedicated thread-pool executors ──────────────────────────────────────────
+# Two separate pools prevent ML inference and blocking HTTP calls from
+# competing for the same threads and stalling each other during AI commands.
+#   _ML_EXECUTOR  — transformer model inference (predict_detailed); kept small
+#                   (2 workers) because each call is CPU-heavy and loading more
+#                   just causes context-switching thrash.
+#   _IO_EXECUTOR  — blocking HTTP calls (ollama, llama.cpp, translation); wider
+#                   (4 workers) because calls block on network I/O, not CPU.
+_ML_EXECUTOR = _ThreadPoolExecutor(max_workers=2, thread_name_prefix="eyrc-ml")
+_IO_EXECUTOR = _ThreadPoolExecutor(max_workers=4, thread_name_prefix="eyrc-io")
+
+# Semaphore created lazily in the async context.
+_ML_SEM: Optional[asyncio.Semaphore] = None
+
+# Cached classify clients (module-level so they survive across calls).
+_classify_ac: Optional[object] = None
+_classify_oc: Optional[object] = None
+
+# ── Translation cache + concurrency control ───────────────────────────────────
+# Cache: plain_text → Optional[str].  A cached None means "already English" or
+# "previously failed" — we don't retry until the process restarts.
+_TRANSLATION_CACHE: OrderedDict = OrderedDict()
+_TRANSLATION_CACHE_MAX = 256
+_CACHE_MISS = object()                        # sentinel: key absent from cache
+_TRANSLATION_SEM: Optional[asyncio.Semaphore] = None   # created lazily in async context
+
+# ── Link title / unfurl cache + concurrency ──────────────────────────────────
+_LINK_CACHE: OrderedDict = OrderedDict()
+_LINK_CACHE_MAX = 256
+_LINK_SEM: Optional[asyncio.Semaphore] = None
+_IMAGE_EXT_RE = re.compile(r'\.(jpe?g|png|gif|webp|bmp|avif|svg)(?:\?.*)?$', re.IGNORECASE)
+# Domains commonly flagged for spam, tracking, or shorteners
+_SPAM_DOMAINS = frozenset({
+    "bit.ly", "tinyurl.com", "tiny.cc", "ow.ly", "is.gd", "buff.ly",
+    "goo.gl", "shorturl.at", "rb.gy", "t.co", "adf.ly", "shorte.st",
+    "bc.vc", "linktr.ee", "tr.ee", "cutt.ly", "rebrand.ly",
+    "tracking." "doubleclick.net", "adservice.google.com",
+    "click.googleadservices.com", "outbrain.com", "taboola.com",
+})
+
+
+# ── x0.at upload support ──────────────────────────────────────────────────
+try:
+    from PIL import Image as _PILImage
+    PIL_AVAILABLE = True
+except ImportError:
+    _PILImage = None
+    PIL_AVAILABLE = False
+
+_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif"})
+
+def _compress_image(filepath: str, max_size: int = 1920, quality: int = 85) -> Optional[bytes]:
+    """Compress an image file. Returns compressed JPEG bytes or None on failure."""
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        img = _PILImage.open(filepath)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        w, h = img.size
+        if w > max_size or h > max_size:
+            ratio = min(max_size / w, max_size / h)
+            img = img.resize((int(w * ratio), int(h * ratio)), _PILImage.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+def _upload_to_x0(filepath: str) -> Optional[str]:
+    """Upload a file to x0.at. Returns the URL or None on failure."""
+    try:
+        compressed = _compress_image(filepath)
+        data: bytes
+        if compressed is not None:
+            data = compressed
+        else:
+            with open(filepath, "rb") as f:
+                data = f.read()
+        boundary = uuid.uuid4().hex
+        body = (
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="image.jpg"\r\n'
+            b"Content-Type: application/octet-stream\r\n\r\n"
+            + data +
+            b"\r\n--" + boundary.encode() + b"--\r\n"
+        )
+        req = urllib.request.Request(
+            "https://x0.at/",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            url = resp.read().decode("utf-8").strip()
+            return url if url else None
+    except Exception:
+        return None
+
+
+def _parse_server_time(ts: str) -> str:
+    """Convert IRCv3 server-time tag value (ISO 8601 UTC) to local [HH:MM] string."""
+    try:
+        from datetime import datetime, timezone
+        s = ts.rstrip("Z")
+        fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in s else "%Y-%m-%dT%H:%M:%S"
+        dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).astimezone(tz=None)
+        return dt.strftime("[%H:%M]")
+    except Exception:
+        return time.strftime("[%H:%M]")
+
+
+async def _translate_to_english(text: str) -> Optional[str]:
+    """Translate *text* to English via Google Translate's free public endpoint.
+
+    Improvements over naïve implementation:
+    • IRC formatting codes are stripped before sending to the API.
+    • The detected source-language field in the response is checked; text already
+      in English is rejected without a string comparison.
+    • Results are cached in an LRU OrderedDict (256 entries) — repeated phrases
+      (greetings, bot announcements) are served from memory with no network round-trip.
+    • A per-process asyncio.Semaphore caps concurrent HTTP calls at 3 to avoid
+      flooding the endpoint when many CJK messages arrive at once.
+    • Returns None on any failure; callers treat None as "do not display".
+    """
+    global _TRANSLATION_SEM
+    if _TRANSLATION_SEM is None:
+        _TRANSLATION_SEM = asyncio.Semaphore(3)
+
+    # Strip IRC formatting codes — they confuse the translation model and add noise
+    plain = irc_strip_formatting(text).strip()
+    if not plain:
+        return None
+
+    # Fast path: cache hit
+    cached = _TRANSLATION_CACHE.get(plain, _CACHE_MISS)
+    if cached is not _CACHE_MISS:
+        _TRANSLATION_CACHE.move_to_end(plain)  # LRU refresh
+        return cached  # type: ignore[return-value]  # may be None
+
+    try:
+        url = (
+            "https://translate.googleapis.com/translate_a/single"
+            "?client=gtx&sl=auto&tl=en&dt=t&q=" + urllib.parse.quote(plain)
+        )
+        loop = asyncio.get_running_loop()
+        async with _TRANSLATION_SEM:
+            raw = await loop.run_in_executor(
+                _IO_EXECUTOR, lambda: urllib.request.urlopen(url, timeout=6).read()
+            )
+        data = json.loads(raw)
+
+        # data[2] = detected source language code (e.g. "zh-CN", "ja", "en")
+        detected_lang = data[2] if len(data) > 2 and isinstance(data[2], str) else ""
+        if detected_lang.startswith("en"):
+            result: Optional[str] = None  # already English — nothing to show
+        else:
+            segs = data[0]
+            result = "".join(seg[0] for seg in segs if seg and seg[0]) or None
+
+    except Exception:
+        result = None
+
+    # Write to cache (evict LRU entry if at capacity)
+    if len(_TRANSLATION_CACHE) >= _TRANSLATION_CACHE_MAX:
+        _TRANSLATION_CACHE.popitem(last=False)
+    _TRANSLATION_CACHE[plain] = result
+    return result
+
+def _fetch_page_title_blocking(url: str) -> Optional[str]:
+    """Synchronously fetch a URL and extract its <title> tag.
+    Returns None on any error or if no <title> is found."""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; eyearesee/1.0)",
+            "Accept": "text/html,application/xhtml+xml",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read(131072)  # 128 KB max — stop reading malicious payloads
+        # Quick encoding sniff via Content-Type or BOM
+        content_type = resp.headers.get("Content-Type", "")
+        enc = "utf-8"
+        if "charset=" in content_type:
+            enc = content_type.split("charset=")[-1].split(";")[0].strip()
+        text = raw.decode(enc, errors="replace")
+        m = re.search(r'<title[^>]*>([^<]+)</title>', text, re.IGNORECASE | re.DOTALL)
+        if m:
+            return m.group(1).strip()[:200]
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_image_info_blocking(url: str) -> Optional[str]:
+    """Synchronously HEAD an image URL and return dimensions + size.
+    Returns None on error or non-image content type."""
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers={
+            "User-Agent": "Mozilla/5.0 (compatible; eyearesee/1.0)",
+        })
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            ct = resp.headers.get("Content-Type", "")
+            if not ct.startswith("image/"):
+                return None
+            cl = resp.headers.get("Content-Length")
+            size_str = ""
+            if cl and cl.isdigit():
+                kb = int(cl) / 1024
+                if kb >= 1024:
+                    size_str = f"  ({kb / 1024:.1f} MB)"
+                else:
+                    size_str = f"  ({kb:.0f} KB)"
+            return f"[image{size_str}]"
+    except Exception:
+        return None
+
+
+def _check_domain_reputation(url: str) -> Optional[str]:
+    """Return a warning string if the domain is a known spam/tracking/shortener."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        domain = parsed.netloc.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        for spam in _SPAM_DOMAINS:
+            if domain == spam or domain.endswith("." + spam):
+                return f"\u26a0 {domain}"
+    except Exception:
+        pass
+    return None
+
+
+async def _fetch_link_info(url: str) -> Dict[str, Optional[str]]:
+    """Fetch metadata for a URL: title, image info, and domain warning.
+
+    Returns dict with keys: title, image, domain_warn.
+    Results are LRU-cached (256 entries).
+    """
+    global _LINK_SEM
+    if _LINK_SEM is None:
+        _LINK_SEM = asyncio.Semaphore(4)
+
+    cached = _LINK_CACHE.get(url)
+    if cached is not None:
+        _LINK_CACHE.move_to_end(url)
+        return cached
+
+    domain_warn = _check_domain_reputation(url)
+    is_image = bool(_IMAGE_EXT_RE.search(url))
+
+    loop = asyncio.get_running_loop()
+    async with _LINK_SEM:
+        if is_image:
+            title_task = loop.run_in_executor(_IO_EXECUTOR, _fetch_image_info_blocking, url)
+            image_task = title_task
+            title_result: Optional[str] = await title_task
+            image_result: Optional[str] = title_result
+        else:
+            title_task = loop.run_in_executor(_IO_EXECUTOR, _fetch_page_title_blocking, url)
+            image_task = loop.run_in_executor(_IO_EXECUTOR, _fetch_image_info_blocking, url)
+            title_result = await title_task
+            image_result = await image_task
+
+    result: Dict[str, Optional[str]] = {
+        "title": title_result if not is_image else None,
+        "image": image_result if is_image else image_result,
+        "domain_warn": domain_warn,
+    }
+    if len(_LINK_CACHE) >= _LINK_CACHE_MAX:
+        _LINK_CACHE.popitem(last=False)
+    _LINK_CACHE[url] = result
+    return result
+
+
+def _link_log_path(window_name: str) -> str:
+    safe = _UNSAFE_FILENAME_RE.sub("_", window_name) or "_"
+    safe = re.sub(r'\.{2,}', '_', safe) or "_"
+    return os.path.join(LINK_LOG_DIR, safe + "_links.jsonl")
+
+
+def _append_link_log(window_name: str, nick: str, url: str, title: str, domain: str) -> None:
+    try:
+        os.makedirs(LINK_LOG_DIR, exist_ok=True)
+        entry = json.dumps({
+            "ts": time.time(),
+            "dt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "nick": nick,
+            "url": url,
+            "title": title,
+            "domain": domain,
+        }, ensure_ascii=False)
+        with open(_link_log_path(window_name), "a", encoding="utf-8") as f:
+            f.write(entry + "\n")
+    except Exception:
+        pass
+
+
+def _load_link_history(window_name: str, limit: int = 100) -> List[dict]:
+    path = _link_log_path(window_name)
+    entries: List[dict] = []
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return default
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entries.append(json.loads(raw))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return entries[-limit:]
 
 
-def _save_json(path: str, data) -> None:
+def irc_parse_formatting(text: str) -> List[Tuple[str, int]]:
+    """Split *text* into (segment, curses_attr) pairs honouring IRC codes.
+
+    Supports: \x02 bold, \x1D italic, \x1F underline, \x0F reset,
+    \x16 reverse, \x1E strikethrough, \x03 colour
+    (colour is stripped; only bold/italic/underline/reverse/strikethrough
+    are mapped to curses attributes).
+
+    Results are cached (up to 512 entries) since the same wrapped line is
+    rendered on every frame until the window is scrolled or text changes.
+    """
+    cached = _FMT_PARSE_CACHE.get(text)
+    if cached is not None:
+        return cached
+
+    segments: List[Tuple[str, int]] = []
+    bold = italic = underline = reverse = strikethrough = False
+    buf: List[str] = []
+    i = 0
+
+    def _flush():
+        if buf:
+            segments.append(("".join(buf), _irc_attr(bold, italic, underline, reverse, strikethrough)))
+            buf.clear()
+
+    while i < len(text):
+        ch = text[i]
+        if ch == "\x02":          # bold toggle
+            _flush(); bold = not bold; i += 1
+        elif ch == "\x1D":        # italic toggle
+            _flush(); italic = not italic; i += 1
+        elif ch == "\x1F":        # underline toggle
+            _flush(); underline = not underline; i += 1
+        elif ch == "\x16":        # reverse toggle
+            _flush(); reverse = not reverse; i += 1
+        elif ch == "\x1E":        # strikethrough toggle (draft/format)
+            _flush(); strikethrough = not strikethrough; i += 1
+        elif ch == "\x0F":        # reset all
+            _flush(); bold = italic = underline = reverse = strikethrough = False; i += 1
+        elif ch == "\x03":        # colour code — advance past digits, map nothing
+            _flush()
+            i += 1
+            for _ in range(2):
+                if i < len(text) and text[i].isdigit(): i += 1
+                else: break
+            if i < len(text) and text[i] == ",":
+                i += 1
+                for _ in range(2):
+                    if i < len(text) and text[i].isdigit(): i += 1
+                    else: break
+        else:
+            buf.append(ch); i += 1
+
+    _flush()
+    result = segments or [("", curses.A_NORMAL)]
+    if len(_FMT_PARSE_CACHE) >= _FMT_CACHE_MAX:
+        _FMT_PARSE_CACHE.popitem(last=False)
+    _FMT_PARSE_CACHE[text] = result
+    return result
+
+
+def _irc_attr(bold: bool, italic: bool, underline: bool, reverse: bool,
+              strikethrough: bool = False) -> int:
+    attr = curses.A_NORMAL
+    if bold:      attr |= curses.A_BOLD
+    if underline: attr |= curses.A_UNDERLINE
+    if reverse:   attr |= curses.A_REVERSE
+    if italic:
+        try:    attr |= curses.A_ITALIC
+        except AttributeError: attr |= curses.A_DIM
+    if strikethrough:
+        try:    attr |= curses.A_STANDOUT  # closest curses has to strikethrough
+        except AttributeError: attr |= curses.A_DIM
+    return attr
+
+# =========================
+# AI Log  (JSONL format)
+# =========================
+# One JSON object per line.  Fields that are always present:
+#   ts      – float unix timestamp (authoritative for sorting)
+#   dt      – human-readable "YYYY-MM-DD HH:MM:SS"
+#   sess    – 8-char session UUID (unique per process start)
+#   seq     – monotone int per session; gaps indicate missing/injected lines
+#   nick    – IRC nick
+#   target  – channel or nick
+#   u/m/a   – user / message / AI score  (0-100)
+#   roll    – rolling AI score
+#   msg     – the raw message text  (JSON encoding handles all escaping)
+#
+# Session-start records have type="session_start" and no nick/msg fields.
+# Legacy tab-separated lines (from older versions) are silently skipped by
+# load_nick_history() so old logs remain readable.
+
+_LOG_SESSION_ID: str = uuid.uuid4().hex[:8]
+_log_seq: int = 0
+
+# ── Persistent write handles — kept open between calls so the OS page cache
+#    does the batching instead of paying an open()/close() syscall per line.
+#    buffering=8192 → up to ~8 KB accumulated before a real disk write.
+#    Input history uses buffering=1 (line-buffered) for crash-safety.
+_ai_log_handle:     Optional[io.TextIOWrapper] = None
+_chat_log_handles:  Dict[str, io.TextIOWrapper] = {}
+_input_hist_handle: Optional[io.TextIOWrapper] = None
+
+def _open_append(path: str, buffering: int = 8192) -> io.TextIOWrapper:
+    return open(path, "a", encoding="utf-8", buffering=buffering)  # type: ignore[return-value]
+
+
+@atexit.register
+def _flush_log_handles() -> None:
+    """Ensure all buffered log data is written when the process exits."""
+    for h in [_ai_log_handle, _input_hist_handle, *_chat_log_handles.values()]:
+        if h and not h.closed:
+            try:
+                h.flush()
+                h.close()
+            except Exception:
+                pass
+
+
+def _ai_log_write(payload: str) -> None:
+    """Append *payload* to ai_scores.log.
+
+    Uses line-buffered mode (buffering=1) so every record lands on disk as
+    soon as the terminating newline is written — no explicit flush() needed.
+    On any I/O error the handle is discarded so the next call attempts a
+    fresh open instead of retrying against a broken handle forever."""
+    global _ai_log_handle
     try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, path)
-    except OSError as exc:
-        print(f"Failed to write {path}: {exc}", file=sys.stderr)
+        if _ai_log_handle is None or _ai_log_handle.closed:
+            _ai_log_handle = _open_append(AI_LOG_PATH, buffering=1)
+        _ai_log_handle.write(payload)
+    except Exception:
+        _ai_log_handle = None  # force reopen next call; don't retry a broken handle
 
 
-# ---------- LLM --------------------------------------------------------------
+def log_session_start(server: str, nick: str) -> None:
+    if not _ai_logging_enabled:
+        return
+    entry = {
+        "type":   "session_start",
+        "ts":     time.time(),
+        "dt":     time.strftime("%Y-%m-%d %H:%M:%S"),
+        "sess":   _LOG_SESSION_ID,
+        "server": server,
+        "nick":   nick,
+    }
+    _ai_log_write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-def _llm_endpoint(base: str) -> str:
-    base = base.rstrip("/")
-    if base.endswith("/v1/chat/completions") or base.endswith("/chat/completions"):
-        return base
-    return base + "/v1/chat/completions"
+
+def log_ai_event(nick: str, target: str, msg: str,
+                 u_score: int, m_score: int, a_score: int, rolling_ai: int,
+                 heu_score: float = 0.0,
+                 bino_score: float = 0.0,
+                 cls_score: float = 0.0,
+                 llama_score: float = 0.0,
+                 adv_score: float = 0.0,
+                 embed_score: float = 0.0,
+                 watermark_score_val: float = 0.0) -> None:
+    """Write one JSONL detection record to ai_scores.log.
+
+    Every record contains the full signal breakdown so any line can be
+    independently analysed without referencing session state:
+
+      ts / dt   – unix timestamp + human-readable datetime
+      sess      – 8-char session UUID (unique per process start)
+      seq       – monotone per-session counter; gaps indicate missing lines
+      nick      – IRC nickname
+      target    – channel or DM nick the message was sent to
+      u         – user-history score (0-99, based on message count)
+      m         – message-level score (reserved, currently 50)
+      a         – ensemble AI score 0-100
+      roll      – rolling per-nick AI average (last USER_HISTORY_WINDOW msgs)
+      flag      – "suspect" if a >= AI_SUSPECT_THRESHOLD else "normal"
+      msg_len   – byte length of the raw message
+      heu       – combined heuristic sub-score (formality + Llama patterns)
+      bino      – Binoculars cross-entropy ratio sub-score
+      cls       – averaged classifier probability (ChatGPT-RoBERTa + general)
+      llama     – Llama-specific structural/phrasing pattern sub-score
+      adv       – adversarial-evasion sub-score (char n-gram entropy + spacing)
+      embed     – embedding-variance sub-score (0 when no history)
+      wm        – watermark-detection sub-score
+      msg       – raw message text (JSON-escaped)
+    """
+    if not _ai_logging_enabled:
+        return
+    # Clamp every numeric field to its documented range so out-of-range values
+    # from upstream bugs or floating-point edge cases never corrupt the log.
+    a_score     = max(0,   min(100, int(a_score)))
+    rolling_ai  = max(0,   min(100, int(rolling_ai)))
+    u_score     = max(0,   min(99,  int(u_score)))
+    m_score     = max(0,   min(100, int(m_score)))
+    heu_score   = max(0.0, min(1.0, float(heu_score)))
+    bino_score  = max(0.0, min(1.0, float(bino_score)))
+    cls_score   = max(0.0, min(1.0, float(cls_score)))
+    llama_score = max(0.0, min(1.0, float(llama_score)))
+    adv_score   = max(0.0, min(1.0, float(adv_score)))
+    embed_score = max(0.0, min(1.0, float(embed_score)))
+    watermark_score_val = max(0.0, min(1.0, float(watermark_score_val)))
+    # Cap the stored message at the IRC protocol line length to bound record size.
+    msg_logged  = msg[:512]
+    global _log_seq
+    _log_seq += 1
+    entry: dict = {
+        "ts":      time.time(),
+        "dt":      time.strftime("%Y-%m-%d %H:%M:%S"),
+        "sess":    _LOG_SESSION_ID,
+        "seq":     _log_seq,
+        "nick":    nick,
+        "target":  target,
+        "u":       u_score,
+        "m":       m_score,
+        "a":       a_score,
+        "roll":    rolling_ai,
+        "flag":    "suspect" if a_score >= AI_SUSPECT_THRESHOLD else "normal",
+        "msg_len": len(msg),
+        "heu":     round(heu_score,   4),
+        "bino":    round(bino_score,  4),
+        "cls":     round(cls_score,   4),
+        "llama":   round(llama_score, 4),
+        "adv":     round(adv_score,   4),
+        "embed":   round(embed_score, 4),
+        "wm":      round(watermark_score_val, 4),
+        "msg":     msg_logged,
+    }
+    _ai_log_write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def call_llm(base_url: str, model: str, system: str, user_msg: str,
-             timeout: int = 180) -> str:
+def log_toggle_event(enabled: bool, nick: str) -> None:
+    """Record a logging enable/disable event so log gaps are auditable."""
+    entry = {
+        "type": "log_toggle",
+        "ts":   time.time(),
+        "dt":   time.strftime("%Y-%m-%d %H:%M:%S"),
+        "sess": _LOG_SESSION_ID,
+        "enabled": enabled,
+        "nick": nick,
+    }
+    _ai_log_write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def load_nick_history(nick: str) -> dict:
+    """Parse the JSONL log and return aggregated history for *nick*.
+
+    Returns:
+      total_msgs    – total log entries for this nick
+      first_ts      – earliest unix timestamp or None
+      last_ts       – most recent unix timestamp or None
+      all_scores    – list[int] of every AI score, chronological
+      all_lengths   – list[int] of every message length, chronological
+      sessions      – dict  sess_id → {dt, scores, msgs, channels, lengths}
+      channels      – sorted list of unique targets seen
+      top_messages  – up to 5 highest-scored entries: {a, dt, target, msg}
+      gaps          – list of (sess_id, expected_seq, got_seq)
+    """
+    nick_lower = nick.lower()
+    all_scores: list  = []
+    all_lengths: list = []
+    all_ts: list      = []
+    first_ts = None
+    last_ts  = None
+    sessions: dict       = {}
+    sess_last_seq: dict  = {}
+    gaps: list           = []
+    channels: set        = set()
+    _top_heap: list      = []   # min-heap of (score, entry_dict), capped at 5
+
+    try:
+        with open(AI_LOG_PATH, "r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw or not raw.startswith("{"):
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+                if entry.get("type") == "session_start":
+                    sess = entry.get("sess", "?")
+                    if sess not in sessions:
+                        sessions[sess] = {
+                            "dt": entry.get("dt", ""), "scores": [],
+                            "msgs": 0, "channels": set(), "lengths": [],
+                        }
+                    continue
+
+                if entry.get("nick", "").lower() != nick_lower:
+                    continue
+
+                ts     = entry.get("ts", 0.0)
+                a      = entry.get("a", 0)
+                msg    = entry.get("msg", "")
+                target = entry.get("target", "")
+                sess   = entry.get("sess", "?")
+                seq    = entry.get("seq")
+
+                all_scores.append(a)
+                all_lengths.append(len(msg))
+                all_ts.append(ts)
+                channels.add(target)
+
+                if first_ts is None or ts < first_ts: first_ts = ts
+                if last_ts  is None or ts > last_ts:  last_ts  = ts
+
+                if sess not in sessions:
+                    sessions[sess] = {
+                        "dt": entry.get("dt", ""), "scores": [],
+                        "msgs": 0, "channels": set(), "lengths": [],
+                    }
+                sd = sessions[sess]
+                sd["scores"].append(a)
+                sd["msgs"] += 1
+                sd["channels"].add(target)
+                sd["lengths"].append(len(msg))
+
+                # Track top-5 highest-scored messages via min-heap (O(log 5) per entry)
+                _entry = {"a": a, "dt": entry.get("dt", ""), "target": target, "msg": msg}
+                if len(_top_heap) < 5:
+                    heapq.heappush(_top_heap, (a, _entry))
+                elif a > _top_heap[0][0]:
+                    heapq.heapreplace(_top_heap, (a, _entry))
+
+                # Gap detection
+                if seq is not None:
+                    prev = sess_last_seq.get(sess)
+                    if prev is not None and seq != prev + 1:
+                        gaps.append((sess, prev + 1, seq))
+                    sess_last_seq[sess] = seq
+
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    top_messages = sorted([e for _, e in _top_heap], key=lambda x: x["a"], reverse=True)
+    return {
+        "total_msgs":   len(all_scores),
+        "first_ts":     first_ts,
+        "last_ts":      last_ts,
+        "all_scores":   all_scores,
+        "all_lengths":  all_lengths,
+        "all_ts":       all_ts,
+        "sessions":     sessions,
+        "channels":     sorted(channels),
+        "top_messages": top_messages,
+        "gaps":         gaps,
+    }
+
+
+# Per-nick AI score history loaded from ai_scores.log at startup.
+# Maps nick → list[int] of the last _NICK_AI_HISTORY_LIMIT 'a' scores, chronological.
+_NICK_AI_HISTORY: Dict[str, List[int]] = {}
+_NICK_AI_HISTORY_LIMIT = 50  # max prior scores seeded per nick per session
+
+
+def _load_all_nick_ai_history() -> None:
+    """Read ai_scores.log once at startup and populate _NICK_AI_HISTORY.
+
+    Keeps only the last _NICK_AI_HISTORY_LIMIT scores per nick so historical
+    evidence doesn't overwhelm new in-session observations.  Silently skips
+    corrupt lines and missing files.
+    """
+    global _NICK_AI_HISTORY
+    tmp: Dict[str, List[int]] = {}
+    try:
+        with open(AI_LOG_PATH, "r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw or not raw.startswith("{"):
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if rec.get("type") == "session_start":
+                    continue
+                nick = rec.get("nick", "")
+                a    = rec.get("a")
+                if nick and isinstance(a, (int, float)):
+                    tmp.setdefault(nick, []).append(int(a))
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    _NICK_AI_HISTORY = {k: v[-_NICK_AI_HISTORY_LIMIT:] for k, v in tmp.items()}
+
+
+def load_historical_suspects(threshold: int) -> list:
+    """Return list of (nick, avg_score, total_msgs, first_ts) for all nicks in the
+    log whose average AI score is >= threshold, sorted by avg_score descending."""
+    nick_data: dict = {}  # nick_lower → {"nick": str, "scores": [], "first_ts": float}
+
+    try:
+        with open(AI_LOG_PATH, "r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw or not raw.startswith("{"):
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if entry.get("type") == "session_start":
+                    continue
+                nick = entry.get("nick", "")
+                if not nick:
+                    continue
+                key  = nick.lower()
+                ts   = entry.get("ts", 0.0)
+                a    = entry.get("a", 0)
+                if key not in nick_data:
+                    nick_data[key] = {"nick": nick, "scores": [], "first_ts": ts}
+                nick_data[key]["scores"].append(a)
+                if ts < nick_data[key]["first_ts"]:
+                    nick_data[key]["first_ts"] = ts
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+    results = []
+    for data in nick_data.values():
+        scores = data["scores"]
+        avg = sum(scores) / len(scores) if scores else 0
+        if avg >= threshold:
+            results.append((data["nick"], int(avg), len(scores), data["first_ts"]))
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+# =========================
+# AI Detector
+# =========================
+AI_AVAILABLE = False
+if not _NO_AI:
+    try:
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification, GPT2LMHeadModel, GPT2TokenizerFast
+        import torch
+        AI_AVAILABLE = True
+    except Exception:
+        AI_AVAILABLE = False
+
+# PEFT (LoRA) optional — only needed for incremental fine-tuning (Area 7)
+_PEFT_AVAILABLE = False
+if not _NO_AI:
+    try:
+        import peft  # noqa: F401
+        _PEFT_AVAILABLE = True
+    except ImportError:
+        _PEFT_AVAILABLE = False
+
+IRC_CASUAL_WORDS = frozenset({
+    "lol", "lmao", "lmfao", "rofl", "haha", "hehe", "xd", "xdd",
+    "brb", "afk", "omg", "wtf", "gtg", "gg", "rip", "smh", "imo",
+    "imho", "tbh", "ngl", "idk", "irl", "fyi", "ty", "thx", "np",
+    "nvm", "btw", "iirc", "tfw", "mfw", "welp", "kek", "ez",
+    "lmk", "imo", "ikr", "fr", "no cap", "w", "l", "based", "cope",
+    "slay", "bro", "dude", "gonna", "wanna", "gotta",
+})
+
+# General LLM tell-phrases — applies across GPT-4, Claude, Gemini, Llama, etc.
+AI_TELL_PHRASES = frozenset({
+    # Hedging / meta-commentary
+    "it's worth noting", "it is worth noting",
+    "it's important to", "it is important to",
+    "it should be noted", "it's crucial to",
+    "as previously mentioned", "as noted above",
+    "it's important to understand", "it's essential to understand",
+    "keep in mind that", "bear in mind that",
+    "it's worth mentioning", "worth pointing out",
+    # Transitional connectors overused by LLMs
+    "to elaborate", "to clarify", "in other words",
+    "furthermore", "moreover", "additionally", "consequently",
+    "that being said", "having said that", "with that said",
+    "on the other hand", "in conclusion", "to that end",
+    "at its core", "at the end of the day",
+    # Summary / recap language
+    "to summarize", "in summary", "to recap", "to put it simply",
+    "in a nutshell", "in essence", "to boil it down",
+    "overall,", "ultimately,", "in short,",
+    # Sycophantic openers
+    "certainly!", "absolutely!", "great question", "excellent question",
+    "good question", "that's a great", "what a great",
+    "of course!", "sure thing", "i'd be happy to", "i'd be glad to",
+    "happy to help", "glad to help", "i'm happy to",
+    # Closing / helper phrases
+    "i hope this helps", "i hope that helps", "hope this helps",
+    "feel free to", "please let me know", "let me know if",
+    "don't hesitate to", "if you have any questions",
+    "if you'd like more", "if you need further",
+    # LLM identity tells
+    "as an ai", "as an ai assistant", "as an ai language model",
+    "as a language model", "i'm just an ai", "i am just an ai",
+    "my training data", "my knowledge cutoff", "my training",
+    "based on my training", "i don't have real-time",
+    "i don't have access to real-time",
+    # 2025/2026 stylistic tells
+    "delve into", "tapestry", "nuanced perspective",
+    "it's fascinating", "it's interesting to note",
+    "navigating the", "landscape of", "realm of",
+    "leverage", "synergize", "holistic approach",
+    "robust solution", "empower", "cutting-edge",
+    # Deliberative / thinking-aloud phrases (Claude 3/4, GPT-4o)
+    "let me think through", "here's my thinking",
+    "to put it another way", "to be more specific",
+    "broadly speaking", "in practical terms",
+    "at a high level", "drill down into",
+    "the key takeaway", "the main takeaway",
+    "worth unpacking", "let me unpack",
+    "when it comes to", "in real-world terms",
+    # 2026 additions — newer stylistic tics across all frontier models
+    "i think it's worth", "one thing to consider",
+    "it depends on", "the short answer is",
+    "the long answer is", "to answer directly",
+    "to give you a direct answer", "what i'd say is",
+    "here's the thing:", "the thing is,",
+})
+
+# Phrases characteristic of Llama 2 / Llama 3 / Mistral / open-source LLMs
+LLAMA_TELL_PHRASES = frozenset({
+    # Typical Llama openers
+    "sure, here", "sure! here", "sure, i can",
+    "of course, here", "of course! i",
+    "i'll do my best", "i'll try my best",
+    "let me provide", "let me explain", "let me walk you through",
+    "let me break this down", "let me break down",
+    "let me help you", "let me help with",
+    "here's a step-by-step", "here are some steps",
+    "here's how you can", "here's how to",
+    "here's an overview", "here's a breakdown",
+    "here's what you", "here are a few", "here are some",
+    # Llama meta-language
+    "as requested", "as you asked", "as you mentioned",
+    "based on your question", "based on what you've said",
+    "to answer your question", "to address your question",
+    "your question is", "you asked about",
+    # Llama recommendation style
+    "my recommendation would be", "my suggestion would be",
+    "i would recommend", "i would suggest", "i suggest",
+    "i recommend", "one approach would be", "one option is",
+    # Llama closing phrases
+    "i hope this answers", "i hope this clarifies",
+    "i hope this helps you", "please feel free",
+    "feel free to ask", "feel free to reach out",
+    "let me know if you", "let me know if there",
+    "to summarize my response", "in summary,",
+    # Llama hedging / safety language
+    "i need to point out", "i should point out",
+    "i should mention", "i should note",
+    "to be clear", "to be precise", "to be transparent",
+    "i want to be clear", "i want to clarify",
+    "it's important that i clarify", "i must clarify",
+    # Llama 2 refusal / alignment patterns
+    "i cannot assist with", "i'm not able to assist",
+    "i'm unable to", "i'm afraid i can't",
+    "that falls outside", "outside my capabilities",
+    "i'm designed to", "my purpose is to",
+    # Llama 3 / newer patterns
+    "my understanding is", "based on my knowledge",
+    "as of my last update", "as of my knowledge",
+    "as of my training", "my response to this",
+    # Additional open-source LLM openers (Qwen, Gemma, Mistral, Phi)
+    "i can certainly help", "i can help you with",
+    "let me outline", "here's a quick overview",
+    "here's a quick summary", "to break it down",
+    "step by step:", "step-by-step guide",
+    "here's what i'd suggest", "happy to elaborate",
+    "glad you asked", "great, let me",
+    "to put it simply,", "simply put,",
+    # Qwen3 / DeepSeek thinking-mode bleed-through (internal CoT leaking)
+    "let me think step by step", "thinking step by step",
+    "let me reason through", "let me work through",
+    "so first, let me", "ok, so the question",
+})
+
+# Vocabulary LLMs reach for that humans rarely use in casual IRC chat
+FORMAL_WORDS = frozenset({
+    # Classic formal vocabulary
+    "utilize", "leverage", "implement", "facilitate",
+    "demonstrate", "enumerate", "articulate",
+    "commence", "terminate", "endeavor",
+    "subsequent", "pertaining", "aforementioned",
+    "constitute", "comprises", "optimal",
+    "paramount", "imperative", "holistic",
+    "synergy", "paradigm", "streamline",
+    # 2025 additions — words AI over-applies in casual settings
+    "comprehensive", "multifaceted", "intricate",
+    "pivotal", "fundamental", "substantial",
+    "conceptual", "theoretical", "contextual",
+    "methodology", "framework", "perspective",
+    "implications", "considerations", "ramifications",
+    "sophisticated", "nuanced", "intrinsically",
+    "inherently", "essentially", "fundamentally",
+    "predominantly", "predominantly", "encompass",
+    "elucidate", "expound", "elaborate",
+    "ascertain", "discern", "navigate",
+    "augment", "mitigate", "alleviate",
+})
+
+# Quick regex to detect AI bot-style response openers at the very start of a message
+_BOT_OPENER_RE = re.compile(
+    r"^(?:Sure[!,]?|Absolutely[!,]?|Certainly[!,]?|Of course[!,]?|"
+    r"Great[!,]?|Gladly[!,]?|Happy to help[!,]?|I'?d be happy|"
+    r"I'?d be glad|Let me|Here'?s |Here are |To answer|"
+    r"Of course[,!] I'?d|I can help|I'?ll help|"
+    r"I can certainly|Allow me|Thanks for (?:asking|the question)|"
+    r"Good (?:question|point)[!,.]?|That'?s (?:a )?(?:great|good|interesting)|"
+    r"To (?:address|answer|respond to)|I'?ll (?:break|walk|explain|outline)|"
+    r"Step(?:\s+\d+)?[:.]\s*\w)",
+    re.IGNORECASE,
+)
+
+# Structural patterns Llama/open-source LLMs use that are unusual in IRC
+# (numbered lists, bullet points, markdown headers, code fences)
+_LLAMA_STRUCT_RE = re.compile(
+    r"(?m)^(?:\s*\d+[.)]\s+\S|\s*[-*•]\s+\S|\s*#{1,3}\s+\S|```)",
+)
+
+# =========================
+# Ollama local-model helper
+# =========================
+def _ollama_blocking_call(model_id: str, prompt: str, max_tokens: int) -> Tuple[str, str]:
+    """Synchronous HTTP call to a local Ollama server (run via asyncio executor).
+
+    Uses only stdlib urllib so no extra package is required.
+    Requires `ollama serve` running at OLLAMA_URL (default http://localhost:11434).
+    Pull models first with e.g.: ollama pull gemma3:4b
+    """
     body = json.dumps({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_msg},
-        ],
-        "temperature": 0.3,
-        "stream": False,
+        "model":   model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream":  False,
+        "options": {"num_predict": max_tokens},
     }).encode("utf-8")
     req = urllib.request.Request(
-        _llm_endpoint(base_url),
+        f"{OLLAMA_URL}/api/chat",
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8", errors="replace"))
     try:
-        return data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        return json.dumps(data)[:2000]
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        answer = data.get("message", {}).get("content", "(empty response)")
+        eval_c   = data.get("eval_count")
+        prompt_c = data.get("prompt_eval_count", 0)
+        tokens   = str(eval_c + prompt_c) if isinstance(eval_c, int) else "?"
+        return answer, tokens
+    except urllib.error.URLError as exc:
+        return (
+            f"[error] Ollama unreachable at {OLLAMA_URL} — "
+            f"start it with: ollama serve  (then: ollama pull {model_id})\n"
+            f"Detail: {exc}"
+        ), "?"
+    except Exception as exc:
+        return f"[error] Ollama call failed: {exc}", "?"
 
 
-class LLMCache:
-    """JSON-on-disk cache of LLM responses keyed by (model, system, user_msg)."""
+def _llamacpp_blocking_call(model_id: str, prompt: str, max_tokens: int) -> Tuple[str, str]:
+    """Synchronous HTTP call to a llama.cpp server (run via asyncio executor).
 
-    def __init__(self, path: str | None) -> None:
-        self.path = path
-        self.data: dict[str, str] = {}
-        self.dirty = False
-        if path and os.path.exists(path):
+    Uses only stdlib urllib so no extra package is required.
+    Requires `llama-server` running at LLAMACPP_URL (default http://127.0.0.1:8033).
+    The model field is sent but ignored by llama.cpp — it serves whichever model was
+    loaded at startup.  Uses the OpenAI-compatible /v1/chat/completions endpoint.
+    """
+    body = json.dumps({
+        "model":      model_id,
+        "messages":   [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "stream":     False,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{LLAMACPP_URL}/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        answer = (data.get("choices", [{}])[0]
+                      .get("message", {})
+                      .get("content", "(empty response)"))
+        usage  = data.get("usage", {})
+        total  = usage.get("total_tokens")
+        tokens = str(total) if isinstance(total, int) else "?"
+        return answer, tokens
+    except urllib.error.URLError as exc:
+        return (
+            f"[error] llama.cpp unreachable at {LLAMACPP_URL} — "
+            f"start it with: llama-server -m <model.gguf>\n"
+            f"Detail: {exc}"
+        ), "?"
+    except Exception as exc:
+        return f"[error] llama.cpp call failed: {exc}", "?"
+
+
+async def _llm_classify_ai(text: str, model_key: str) -> float:
+    """Ask the active /model to classify *text* as AI- or human-written.
+
+    Sends a tightly constrained prompt and expects a single-word reply of
+    "AI" or "HUMAN".  Returns 0.0–1.0 (1.0 = AI-generated).  Returns 0.0
+    on any network or parse error so it degrades gracefully.
+
+    Skipped for messages shorter than 6 words — too little signal to be
+    meaningful and would waste API / local-inference budget.
+    """
+    if len(text.split()) < 6:
+        return 0.0
+
+    prompt = (
+        "You are an AI-text detector reviewing IRC chat messages.\n"
+        "Classify the message below as written by a human or generated by AI.\n"
+        "Consider: informal language, typos, slang, IRC conventions, naturalness.\n"
+        "Reply with ONLY one word: AI or HUMAN.\n\n"
+        f"Message: {text!r}\n\nClassification:"
+    )
+
+    try:
+        if model_key.startswith("ollama:"):
+            provider = "ollama"
+            model_id = model_key[len("ollama:"):]
+        else:
+            spec = AI_MODELS.get(model_key)
+            if not spec:
+                return 0.0
+            provider = spec["provider"]
+            model_id = spec["id"]
+
+        global _classify_ac, _classify_oc
+        answer = ""
+        if provider == "claude":
+            if not ANTHROPIC_AVAILABLE or not ANTHROPIC_API_KEY:
+                return 0.0
+            if _classify_ac is None:
+                _classify_ac = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    obj = json.load(f)
-                if isinstance(obj, dict):
-                    self.data = {k: v for k, v in obj.items() if isinstance(v, str)}
-            except (OSError, json.JSONDecodeError):
-                self.data = {}
+                msg = await _classify_ac.messages.create(
+                    model=model_id, max_tokens=10,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            except Exception:
+                _classify_ac = None
+                raise
+            answer = msg.content[0].text if msg.content else ""
+        elif provider == "openai":
+            if not OPENAI_AVAILABLE or not OPENAI_API_KEY:
+                return 0.0
+            if _classify_oc is None:
+                _classify_oc = _openai_mod.AsyncOpenAI(api_key=OPENAI_API_KEY)
+            try:
+                resp = await _classify_oc.chat.completions.create(
+                    model=model_id, max_tokens=10,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            except Exception:
+                _classify_oc = None
+                raise
+            answer = resp.choices[0].message.content if resp.choices else ""
+        elif provider == "ollama":
+            loop   = asyncio.get_running_loop()
+            answer, _ = await loop.run_in_executor(
+                _IO_EXECUTOR, _ollama_blocking_call, model_id, prompt, 10)
+        elif provider == "llamacpp":
+            loop   = asyncio.get_running_loop()
+            answer, _ = await loop.run_in_executor(
+                _IO_EXECUTOR, _llamacpp_blocking_call, model_id, prompt, 10)
+        else:
+            return 0.0
+
+        upper = answer.strip().upper()
+        if "HUMAN" in upper:
+            return 0.0
+        if "AI" in upper:
+            return 1.0
+        return 0.5   # ambiguous / unexpected reply
+
+    except Exception:
+        return 0.0
+
+
+class EnsembleAIDetector:
+    _CACHE_MAX = 512  # LRU-style prediction cache (bots repeat themselves)
+
+    # Primary classifier: trained on ChatGPT/GPT-family output
+    _CLS1_MODEL = "Hello-SimpleAI/chatgpt-detector-roberta"
+    # Secondary classifier: broader OpenAI GPT-2-era detector; generalises to
+    # fluent AI text regardless of model family (Llama, Mistral, etc.).
+    # Loaded opportunistically — falls back gracefully if unavailable.
+    _CLS2_MODEL = "openai-community/roberta-base-openai-detector"
+
+    def __init__(self, disabled: bool = False):
+        self.enabled = not disabled
+        self.active_detect_model: str = "" if disabled else "qwen3"  # default: llama.cpp qwen3 for LLM detection
+        self._gpt2_model = None   # GPT-2: Binoculars performer
+        self._obs_model  = None   # distilgpt2 or configurable observer
+        self._obs_modern = None   # modern observer (TinyLlama etc.), optional
+        self._obs_modern_tok = None
+        self._gpt2_tok   = None   # shared GPT-2 tokenizer
+        self._cls_model  = None   # primary classifier (ChatGPT-focused RoBERTa)
+        self._cls_tok    = None
+        self._cls2_model = None   # secondary classifier (general LLM detector), optional
+        self._cls2_tok   = None
+        self._embed_model = None  # sentence embedding model (drift detection), optional
+        self._embed_tok   = None
+        self._device = "cpu"
+        self._pred_cache: OrderedDict = OrderedDict()  # text → Dict[str,float], LRU
+        # ── LoRA incremental fine-tuning (Area 7) ────────────────────────────
+        self._lora_peft_config = None
+        self._lora_model = None
+        self._lora_loaded = False
+
+        if disabled:
+            return
+        if not AI_AVAILABLE:
+            raise SystemExit(
+                "AI detector requires: pip install transformers torch\n"
+                "Core models (gpt2, distilgpt2, RoBERTa) must load successfully."
+            )
+        self._load_models()
+
+    def _load_models(self) -> None:
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        print("AI detector: loading gpt2 tokenizer...", end=" ", flush=True)
+        self._gpt2_tok = GPT2TokenizerFast.from_pretrained("gpt2")
+        print("OK")
+
+        print("AI detector: loading gpt2 (Binoculars performer)...", end=" ", flush=True)
+        self._gpt2_model = GPT2LMHeadModel.from_pretrained("gpt2").to(self._device)
+        self._gpt2_model.eval()
+        print("OK")
+
+        # ── Binoculars observer model (configurable via IRC_OBSERVER_MODEL) ──────────
+        _obs_id = OBSERVER_MODEL_ID
+        if _obs_id == "distilgpt2":
+            print("AI detector: loading distilgpt2 (Binoculars observer)...", end=" ", flush=True)
+            try:
+                self._obs_model = GPT2LMHeadModel.from_pretrained(_obs_id).to(self._device)
+                self._obs_model.eval()
+                print("OK")
+            except Exception as _e:
+                print(f"failed ({_e})")
+        else:
+            # Modern observer — not GPT-2 family, so it gets its own tokenizer
+            print(f"AI detector: loading {_obs_id} (modern Binoculars observer)...", end=" ", flush=True)
+            try:
+                from transformers import AutoModelForCausalLM as _AutoCausal
+                self._obs_modern_tok = AutoTokenizer.from_pretrained(_obs_id)
+                if self._obs_modern_tok.pad_token is None:
+                    self._obs_modern_tok.pad_token = self._obs_modern_tok.eos_token
+                self._obs_modern = _AutoCausal.from_pretrained(
+                    _obs_id, torch_dtype="auto", device_map="auto",
+                ).to(self._device)
+                self._obs_modern.eval()
+                print("OK")
+            except Exception as _e:
+                self._obs_modern = None
+                self._obs_modern_tok = None
+                print(f"skipped ({_e})")
+            # Load distilgpt2 as fallback for the classic Binoculars path
+            print("AI detector: loading distilgpt2 (fallback observer)...", end=" ", flush=True)
+            try:
+                self._obs_model = GPT2LMHeadModel.from_pretrained("distilgpt2").to(self._device)
+                self._obs_model.eval()
+                print("OK")
+            except Exception as _e:
+                print(f"failed ({_e})")
+
+        # ── Sentence embedding model for semantic-drift detection ───────────────────
+        if EMBEDDING_MODEL:
+            print(f"AI detector: loading embedding model ({EMBEDDING_MODEL})...", end=" ", flush=True)
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._embed_model = SentenceTransformer(EMBEDDING_MODEL, device=self._device)
+                print("OK")
+            except ImportError:
+                print("skipped (sentence-transformers not installed)")
+            except Exception as _e:
+                print(f"skipped ({_e})")
+
+        # ── Classifiers ─────────────────────────────────────────────────────────────
+        _tf_logger = logging.getLogger("transformers")
+        _prev_tf_level = _tf_logger.level
+        _tf_logger.setLevel(logging.ERROR)
+
+        try:
+            print(f"AI detector: loading primary classifier ({self._CLS1_MODEL})...", end=" ", flush=True)
+            try:
+                self._cls_tok = AutoTokenizer.from_pretrained(self._CLS1_MODEL)
+                self._cls_model = AutoModelForSequenceClassification.from_pretrained(
+                    self._CLS1_MODEL,
+                    ignore_mismatched_sizes=True,
+                ).to(self._device)
+                self._cls_model.eval()
+                print("OK")
+            except Exception as _e:
+                self._cls_tok   = None
+                self._cls_model = None
+                print(f"skipped ({_e})")
+
+            print(f"AI detector: loading secondary classifier ({self._CLS2_MODEL})...", end=" ", flush=True)
+            try:
+                self._cls2_tok = AutoTokenizer.from_pretrained(self._CLS2_MODEL)
+                self._cls2_model = AutoModelForSequenceClassification.from_pretrained(
+                    self._CLS2_MODEL,
+                    ignore_mismatched_sizes=True,
+                ).to(self._device)
+                self._cls2_model.eval()
+                print("OK")
+            except Exception as _e:
+                self._cls2_tok   = None
+                self._cls2_model = None
+                print(f"skipped ({_e})")
+        finally:
+            _tf_logger.setLevel(_prev_tf_level)
+
+        obs_name = OBSERVER_MODEL_ID if self._obs_modern else "distilgpt2"
+        loaded = [f"Binoculars(gpt2+{obs_name})", "Llama-heuristics"]
+        if self._cls_model:
+            loaded.append("RoBERTa(chatgpt)")
+        if self._cls2_model:
+            loaded.append("RoBERTa(general)")
+        if self._embed_model:
+            loaded.append(f"Embed({EMBEDDING_MODEL})")
+        print(f"AI detector ENABLED: {' + '.join(loaded)}  (device={self._device})")
+
+    # ---- static heuristics ----
 
     @staticmethod
-    def make_key(model: str, system: str, user_msg: str) -> str:
-        h = hashlib.sha256()
-        h.update(model.encode())
-        h.update(b"\0")
-        h.update(system.encode())
-        h.update(b"\0")
-        h.update(user_msg.encode())
-        return h.hexdigest()
+    def entropy(text: str) -> float:
+        if not text: return 0.0
+        total = len(text)
+        freq: dict = {}
+        for ch in text:
+            freq[ch] = freq.get(ch, 0) + 1
+        inv = 1.0 / total
+        return -sum(n * inv * log2(n * inv) for n in freq.values())
 
-    def get(self, model: str, system: str, user_msg: str) -> str | None:
-        return self.data.get(self.make_key(model, system, user_msg))
+    @staticmethod
+    def repetition(text: str) -> float:
+        if not text: return 0.0
+        words = text.lower().split()
+        if len(words) < 3: return 0.0
+        return 1.0 - (len(set(words)) / len(words))
 
-    def put(self, model: str, system: str, user_msg: str, response: str) -> None:
-        self.data[self.make_key(model, system, user_msg)] = response
-        self.dirty = True
-        self.save()
+    @staticmethod
+    def formality_score(text: str) -> float:
+        """0..1 — calibrated for 2025/2026 LLM output patterns in IRC chat."""
+        if not text: return 0.0
+        words = text.split()
+        if not words: return 0.0
+        text_lower = text.lower()
+        _strip = ".,!?;:\"'()[]"
+        words_lower_stripped = {w.lower().strip(_strip) for w in words}
 
-    def save(self) -> None:
-        if not self.path or not self.dirty:
+        # Classic IRC vs formal signals
+        casual_hit   = bool(words_lower_stripped & IRC_CASUAL_WORDS)
+        ends_cleanly = text.rstrip().endswith((".", "!", "?", "..."))
+        starts_cap   = text[0].isupper()
+        no_charspam  = not any(len(set(w)) == 1 and len(w) > 2 for w in words)
+        no_emoticon  = not any(e in text for e in (":)", ":(", ":D", "xD", "XD", "^_^", ">_<", "o/"))
+        long_enough  = len(words) >= 6
+
+        # LLM-specific tells (general across all model families)
+        has_emdash     = "\u2014" in text or " -- " in text
+        tell_phrase    = any(p in text_lower for p in AI_TELL_PHRASES)
+        llama_phrase   = any(p in text_lower for p in LLAMA_TELL_PHRASES)
+        formal_vocab   = bool(words_lower_stripped & FORMAL_WORDS)
+        no_contraction = not any(c in text_lower for c in
+                                 ("n't", "'re", "'ve", "'ll", "'m", "'d"))
+        # Bot-opener at the very start of the message
+        bot_opener = bool(_BOT_OPENER_RE.match(text))
+
+        return min(1.0,
+            0.08 * ends_cleanly
+            + 0.04 * starts_cap
+            + 0.06 * (not casual_hit)
+            + 0.04 * no_charspam
+            + 0.03 * no_emoticon
+            + 0.05 * long_enough
+            + 0.16 * tell_phrase       # strongest general signal
+            + 0.14 * llama_phrase      # Llama/open-source LLM signal
+            + 0.12 * has_emdash
+            + 0.12 * formal_vocab
+            + 0.10 * no_contraction
+            + 0.14 * bot_opener        # unambiguous AI opener pattern
+        )
+
+    @staticmethod
+    def llama_pattern_score(text: str) -> float:
+        """0..1 — detects structural and phrasing patterns specific to Llama/
+        open-source LLM outputs (Llama 2, Llama 3, Mistral, Vicuna, etc.).
+
+        Focuses on signals that are low-FP in casual IRC:
+        • Markdown structure (numbered lists, bullets, headers) in plain chat
+        • Bot-opener words at the message start
+        • Colon-terminated sentences introducing a list
+        • Unusually long single messages (LLMs over-explain)
+        • Multi-sentence uniform capitalisation (templated output)
+        """
+        if not text:
+            return 0.0
+        text_lower = text.lower()
+        score = 0.0
+
+        # Llama-specific tell phrases (subset different from general AI_TELL_PHRASES)
+        if any(p in text_lower for p in LLAMA_TELL_PHRASES):
+            score += 0.30
+
+        # Markdown-style structural elements in what should be plain IRC chat
+        struct_hits = len(_LLAMA_STRUCT_RE.findall(text))
+        if struct_hits >= 3:
+            score += 0.25
+        elif struct_hits >= 1:
+            score += 0.12
+
+        # Bot-opener (unambiguous start patterns)
+        if _BOT_OPENER_RE.match(text):
+            score += 0.18
+
+        # Colon at end of a sentence followed by newline or end-of-text (list intro)
+        if re.search(r':\s*(?:\n|$)', text):
+            score += 0.08
+
+        # Very long single message: Llama over-explains simple questions
+        word_count = len(text.split())
+        if word_count >= 60:
+            score += 0.15
+        elif word_count >= 30:
+            score += 0.07
+
+        # All sentences start with a capital: templated / AI-generated prose
+        sentences = [s.strip() for s in re.split(r'[.!?]', text) if len(s.strip()) > 4]
+        if len(sentences) >= 3 and all(s[0].isupper() for s in sentences):
+            score += 0.08
+
+        # Repeated numbered / enumerated structure (common Llama answer format)
+        if re.search(r'\b(?:first|second|third|finally|lastly)[,:]', text_lower):
+            score += 0.08
+
+        return min(1.0, score)
+
+    def _heuristic_score(self, text: str) -> float:
+        """Combined heuristic score incorporating general formality and
+        Llama-specific structural/phrasing signals."""
+        form  = self.formality_score(text)
+        llama = self.llama_pattern_score(text)
+        rep   = self.repetition(text)
+        ent   = self.entropy(text)
+        length = min(1.0, len(text) / 300.0)
+        ent_penalty = max(0.0, (ent - 4.0) / 2.0)
+        # llama_pattern_score is a strong direct signal — give it equal weight to formality
+        return max(0.0, min(1.0,
+            0.38 * form
+            + 0.35 * llama
+            + 0.14 * rep
+            + 0.07 * length
+            - 0.14 * ent_penalty
+        ))
+
+    # ---- ML signals ----
+
+    def _binoculars_score(self, text: str) -> float:
+        """Binoculars (Hans et al., 2024): CE_observer / CE_performer.
+
+        Low ratio → both models find the text fluent → likely AI-generated.
+        When `self._obs_modern` is set, both the performer (gpt2) and the
+        modern observer run on their own tokenizers independently and we take
+        whichever yields a stronger signal.  Falls back to classic (gpt2,
+        distilgpt2) if the modern model is unavailable.
+        Returns 0..1, higher = more AI-like.
+        """
+        if self._gpt2_tok is None or self._gpt2_model is None:
+            return 0.0
+        if len(text.split()) < 5:
+            return 0.0
+
+        performer_ready = self._gpt2_model is not None
+        classic_ready   = performer_ready and self._obs_model is not None
+        modern_ready    = performer_ready and self._obs_modern is not None and self._obs_modern_tok is not None
+
+        if not classic_ready and not modern_ready:
+            return 0.0
+
+        best_ratio = None
+
+        # Classic path (gpt2 performer + distilgpt2 observer)
+        if classic_ready:
+            try:
+                enc = self._gpt2_tok(text, return_tensors="pt", truncation=True, max_length=128)
+                enc = {k: v.to(self._device) for k, v in enc.items()}
+                if enc["input_ids"].shape[1] >= 3:
+                    with torch.inference_mode():
+                        ce_perf = self._gpt2_model(**enc, labels=enc["input_ids"]).loss.item()
+                        ce_obs  = self._obs_model(**enc, labels=enc["input_ids"]).loss.item()
+                    if ce_perf >= 1e-6:
+                        best_ratio = ce_obs / ce_perf
+            except Exception:
+                pass
+
+        # Modern path (gpt2 performer + modern observer on its own tokenizer).
+        # A strong fluency disagreement between the two architectures is a
+        # cheaper signal than perplexity itself.
+        if modern_ready:
+            try:
+                enc_m = self._obs_modern_tok(
+                    text, return_tensors="pt", truncation=True, max_length=128,
+                    padding=True,
+                )
+                enc_m = {k: v.to(self._device) for k, v in enc_m.items()}
+                if enc_m["input_ids"].shape[1] >= 3:
+                    with torch.inference_mode():
+                        ce_modern = self._obs_modern(**enc_m, labels=enc_m["input_ids"]).loss.item()
+                    if ce_modern >= 1e-6:
+                        # Re-run performer through the same encoding to compare
+                        # on the modern model's tokenization.
+                        enc_p = self._gpt2_tok(
+                            text, return_tensors="pt", truncation=True, max_length=128)
+                        enc_p = {k: v.to(self._device) for k, v in enc_p.items()}
+                        with torch.inference_mode():
+                            ce_perf2 = self._gpt2_model(**enc_p, labels=enc_p["input_ids"]).loss.item()
+                        if ce_perf2 >= 1e-6:
+                            r = ce_modern / ce_perf2
+                            if best_ratio is None or r < best_ratio:
+                                best_ratio = r
+            except Exception:
+                pass
+
+        if best_ratio is None:
+            return 0.0
+
+        # Calibration is model-pair specific.  distilgpt2 threshold:
+        #   human ~1.3–2.5,  AI ~0.7–1.2  →  score = (1.9 - r) / 1.3
+        # A modern observer (e.g. TinyLlama) has lower perplexity overall,
+        # so the ratio for AI text is typically *higher* (~1.0–1.6) because
+        # both the performer and the modern model find it reasonably fluent.
+        if self._obs_modern is not None and best_ratio is not None:
+            return max(0.0, min(1.0, (2.2 - best_ratio) / 1.4))
+        return max(0.0, min(1.0, (1.9 - best_ratio) / 1.3))
+
+    def _classifier_score(self, text: str) -> float:
+        """Average AI-probability across all loaded classifiers.
+
+        Primary (cls1): Hello-SimpleAI/chatgpt-detector-roberta — strong on
+          ChatGPT / GPT-4 / Claude family output.  If a LoRA adapter is loaded
+          (Area 7), the LoRA-adapted cls1 is used instead.
+        Secondary (cls2): openai-community/roberta-base-openai-detector — trained
+          on GPT-2 outputs; generalises to Llama / Mistral / open-source LLMs
+          because it captures broad fluency features rather than ChatGPT style.
+        If cls2 failed to load only cls1 is used.
+        """
+        scores: List[float] = []
+        if len(text.split()) < 5:
+            return 0.0
+        _cls_model = self._cls_model
+        if getattr(self, "_lora_loaded", False) and self._lora_model is not None:
+            _cls_model = self._lora_model
+        if _cls_model is not None:
+            try:
+                enc = self._cls_tok(text, return_tensors="pt", truncation=True, max_length=128)
+                enc = {k: v.to(self._device) for k, v in enc.items()}
+                with torch.inference_mode():
+                    logits = _cls_model(**enc).logits
+                scores.append(torch.softmax(logits, dim=-1)[0][1].item())
+            except Exception:
+                pass
+        if self._cls2_model is not None:
+            try:
+                enc2 = self._cls2_tok(text, return_tensors="pt", truncation=True, max_length=128)
+                enc2 = {k: v.to(self._device) for k, v in enc2.items()}
+                with torch.inference_mode():
+                    logits2 = self._cls2_model(**enc2).logits
+                # openai-community/roberta-base-openai-detector: LABEL_0=Real, LABEL_1=Fake
+                scores.append(torch.softmax(logits2, dim=-1)[0][1].item())
+            except Exception:
+                pass
+        return sum(scores) / len(scores) if scores else 0.0
+
+    # ---- adversarial character-level detection ----
+
+    @staticmethod
+    def _char_ngram_entropy(text: str, n: int = 3) -> float:
+        """Normalised entropy over character n-grams.  Low entropy suggests
+        repetitive/patterned text; near-zero is suspicious for natural language
+        but common in adversarial padding (e.g. "s p r e a d  o u t")."""
+        if not text or len(text) < n:
+            return 1.0
+        ngrams: Counter = Counter()
+        for i in range(len(text) - n + 1):
+            ngrams[text[i:i + n]] += 1
+        total = sum(ngrams.values())
+        inv   = 1.0 / total
+        ent   = -sum(c * inv * log2(c * inv) for c in ngrams.values())
+        max_ent = log2(len(ngrams)) if ngrams else 1.0
+        return ent / max_ent if max_ent > 0 else 0.0
+
+    @staticmethod
+    def _spacing_anomaly(text: str) -> float:
+        """Score (0..1) for unusual spacing patterns common in adversarial
+        evasion: multi-space gaps, letter-spacing (every-other char space),
+        excessive whitespace."""
+        if not text:
+            return 0.0
+        score = 0.0
+        # Multi-space runs (>2 spaces)
+        multi = re.findall(r'  +', text)
+        if multi:
+            score += min(0.4, 0.1 * len(multi))
+        # Letter-spacing detection: "s p r e a d" pattern
+        spaced = re.findall(r'\b(?:\w ){3,}\w\b', text)
+        if spaced:
+            score += min(0.5, 0.15 * len(spaced))
+        # Whitespace ratio anomaly
+        if len(text) > 10:
+            ws_ratio = text.count(" ") / len(text)
+            if ws_ratio > 0.5:
+                score += min(0.3, (ws_ratio - 0.5) * 2.0)
+        return min(1.0, score)
+
+    @staticmethod
+    def _adversarial_score(text: str) -> float:
+        """Combined adversarial-evasion score (0..1).  Low char-ngram entropy
+        combined with spacing anomalies is a strong indicator of adversarial
+        padding designed to bypass classifiers."""
+        if not text or len(text) < 8:
+            return 0.0
+        tri_ent = EnsembleAIDetector._char_ngram_entropy(text, n=3)
+        quad_ent = EnsembleAIDetector._char_ngram_entropy(text, n=4)
+        spacing = EnsembleAIDetector._spacing_anomaly(text)
+        entropy_penalty = max(0.0, 0.5 - (tri_ent + quad_ent) * 0.5) * 0.6
+        return min(1.0, entropy_penalty + 0.4 * spacing)
+
+    # ---- embedding-based semantic drift ----
+
+    def _embed_text(self, text: str):
+        """Return a sentence embedding vector, or None on failure."""
+        if self._embed_model is None:
+            return None
+        try:
+            return self._embed_model.encode(text, convert_to_numpy=True)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _cosine_sim(a, b) -> float:
+        """Cosine similarity between two 1-D vectors."""
+        import numpy as _np
+        a_n = _np.linalg.norm(a)
+        b_n = _np.linalg.norm(b)
+        if a_n < 1e-8 or b_n < 1e-8:
+            return 0.0
+        return float(_np.dot(a, b) / (a_n * b_n))
+
+    def _embedding_variance_score(self, text: str, recent_embeds: list) -> float:
+        """Return 0..1 based on how much *text*'s embedding deviates from
+        the user's recent embedding history.  Low variance (tight cluster)
+        suggests machine-generated text.  Returns 0 if not enough data or
+        embedding model unavailable."""
+        if self._embed_model is None or not recent_embeds:
+            return 0.0
+        emb = self._embed_text(text)
+        if emb is None:
+            return 0.0
+        sims = [self._cosine_sim(emb, e) for e in recent_embeds if e is not None]
+        if len(sims) < 3:
+            return 0.0
+        avg_sim = sum(sims) / len(sims)
+        # Humans typically have avg_sim ~0.6–0.8 (diverse topics);
+        # bots cluster at ~0.85–1.0 (uniform style/topic).
+        # Scale: 1.0 at avg_sim=1.0, 0.0 at avg_sim <= 0.60
+        return max(0.0, min(1.0, (avg_sim - 0.60) / 0.40))
+
+    # ---- main entry point ----
+
+    def predict_detailed(self, text: str,
+                         recent_embeds: Optional[list] = None) -> Dict[str, float]:
+        """Return ensemble probability plus per-signal breakdown.
+
+        Keys:
+          prob  – final ensemble score (0–1)
+          heu   – combined heuristic (formality + Llama patterns + repetition)
+          llama – raw Llama-specific pattern sub-score (0–1)
+          bino  – Binoculars perplexity ratio score (0–1)
+          cls   – average classifier score across all loaded models (0–1)
+          adv   – adversarial-evasion score (char n-gram entropy + spacing) (0–1)
+          embed – embedding-variance score (0–1); needs recent_embeds
+
+        All values 0–1; higher = more likely AI-generated.
+        Results are LRU-cached (up to _CACHE_MAX entries).
+        """
+        _zero: Dict[str, float] = {
+            "prob": 0.0, "heu": 0.0, "llama": 0.0,
+            "bino": 0.0, "cls": 0.0, "adv": 0.0, "embed": 0.0, "watermark": 0.0}
+        if not self.enabled:
+            return _zero
+        text = text.strip()
+        if not text:
+            return _zero
+
+        cached = self._pred_cache.get(text)
+        if cached is not None:
+            try:
+                self._pred_cache.move_to_end(text)
+            except KeyError:
+                pass  # evicted by a concurrent thread between get() and move_to_end()
+            return cached  # type: ignore[return-value]
+
+        # Reasoning-model CoT leakage: <think>...</think> tags from Qwen3 / DeepSeek-R1
+        # bleeding into chat are unambiguous AI evidence — skip all other scoring.
+        if re.search(r'</?think\b', text, re.IGNORECASE):
+            _certain: Dict[str, float] = {
+                "prob": 1.0, "heu": 1.0, "llama": 1.0,
+                "bino": 1.0, "cls": 1.0, "adv": 1.0, "embed": 0.0, "watermark": 1.0}
+            if len(self._pred_cache) >= self._CACHE_MAX:
+                self._pred_cache.popitem(last=False)
+            self._pred_cache[text] = _certain
+            return _certain
+
+        llama = self.llama_pattern_score(text)
+        heu   = self._heuristic_score(text)
+        bino  = self._binoculars_score(text)
+        cls   = self._classifier_score(text)
+        adv   = self._adversarial_score(text)
+        embed = self._embedding_variance_score(text, recent_embeds or [])
+        wm    = self.watermark_score(text)
+
+        # Adaptive ensemble: ML models are unreliable on short IRC messages
+        # (< 8 words) — weight heuristics much higher there.  For long text
+        # (>= 30 words) Binoculars and the classifiers become more trustworthy.
+        n_words = len(text.split())
+        if n_words < 8:
+            prob = max(0.0, min(1.0, 0.12 * bino + 0.13 * cls + 0.75 * heu))
+        elif n_words < 30:
+            prob = max(0.0, min(1.0, 0.35 * bino + 0.35 * cls + 0.30 * heu))
+        else:
+            prob = max(0.0, min(1.0, 0.38 * bino + 0.37 * cls + 0.25 * heu))
+
+        # High-confidence override: unambiguous Llama structural output in short
+        # IRC messages should score high even when ML signals are uncertain.
+        if llama >= 0.60 and prob < 0.55:
+            prob = min(1.0, prob * 0.5 + llama * 0.5)
+
+        # Adversarial-evasion override: strong spacing/entropy anomalies push
+        # the score upward regardless of the main ensemble.
+        if adv >= 0.40:
+            prob = min(1.0, prob + 0.6 * adv * (1.0 - prob))
+
+        # Embedding-variance boost: add up to +0.08 when the text is unusually
+        # consistent with the user's own recent style.
+        if embed > 0.0:
+            prob = min(1.0, prob + 0.08 * embed)
+
+        # Watermark-detection boost: add up to +0.12 when watermark patterns found
+        if wm > 0.0:
+            prob = min(1.0, prob + 0.12 * wm)
+
+        result: Dict[str, float] = {
+            "prob": prob, "heu": heu, "llama": llama, "bino": bino,
+            "cls": cls, "adv": adv, "embed": embed, "watermark": wm}
+
+        if len(self._pred_cache) >= self._CACHE_MAX:
+            self._pred_cache.popitem(last=False)   # O(1) FIFO eviction
+        self._pred_cache[text] = result
+        return result
+
+    def predict_prob(self, text: str) -> float:
+        """Convenience wrapper — returns only the ensemble probability (0–1)."""
+        return self.predict_detailed(text)["prob"]
+
+    # ---- watermark detection (Area 5) ----
+
+    def watermark_score(self, text: str) -> float:
+        """Detect common LLM watermark patterns.  Returns 0..1.
+
+        Checks:
+          • Duplicate-token watermark (repeated function words / high-frequency
+            tokens at suspiciously regular intervals)
+          • Green-red list bias (unusual token-frequency distribution)
+          • Structural watermarks (uniform sentence length, low positional entropy)
+        """
+        if not text or len(text) < 10:
+            return 0.0
+        score = 0.0
+        words = text.lower().split()
+        n_words = len(words)
+        if n_words < 5:
+            return 0.0
+
+        # ── Duplicate-token watermark ────────────────────────────────────────
+        # Some watermarking schemes bias toward repeating high-frequency tokens.
+        # Detect by counting function-word repeats at 3–7 token intervals.
+        _func_words = frozenset({
+            "the", "a", "an", "of", "to", "in", "is", "that", "for", "it",
+            "on", "and", "be", "or", "as", "at", "by", "with", "this", "are",
+            "was", "were", "been", "has", "have", "had", "do", "does", "did",
+            "will", "would", "can", "could", "may", "might", "shall", "should",
+            "not", "no", "so", "if", "than", "then", "but", "because", "we",
+        })
+        func_positions = [i for i, w in enumerate(words) if w in _func_words]
+        if len(func_positions) >= 6:
+            gaps = [func_positions[i+1] - func_positions[i]
+                    for i in range(len(func_positions)-1)]
+            if gaps:
+                mean_gap = sum(gaps) / len(gaps)
+                low_var = sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)
+                cv = (low_var ** 0.5) / max(mean_gap, 1)
+                # Suspiciously regular function-word spacing → watermark
+                if cv < 0.30 and mean_gap <= 7:
+                    score += 0.25
+
+        # ── Green-red token bias ─────────────────────────────────────────────
+        # Watermarked text tends to have an unusually uniform token-frequency
+        # rank distribution (too many "medium-rare" tokens, too few rare ones).
+        if n_words >= 10:
+            wf: Counter = Counter()
+            for w in words:
+                wf[w] += 1
+            freqs = sorted(wf.values(), reverse=True)
+            if len(freqs) >= 5:
+                top3 = sum(freqs[:3])
+                rare = sum(freqs[3:])
+                total_f = sum(freqs)
+                top3_ratio = top3 / total_f if total_f else 0
+                # Human text: top-3 words account for ~15–35% of tokens.
+                # Watermarked: more uniform → top-3 ratio < 15% or > 45%.
+                if top3_ratio < 0.15:
+                    score += 0.15
+                elif top3_ratio > 0.45:
+                    score += 0.10
+
+        # ── Sentence-length uniformity ───────────────────────────────────────
+        # Watermarked prose often has very uniform sentence lengths.
+        sentences = re.split(r'[.!?]+', text)
+        sent_lens = [len(s.split()) for s in sentences if len(s.split()) >= 2]
+        if len(sent_lens) >= 4:
+            m_sl = sum(sent_lens) / len(sent_lens)
+            v_sl = sum((sl - m_sl) ** 2 for sl in sent_lens) / len(sent_lens)
+            cv_sl = (v_sl ** 0.5) / max(m_sl, 1)
+            if cv_sl < 0.25:
+                score += 0.20
+
+        return min(1.0, score)
+
+    # ---- LoRA incremental fine-tuning (Area 7) ----
+
+    def _init_lora(self) -> bool:
+        """Attempt to prepare a LoRA adapter on cls1.  Returns True if ready."""
+        if self._cls_model is None:
+            return False
+        try:
+            from peft import LoraConfig, get_peft_model, TaskType
+            if getattr(self, "_lora_peft_config", None) is None:
+                self._lora_peft_config = LoraConfig(
+                    task_type=TaskType.SEQ_CLS,
+                    r=8,
+                    lora_alpha=16,
+                    lora_dropout=0.05,
+                    target_modules=["query", "value"],
+                )
+                self._lora_model = get_peft_model(self._cls_model, self._lora_peft_config)
+                self._lora_model.to(self._device)
+            return True
+        except ImportError:
+            return False
+
+    def _train_lora_adapter(self, positive_texts: List[str], negative_texts: List[str],
+                             output_path: str, epochs: int = 3) -> str:
+        """Fine-tune the LoRA adapter on positive vs negative examples.
+
+        Runs synchronously (call from a thread executor).  Returns the adapter
+        path on success, or an error message on failure.
+        """
+        if not _PEFT_AVAILABLE or self._cls_tok is None:
+            return "PEFT not available"
+        if not self._init_lora():
+            return "failed to init LoRA"
+        # Limit PyTorch to 1 thread so BLAS doesn't starve the event loop
+        _old_torch_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        from torch.utils.data import DataLoader, TensorDataset
+        texts = positive_texts + negative_texts
+        labels = [1] * len(positive_texts) + [0] * len(negative_texts)
+        if len(texts) < 4:
+            return "need at least 4 examples (2 pos + 2 neg)"
+        enc = self._cls_tok(texts, truncation=True, padding=True, max_length=128, return_tensors="pt")
+        dataset = TensorDataset(enc["input_ids"], enc["attention_mask"], torch.tensor(labels))
+        loader = DataLoader(dataset, batch_size=4, shuffle=True)
+        opt = torch.optim.AdamW(self._lora_model.parameters(), lr=3e-5)
+        self._lora_model.train()
+        for epoch in range(epochs):
+            for batch_ids, batch_mask, batch_labels in loader:
+                batch_ids = batch_ids.to(self._device)
+                batch_mask = batch_mask.to(self._device)
+                batch_labels = batch_labels.to(self._device).float()
+                out = self._lora_model(input_ids=batch_ids, attention_mask=batch_mask,
+                                       labels=batch_labels.long())
+                loss = out.loss
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        self._lora_model.eval()
+        try:
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            self._lora_model.save_pretrained(output_path)
+        except Exception as e:
+            return f"save failed: {e}"
+        finally:
+            torch.set_num_threads(_old_torch_threads)
+        self._lora_loaded = True
+        return output_path
+
+# =========================
+# BotFingerprint
+# =========================
+_STRIP_PUNCT = str.maketrans("", "", ".,!?;:\"'()[]")
+
+class BotFingerprint:
+    """Linguistic fingerprint built from a confirmed bot/AI user's messages.
+
+    Extracts vocabulary, bigrams, and trigrams so that future messages from
+    *other* users with similar word patterns receive a score boost — effectively
+    learning style from confirmed positives.
+    """
+
+    def __init__(self, nick: str):
+        self.nick       = nick
+        self.word_vocab: set = set()   # all lowercase words seen
+        self.bigrams:   set = set()    # consecutive word pairs
+        self.trigrams:  set = set()    # consecutive word triples
+        self.msg_count: int = 0
+
+    def _tokenize(self, text: str) -> List[str]:
+        return [w.lower().translate(_STRIP_PUNCT) for w in text.split() if w.strip(_STRIP_PUNCT)]
+
+    def ingest(self, text: str) -> None:
+        """Feed one message into this fingerprint."""
+        words = self._tokenize(text)
+        if not words:
             return
+        self.word_vocab.update(words)
+        for i in range(len(words) - 1):
+            self.bigrams.add((words[i], words[i + 1]))
+        for i in range(len(words) - 2):
+            self.trigrams.add((words[i], words[i + 1], words[i + 2]))
+        self.msg_count += 1
+
+    def similarity(self, text: str) -> float:
+        """Return 0..1 — how closely *text* matches this bot's writing patterns.
+
+        Combines Jaccard vocabulary overlap with bigram/trigram hit rates.
+        Trigrams are the strongest signal because accidental three-word collisions
+        are rare in natural IRC conversation.
+        """
+        if not self.word_vocab:
+            return 0.0
+        words = self._tokenize(text)
+        if not words:
+            return 0.0
+
+        text_set = set(words)
+        vocab_j  = len(text_set & self.word_vocab) / len(text_set | self.word_vocab)
+
+        bi_score = 0.0
+        if len(words) >= 2 and self.bigrams:
+            text_bi  = {(words[i], words[i + 1]) for i in range(len(words) - 1)}
+            bi_score = len(text_bi & self.bigrams) / len(text_bi)
+
+        tri_score = 0.0
+        if len(words) >= 3 and self.trigrams:
+            text_tri  = {(words[i], words[i + 1], words[i + 2]) for i in range(len(words) - 2)}
+            tri_score = len(text_tri & self.trigrams) / len(text_tri)
+
+        return min(1.0, 0.25 * vocab_j + 0.35 * bi_score + 0.40 * tri_score)
+
+
+class ScoringEngine:
+    def __init__(self, ai_detector: EnsembleAIDetector):
+        self.ai_detector      = ai_detector
+        self.confirmed_bot_nicks: set = set()
+        self.bot_fingerprints: Dict[str, BotFingerprint] = {}
+        self.blocklisted_ngrams: set = set()
+        self._load_blocklist()
+
+    # ── Collaborative n-gram blocklist (Area 3) ───────────────────────────
+
+    def _blocklist_path(self) -> str:
+        return USER_TELL_PATH
+
+    def _load_blocklist(self) -> None:
+        path = self._blocklist_path()
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                self.blocklisted_ngrams = set(data.get("ngrams", []))
+            except Exception:
+                self.blocklisted_ngrams = set()
+
+    def _save_blocklist(self) -> None:
+        path = self._blocklist_path()
         try:
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.data, f)
-            os.replace(tmp, self.path)
-            self.dirty = False
-        except OSError as exc:
-            print(f"LLM cache save failed: {exc}", file=sys.stderr)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"ngrams": sorted(self.blocklisted_ngrams)}, f)
+        except Exception:
+            pass
 
-    def __len__(self) -> int:
-        return len(self.data)
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        return [w.lower().translate(_STRIP_PUNCT) for w in text.split() if w.strip(_STRIP_PUNCT)]
 
+    def _extract_tell_ngrams(self, text: str) -> set:
+        words = self._tokenize(text)
+        ngrams: set = set()
+        for w in words:
+            ngrams.add(w)
+        for i in range(len(words) - 1):
+            ngrams.add(f"{words[i]} {words[i+1]}")
+        for i in range(len(words) - 2):
+            ngrams.add(f"{words[i]} {words[i+1]} {words[i+2]}")
+        return ngrams
 
-def call_llm_cached(base_url: str, model: str, system: str, user_msg: str,
-                    timeout: int = 180, cache: LLMCache | None = None,
-                    spinner_msg: str = "LLM thinking") -> str:
-    if cache is not None:
-        hit = cache.get(model, system, user_msg)
-        if hit is not None:
-            return hit
-    with Spinner(spinner_msg):
-        out = call_llm(base_url, model, system, user_msg, timeout)
-    if cache is not None:
-        cache.put(model, system, user_msg, out)
-    return out
+    def add_tell(self, phrase: str) -> int:
+        ngrams = self._extract_tell_ngrams(phrase)
+        before = len(self.blocklisted_ngrams)
+        self.blocklisted_ngrams |= ngrams
+        self._save_blocklist()
+        return len(self.blocklisted_ngrams) - before
 
+    def remove_tell(self, phrase: str) -> int:
+        ngrams = self._extract_tell_ngrams(phrase)
+        before = len(self.blocklisted_ngrams)
+        self.blocklisted_ngrams -= ngrams
+        self._save_blocklist()
+        return before - len(self.blocklisted_ngrams)
 
-def chunk_lines(lines: list[str], max_chars: int) -> list[str]:
-    chunks: list[str] = []
-    buf: list[str] = []
-    size = 0
-    for ln in lines:
-        ln_len = len(ln) + 1
-        if size + ln_len > max_chars and buf:
-            chunks.append("\n".join(buf))
-            buf, size = [], 0
-        buf.append(ln)
-        size += ln_len
-    if buf:
-        chunks.append("\n".join(buf))
-    return chunks
+    def blocklist_overlap_score(self, text: str) -> float:
+        """Return 0..1 — fraction of blocklisted n-grams present in *text*."""
+        if not self.blocklisted_ngrams or not text:
+            return 0.0
+        words = self._tokenize(text)
+        if not words:
+            return 0.0
+        hits = 0
+        total = 0
+        seen = set()
+        # Unigrams
+        for w in words:
+            if w in self.blocklisted_ngrams and w not in seen:
+                hits += 1
+                seen.add(w)
+            total += 1
+        # Bigrams
+        for i in range(len(words) - 1):
+            bg = f"{words[i]} {words[i+1]}"
+            if bg in self.blocklisted_ngrams and bg not in seen:
+                hits += 1
+                seen.add(bg)
+            total += 1
+        # Trigrams
+        for i in range(len(words) - 2):
+            tg = f"{words[i]} {words[i+1]} {words[i+2]}"
+            if tg in self.blocklisted_ngrams and tg not in seen:
+                hits += 1
+                seen.add(tg)
+            total += 1
+        return min(1.0, hits / max(1, total))
 
+    def confirm_bot(self, nick: str, messages: List[str]) -> BotFingerprint:
+        """Mark *nick* as a confirmed bot and build their linguistic fingerprint."""
+        self.confirmed_bot_nicks.add(nick)
+        fp = self.bot_fingerprints.get(nick) or BotFingerprint(nick)
+        for msg in messages:
+            fp.ingest(msg)
+        self.bot_fingerprints[nick] = fp
+        return fp
 
-def analyze_user_with_llm(user: str, lines: list[str], llm_url: str,
-                          model: str, max_chars: int,
-                          cache: LLMCache | None = None) -> None:
-    if not lines:
-        print(f"\nNo lines matched user '{user}'. Nothing to send to the LLM.")
-        return
+    def unconfirm_bot(self, nick: str) -> None:
+        self.confirmed_bot_nicks.discard(nick)
+        self.bot_fingerprints.pop(nick, None)
 
-    print(f"\nFiltered to {len(lines)} lines for user '{user}'.")
-    chunks = chunk_lines(lines, max_chars)
-    print(f"Sending {len(chunks)} chunk(s) to LLM at {llm_url} (model={model}).")
-
-    system = (
-        "You are a log-analysis assistant. Given log lines that all relate to a "
-        "single user/identifier, summarize that user's behavior: what they do, "
-        "when they are active, who/what they interact with, anomalies, and any "
-        "signs of trouble. Be concrete, cite line patterns, and keep it tight."
-    )
-
-    partials: list[str] = []
-    for i, chunk in enumerate(chunks, 1):
-        prompt = (
-            f"User of interest: {user}\n"
-            f"Chunk {i}/{len(chunks)} of log lines mentioning this user:\n\n"
-            f"{chunk}\n\n"
-            f"Summarize this chunk's evidence about {user}'s behavior."
-        )
-        try:
-            out = call_llm_cached(llm_url, model, system, prompt, cache=cache)
-        except urllib.error.URLError as exc:
-            print(f"  [chunk {i}] LLM request failed: {exc}", file=sys.stderr)
-            return
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [chunk {i}] LLM error: {exc}", file=sys.stderr)
-            return
-        partials.append(out)
-        print(f"\n--- Chunk {i}/{len(chunks)} summary ---\n{out}")
-
-    if len(partials) > 1:
-        merge_prompt = (
-            f"Combine these per-chunk summaries about user '{user}' into one "
-            f"cohesive behavior profile. Deduplicate, resolve contradictions, "
-            f"and call out the strongest signals.\n\n"
-            + "\n\n---\n\n".join(f"Chunk {i+1}:\n{p}" for i, p in enumerate(partials))
-        )
-        try:
-            final = call_llm_cached(llm_url, model, system, merge_prompt, cache=cache)
-            print(f"\n=== Final behavior profile for {user} ===\n{final}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"Final merge failed: {exc}", file=sys.stderr)
-
-
-def analyze_interaction_with_llm(a: str, b: str, lines: list[str], llm_url: str,
-                                 model: str, max_chars: int,
-                                 cache: LLMCache | None = None) -> None:
-    if not lines:
-        print(f"\nNo direct interactions found between '{a}' and '{b}'. Nothing to send to the LLM.")
-        return
-
-    print(f"\nFound {len(lines)} direct-interaction lines between '{a}' and '{b}'.")
-    chunks = chunk_lines(lines, max_chars)
-    print(f"Sending {len(chunks)} chunk(s) to LLM at {llm_url} (model={model}).")
-
-    system = (
-        "You are a log-analysis assistant. You will receive log lines that "
-        "represent direct exchanges between exactly two users. Characterize "
-        "their relationship: frequency and rhythm of contact, tone, who "
-        "initiates, recurring topics, agreement vs. conflict, role asymmetry "
-        "(e.g. helper/asker, friends, antagonists, bot/operator), and any "
-        "anomalies. Cite concrete evidence and keep it tight."
-    )
-
-    partials: list[str] = []
-    for i, chunk in enumerate(chunks, 1):
-        prompt = (
-            f"User A: {a}\nUser B: {b}\n"
-            f"Chunk {i}/{len(chunks)} of log lines representing direct exchanges "
-            f"between them:\n\n{chunk}\n\n"
-            f"Summarize this chunk's evidence about how {a} and {b} interact."
-        )
-        try:
-            out = call_llm_cached(llm_url, model, system, prompt, cache=cache)
-        except urllib.error.URLError as exc:
-            print(f"  [chunk {i}] LLM request failed: {exc}", file=sys.stderr)
-            return
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [chunk {i}] LLM error: {exc}", file=sys.stderr)
-            return
-        partials.append(out)
-        print(f"\n--- Chunk {i}/{len(chunks)} summary ---\n{out}")
-
-    if len(partials) > 1:
-        merge_prompt = (
-            f"Combine these per-chunk summaries about the interaction between "
-            f"'{a}' and '{b}' into one cohesive relationship profile. "
-            f"Deduplicate, resolve contradictions, and call out the strongest "
-            f"signals.\n\n"
-            + "\n\n---\n\n".join(f"Chunk {i+1}:\n{p}" for i, p in enumerate(partials))
-        )
-        try:
-            final = call_llm_cached(llm_url, model, system, merge_prompt, cache=cache)
-            print(f"\n=== Final interaction profile: {a} ↔ {b} ===\n{final}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"Final merge failed: {exc}", file=sys.stderr)
-
-
-def _profile_summary_for_llm(p: dict) -> str:
-    sm = p["score_means"]
-    return (
-        f"User: {p['user']}\n"
-        f"  authored_lines: {p['authored']}\n"
-        f"  mentioned_by_others: {p['mentioned_by_others']}\n"
-        f"  first_seen: {_fmt_dt(p['first_ts'])}   last_seen: {_fmt_dt(p['last_ts'])}\n"
-        f"  active_days: {len(p['by_day'])}   peak_hours: {_peak_hours(p['by_hour'])}\n"
-        f"  top_channels: {_top_str(p['channels'], 5) or '—'}\n"
-        f"  flags: {_top_str(p['flags'], 5) or '—'}\n"
-        f"  mean_msg_len: {_fmt_num(p['msg_len_mean'])}\n"
-        f"  score_means: heu={_fmt_score(sm['heu'])} bino={_fmt_score(sm['bino'])} "
-        f"cls={_fmt_score(sm['cls'])} llama={_fmt_score(sm['llama'])}"
-    )
-
-
-def _trim_samples(samples: list[str], max_chars: int) -> list[str]:
-    if not samples:
-        return []
-    if len(samples) <= 60:
-        chosen = samples
-    else:
-        step = len(samples) / 60
-        chosen = [samples[int(i * step)] for i in range(60)]
-    out: list[str] = []
-    used = 0
-    for s in chosen:
-        if used + len(s) + 1 > max_chars:
-            break
-        out.append(s)
-        used += len(s) + 1
-    return out
-
-
-def compare_users_with_llm(pa: dict, pb: dict, llm_url: str, model: str,
-                           max_chunk_chars: int,
-                           cache: LLMCache | None = None) -> None:
-    compare_n_users_with_llm([pa, pb], llm_url, model, max_chunk_chars, cache)
-
-
-def compare_n_users_with_llm(profiles: list[dict], llm_url: str, model: str,
-                             max_chunk_chars: int,
-                             cache: LLMCache | None = None) -> None:
-    names = ", ".join(p["user"] for p in profiles)
-    if not any(p["authored"] for p in profiles):
-        print(f"\nNone of the requested users ({names}) authored lines in this log.")
-        return
-
-    sample_budget = max(1500, max_chunk_chars // (len(profiles) + 1))
-    parts: list[str] = []
-    counts: list[int] = []
-    for p in profiles:
-        samples = _trim_samples(p["samples"], sample_budget)
-        counts.append(len(samples))
-        parts.append(
-            f"=== Profile: {p['user']} ===\n{_profile_summary_for_llm(p)}\n\n"
-            f"Sample lines authored by {p['user']} ({len(samples)}):\n"
-            + "\n".join(samples)
-        )
-    user_msg = "\n\n".join(parts) + f"\n\nCompare these users: {names}."
-
-    if len(profiles) == 2:
-        system = (
-            "You are a log-analysis assistant. You will receive two users' "
-            "behavior profiles (aggregate metrics) plus sample messages each "
-            "user authored. Compare them: tone and style, topics they engage "
-            "with, where and when they're active, score-profile differences, "
-            "role (helper/asker/lurker/bot/troll), similarities, and any "
-            "anomalies that distinguish them. Cite metrics and quote short "
-            "snippets when useful. Keep it tight and structured."
-        )
-    else:
-        system = (
-            "You are a log-analysis assistant. You will receive several users' "
-            "behavior profiles and sample messages. Compare them across tone, "
-            "topics, activity windows, score-profile differences, and roles. "
-            "Group users that look alike (possible sock-puppets) and call out "
-            "ones that stand apart. Cite metrics, quote short snippets, and "
-            "structure clearly."
+    def max_fingerprint_similarity(self, text: str, exclude_nick: str = "") -> float:
+        """Return the highest similarity score of *text* against all bot fingerprints."""
+        if not self.bot_fingerprints:
+            return 0.0
+        return max(
+            fp.similarity(text)
+            for n, fp in self.bot_fingerprints.items()
+            if n != exclude_nick
         )
 
-    print(f"\nSending {len(profiles)}-way behavior comparison to LLM at {llm_url} (model={model}).")
-    print("  " + "  |  ".join(f"{p['user']}: {n} samples" for p, n in zip(profiles, counts)))
+    def score_user(self, user_state) -> int:
+        return int(user_state.rolling_ai_likelihood())
 
-    try:
-        out = call_llm_cached(llm_url, model, system, user_msg, cache=cache)
-    except urllib.error.URLError as exc:
-        print(f"LLM request failed: {exc}", file=sys.stderr)
-        return
-    except Exception as exc:  # noqa: BLE001
-        print(f"LLM error: {exc}", file=sys.stderr)
-        return
-    print(f"\n=== Behavior comparison: {names} ===\n{out}")
+    def score_message(self, msg_state, user_state) -> int:
+        return int(user_state.rolling_ai_likelihood())
 
+# =========================
+# UserState + ChatWindow
+# =========================
+class UserState:
+    __slots__ = ("nick", "join_time", "last_msg_time", "msg_times", "msg_lengths",
+                 "total_msgs", "ai_scores", "_rolling_sum", "_len_sum", "_time_sum",
+                 "is_confirmed_bot", "_recent_embeds", "_log_gaps", "_recent_signals")
+    def __init__(self, nick: str):
+        self.nick = nick
+        self.join_time = time.monotonic()
+        self.last_msg_time: Optional[float] = None
+        self.msg_times: deque = deque(maxlen=USER_HISTORY_WINDOW)
+        self.msg_lengths: deque = deque(maxlen=USER_HISTORY_WINDOW)
+        self.total_msgs = 0
+        self.ai_scores: deque = deque(maxlen=USER_HISTORY_WINDOW)
+        self._rolling_sum: float = 0.0
+        self._len_sum:     int   = 0
+        self._time_sum:    float = 0.0
+        self.is_confirmed_bot: bool = False
+        # Embedding history for semantic-drift detection (max 32 vectors)
+        self._recent_embeds: deque = deque(maxlen=32)
+        # Log-transformed inter-message gaps for timing-distribution model
+        self._log_gaps: deque = deque(maxlen=USER_HISTORY_WINDOW)
+        # Per-signal breakdown history for explainability (Area 6)
+        self._recent_signals: deque = deque(maxlen=USER_HISTORY_WINDOW)
 
-def ask_about_user_with_llm(user: str, question: str, lines: list[str],
-                            llm_url: str, model: str, max_chars: int,
-                            cache: LLMCache | None = None) -> None:
-    if not lines:
-        print(f"\nNo lines for '{user}'. Nothing to ask.")
-        return
-    chunks = chunk_lines(lines, max_chars)
-    print(f"\nAsking LLM about {user} ({len(chunks)} chunk(s)) at {llm_url} (model={model}).")
-    system = (
-        "You are a log-analysis assistant. Given log lines that all relate to "
-        "a single user, answer the operator's question concretely, citing "
-        "evidence from the lines. If the lines do not contain enough "
-        "information to answer, say so."
-    )
-    partials: list[str] = []
-    for i, chunk in enumerate(chunks, 1):
-        prompt = (
-            f"User of interest: {user}\n"
-            f"Operator question: {question}\n\n"
-            f"Chunk {i}/{len(chunks)} of log lines for this user:\n\n{chunk}\n\n"
-            f"Answer the question for this chunk. Cite lines when useful."
-        )
-        try:
-            out = call_llm_cached(llm_url, model, system, prompt, cache=cache)
-        except urllib.error.URLError as exc:
-            print(f"  [chunk {i}] LLM request failed: {exc}", file=sys.stderr)
-            return
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [chunk {i}] LLM error: {exc}", file=sys.stderr)
-            return
-        partials.append(out)
-        print(f"\n--- Chunk {i}/{len(chunks)} answer ---\n{out}")
-    if len(partials) > 1:
-        merge = (
-            f"Operator question: {question}\n\n"
-            f"Combine the per-chunk answers below into one coherent response. "
-            f"Resolve contradictions, deduplicate, and cite the strongest evidence.\n\n"
-            + "\n\n---\n\n".join(f"Chunk {i+1}:\n{p}" for i, p in enumerate(partials))
-        )
-        try:
-            final = call_llm_cached(llm_url, model, system, merge, cache=cache)
-            print(f"\n=== Final answer about {user}: {question} ===\n{final}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"Final merge failed: {exc}", file=sys.stderr)
+    def record_message(self, msg: str, ai_score: Optional[int] = None) -> None:
+        now = time.monotonic()
+        if self.last_msg_time is not None:
+            gap = now - self.last_msg_time
+            if len(self.msg_times) == USER_HISTORY_WINDOW:
+                self._time_sum -= self.msg_times[0]
+            self.msg_times.append(gap)
+            self._time_sum += gap
+            self._log_gaps.append(log(gap + 1e-9))
+        self.last_msg_time = now
+        msg_len = len(msg)
+        if len(self.msg_lengths) == USER_HISTORY_WINDOW:
+            self._len_sum -= self.msg_lengths[0]
+        self.msg_lengths.append(msg_len)
+        self._len_sum += msg_len
+        self.total_msgs += 1
+        if ai_score is not None:
+            if len(self.ai_scores) == USER_HISTORY_WINDOW:
+                self._rolling_sum -= self.ai_scores[0]
+            self.ai_scores.append(ai_score)
+            self._rolling_sum += ai_score
 
+    def seed_ai_history(self, scores: List[int]) -> None:
+        """Pre-seed ai_scores from historical log data without affecting message counts."""
+        for score in scores:
+            score = max(0, min(100, score))
+            if len(self.ai_scores) == USER_HISTORY_WINDOW:
+                self._rolling_sum -= self.ai_scores[0]
+            self.ai_scores.append(score)
+            self._rolling_sum += score
 
-# ---------- NEW: LLM anomaly explanation (#19) --------------------------------
+    def rolling_ai_likelihood(self) -> float:
+        n = len(self.ai_scores)
+        return self._rolling_sum / n if n else 0.0
 
-def llm_explain_anomalies(anomalies: list[Anomaly], context_lines: list[str],
-                          llm_url: str, model: str, max_chars: int = 8000,
-                          cache: LLMCache | None = None) -> None:
-    if not anomalies:
-        print("(no anomalies to explain)")
-        return
-    anomaly_text = "\n".join(
-        f"  {a.metric}: value={a.value:.2f}, expected={a.expected:.2f}, z={a.zscore:.2f}, "
-        f"day={a.day or '?'}, hour={a.hour or '?'}"
-        for a in anomalies[:10]
-    )
-    context = "\n".join(context_lines[:50])
-    system = "You are a log-anomaly analyst. Explain what might be happening given the detected anomalies and context."
-    prompt = (
-        f"Detected anomalies:\n{anomaly_text}\n\n"
-        f"Recent context lines:\n{context}\n\n"
-        f"Explain these anomalies: what do they suggest and should we be concerned?"
-    )
-    try:
-        out = call_llm_cached(llm_url, model, system, prompt, cache=cache, spinner_msg="LLM explaining anomalies")
-        print(f"\n=== LLM anomaly explanation ===\n{out}")
-    except Exception as exc:
-        print(f"LLM anomaly explanation failed: {exc}")
+    # Extra stats for dashboard — O(1) via incremental sums
+    def avg_msg_length(self) -> float:
+        n = len(self.msg_lengths)
+        return self._len_sum / n if n else 0.0
 
-# ---------- NEW: Conversation summarization (#20) -----------------------------
+    def messages_per_minute(self) -> float:
+        n = len(self.msg_times)
+        return (n / self._time_sum) * 60 if n and self._time_sum > 0 else 0.0
 
-def llm_summarize_conversation(a: str, b: str, lines: list[str],
-                               llm_url: str, model: str, max_chars: int = 8000,
-                               cache: LLMCache | None = None) -> None:
-    if not lines:
-        print(f"(no conversation to summarize)")
-        return
-    chunks = chunk_lines(lines, max_chars)
-    system = "You summarize chat conversations into bullet points covering topics, tone, and key exchanges."
-    partials: list[str] = []
-    for i, chunk in enumerate(chunks, 1):
-        prompt = (
-            f"Conversation between {a} and {b}, chunk {i}/{len(chunks)}:\n\n"
-            f"{chunk}\n\n"
-            f"Summarize this chunk's conversation as bullet points."
-        )
-        try:
-            out = call_llm_cached(llm_url, model, system, prompt, cache=cache, spinner_msg="LLM summarizing")
-        except Exception as exc:
-            print(f"LLM error: {exc}")
-            return
-        partials.append(out)
-        print(f"\n--- Chunk {i} summary ---\n{out}")
-    if len(partials) > 1:
-        merge_prompt = (
-            f"Combine these per-chunk summaries of a conversation between {a} and {b}:\n\n"
-            + "\n\n".join(f"Chunk {i+1}: {p}" for i, p in enumerate(partials))
-        )
-        try:
-            final = call_llm_cached(llm_url, model, system, merge_prompt, cache=cache)
-            print(f"\n=== Full conversation summary: {a} ↔ {b} ===\n{final}")
-        except Exception as exc:
-            print(f"Merge failed: {exc}")
+    def timing_anomaly_score(self) -> float:
+        """0..1 — log-normal timing regularity model.
 
-# ---------- NEW: LLM clustering (#21) -----------------------------------------
+        Models log-transformed inter-message gaps as a normal distribution.
+        Bots exhibit low log-variance and consistently small z-scores.
+        Higher return value = more automated/bot-like timing pattern.
+        """
+        if len(self._log_gaps) < 5:
+            return 0.0
+        import statistics as _stats
+        mean_log = _stats.mean(self._log_gaps)
+        stdev_log = _stats.stdev(self._log_gaps) if len(self._log_gaps) >= 2 else 0.0
+        if stdev_log < 0.01:
+            return 0.9  # near-zero variance → almost certainly automated
+        latest_log = self._log_gaps[-1]
+        z = abs((latest_log - mean_log) / stdev_log)
+        reg_score = max(0.0, 1.0 - z / 2.0)           # small z → too regular
+        stdev_score = max(0.0, min(1.0, (0.8 - stdev_log) / 0.8))  # low std → consistent
+        return max(0.0, min(1.0, 0.5 * reg_score + 0.5 * stdev_score))
 
-def llm_cluster_users(profiles: list[dict], llm_url: str, model: str,
-                      max_chars: int = 12000, cache: LLMCache | None = None) -> None:
-    if len(profiles) < 3:
-        print("Need at least 3 users for clustering.")
-        return
-    sample_budget = max(2000, max_chars // (len(profiles) + 1))
-    parts: list[str] = []
-    for p in profiles[:15]:
-        samples = _trim_samples(p.get("samples", []), sample_budget)
-        parts.append(
-            f"User: {p['user']} (lines={p.get('authored', 0)})\n"
-            f"Score means: {p.get('score_means', {})}\n"
-            f"Peak hours: {_peak_hours(p.get('by_hour', {}))}\n"
-            f"Sample lines:\n" + "\n".join(samples[:10])
-        )
-    system = (
-        "You are a behavioral clustering analyst. Group these users by similar behavior patterns "
-        "(tone, activity, topics, roles). For each group, describe the common traits. "
-        "Flag any users that are anomalous outliers."
-    )
-    prompt = f"Cluster these {len(profiles)} users into behavioral groups:\n\n" + "\n---\n".join(parts)
-    try:
-        out = call_llm_cached(llm_url, model, system, prompt, cache=cache, spinner_msg="LLM clustering")
-        print(f"\n=== LLM user clustering ===\n{out}")
-    except Exception as exc:
-        print(f"LLM clustering failed: {exc}")
+class ChatWindow:
+    def __init__(self, name: str, is_channel: bool = True, server_id: str = ""):
+        self.name = name
+        self.is_channel = is_channel
+        self.server_id = server_id
+        self.lines: deque = deque(maxlen=MAX_MESSAGES)
+        self._line_msgids: deque = deque(maxlen=MAX_MESSAGES)  # parallel msgid per line
+        self._msg_store: dict = {}   # {msgid: (nick, text_preview)} — for reply lookups
+        self._last_msgid: str = ""   # msgid of most recent incoming message
+        self._reactions: dict = {}   # {msgid: {emoji: [nick, ...]}}
+        self._unread_from: int = -1  # index of first unread line (-1 = none)
+        self.wrapped_cache: List[str] = []
+        self.url_map: Dict[int, str] = {}  # wrapped line index -> full URL
+        self._wrap_dirty = True
+        self._last_wrap_width = 0
+        self.scroll_offset: int = 0  # 0 = pinned to bottom
+        self._persist = True         # write new lines to disk
+        # Optional override for the on-disk log filename.  Defaults to
+        # self.name; used to disambiguate multiple windows that share a name
+        # across servers (e.g. each server's own *status* window).
+        self._log_name: str = ""
 
-# ---------- NEW: Automated LLM report (#22) -----------------------------------
+    def add_line(self, text: str, timestamp: bool = True,
+                 ts_str: Optional[str] = None, msgid: str = "") -> None:
+        if timestamp:
+            ts = ts_str if ts_str else time.strftime("[%H:%M]")
+            text = f"{ts} {text}"
+        self.lines.append(text)
+        self._line_msgids.append(msgid)
+        self._wrap_dirty = True
+        if self._persist:
+            append_chat_line(self._log_name or self.name, text)
 
-def llm_auto_report(summary: dict, top_profiles: list[dict], llm_url: str, model: str,
-                    max_chars: int = 12000, cache: LLMCache | None = None) -> None:
-    system = "You are a log analysis reporter. Generate a concise narrative report of the key findings."
-    summary_part = (
-        f"Total entries: {summary.get('total', 0)}\n"
-        f"Time range: {summary.get('first_ts')} to {summary.get('last_ts')}\n"
-        f"Top users: {summary.get('top_users', [])[:10]}\n"
-        f"Top events: {summary.get('top_events', [])[:10]}\n"
-    )
-    profile_parts: list[str] = []
-    for p in top_profiles[:5]:
-        profile_parts.append(
-            f"{p['user']}: lines={p.get('authored', 0)}, "
-            f"scores={p.get('score_means', {})}"
-        )
-    prompt = (
-        f"Log summary:\n{summary_part}\n\n"
-        f"Top user profiles:\n" + "\n".join(profile_parts) + "\n\n"
-        f"Generate a 1-2 paragraph narrative report of the key findings, trends, and anomalies."
-    )
-    try:
-        out = call_llm_cached(llm_url, model, system, prompt, cache=cache, spinner_msg="LLM generating report")
-        print(f"\n=== Automated log report ===\n{out}")
-    except Exception as exc:
-        print(f"Auto report failed: {exc}")
+# Reuse one SSL context across all connections (parsing the CA bundle is expensive).
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.minimum_version = ssl.TLSVersion.TLSv1_2
+if SASL_MECHANISM == "EXTERNAL" and SASL_CERT and SASL_KEY:
+    _SSL_CTX.load_cert_chain(SASL_CERT, SASL_KEY)
 
-# ---------- exports ---------------------------------------------------------
-
-def serialize_profile(profile: dict, sample_cap: int = 200) -> dict:
-    out = dict(profile)
-    out["channels"] = dict(profile["channels"])
-    out["flags"] = dict(profile["flags"])
-    out["first_ts"] = profile["first_ts"].isoformat() if profile["first_ts"] else None
-    out["last_ts"] = profile["last_ts"].isoformat() if profile["last_ts"] else None
-    out["samples"] = profile["samples"][:sample_cap]
-    return out
-
-
-def serialize_summary(summary: dict) -> dict:
-    out = dict(summary)
-    out["formats"] = dict(summary["formats"])
-    out["first_ts"] = summary["first_ts"].isoformat() if summary["first_ts"] else None
-    out["last_ts"] = summary["last_ts"].isoformat() if summary["last_ts"] else None
-    return out
-
-
-def export_profile_json(profile: dict, path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(serialize_profile(profile), f, indent=2, default=str)
-
-
-def export_profile_csv(profile: dict, path: str) -> None:
-    rows: list[tuple[str, object]] = [
-        ("user", profile["user"]),
-        ("authored", profile["authored"]),
-        ("mentioned_by_others", profile["mentioned_by_others"]),
-        ("first_ts", profile["first_ts"].isoformat() if profile["first_ts"] else ""),
-        ("last_ts", profile["last_ts"].isoformat() if profile["last_ts"] else ""),
-        ("active_days", len(profile["by_day"])),
-        ("msg_len_mean", profile["msg_len_mean"] if profile["msg_len_mean"] is not None else ""),
-    ]
-    for k in SCORE_KEYS:
-        v = profile["score_means"].get(k)
-        rows.append((f"{k}_mean", v if v is not None else ""))
-    rows.append(("top_channels", _top_str(profile["channels"], 5)))
-    rows.append(("flags", _top_str(profile["flags"], 5)))
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["metric", "value"])
-        for k, v in rows:
-            w.writerow([k, v])
-
-
-def export_summary_json(summary: dict, path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(serialize_summary(summary), f, indent=2, default=str)
-
-
-def export_edges_csv(edges: Counter, path: str) -> None:
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["source", "target", "weight"])
-        for (a, b), n in edges.most_common():
-            w.writerow([a, b, n])
-
-
-def export_edges_dot(edges: Counter, path: str, top: int = 200) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("digraph chat {\n")
-        f.write('  rankdir=LR;\n  node [shape=box];\n')
-        for (a, b), n in edges.most_common(top):
-            pen = 1.0 + min(n, 10) / 2.0
-            f.write(f'  "{a}" -> "{b}" [label="{n}", penwidth={pen:.1f}];\n')
-        f.write("}\n")
-
-
-# ---------- HTML report (#15) ------------------------------------------------
-
-def generate_html_report(summary: dict, profiles: list[dict] | None = None,
-                         title: str = "Log Analysis Report") -> str:
-    def _esc(s):
-        return html_mod.escape(str(s))
-    body_parts: list[str] = []
-    body_parts.append(f"<h2>Summary</h2><table>")
-    body_parts.append(f"<tr><td>Total entries</td><td>{summary.get('total', 0)}</td></tr>")
-    if summary.get("first_ts"):
-        body_parts.append(f"<tr><td>Time range</td><td>{summary['first_ts']} &rarr; {summary['last_ts']}</td></tr>")
-    body_parts.append("</table>")
-    if summary.get("top_users"):
-        body_parts.append("<h2>Top Users</h2><table><tr><th>User</th><th>Count</th></tr>")
-        for name, n in summary["top_users"][:20]:
-            body_parts.append(f"<tr><td>{_esc(name)}</td><td>{n}</td></tr>")
-        body_parts.append("</table>")
-    if summary.get("top_events"):
-        body_parts.append("<h2>Top Events</h2><table><tr><th>Event</th><th>Count</th></tr>")
-        for name, n in summary["top_events"][:20]:
-            body_parts.append(f"<tr><td>{_esc(name)}</td><td>{n}</td></tr>")
-        body_parts.append("</table>")
-    if profiles:
-        body_parts.append("<h2>User Profiles</h2>")
-        for p in profiles:
-            body_parts.append(f"<h3>{_esc(p.get('user', '?'))}</h3><table>")
-            body_parts.append(f"<tr><td>Authored</td><td>{p.get('authored', 0)}</td></tr>")
-            body_parts.append(f"<tr><td>Mentioned by others</td><td>{p.get('mentioned_by_others', 0)}</td></tr>")
-            body_parts.append("</table>")
-    html = f"""<!DOCTYPE html><html lang="en">
-<head><meta charset="utf-8"><title>{_esc(title)}</title>
-<style>body{{font-family:sans-serif;margin:2em;background:#fafafa}}
-table{{border-collapse:collapse;margin:1em 0}}
-td,th{{border:1px solid #ccc;padding:4px 8px;text-align:left}}
-th{{background:#eee}} h2{{margin-top:2em}}</style></head>
-<body><h1>{_esc(title)}</h1>
-{"".join(body_parts)}
-</body></html>"""
-    return html
-
-def write_html_report(path: str, summary: dict, profiles: list[dict] | None = None) -> None:
-    html = generate_html_report(summary, profiles, os.path.basename(path))
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
-    print(f"Wrote HTML report to {path} ({len(html)} bytes)")
-
-# ---------- SQLite export/query (#18) -----------------------------------------
-
-def export_to_sqlite(entries: list[Entry], db_path: str) -> str:
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute("CREATE TABLE IF NOT EXISTS entries (ts TEXT, user TEXT, target TEXT, level TEXT, event TEXT, text TEXT, raw TEXT, fmt TEXT)")
-        conn.execute("DELETE FROM entries")
-        rows = []
-        for e in entries:
-            rows.append((
-                e.ts.isoformat() if e.ts else None,
-                e.user, e.target, e.level, e.event, e.text, e.raw, e.fmt,
-            ))
-        conn.executemany("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?)", rows)
-        conn.commit()
-        return f"Exported {len(rows)} rows to {db_path}"
-    finally:
-        conn.close()
-
-def query_sqlite(db_path: str, query: str) -> list[dict]:
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.row_factory = sqlite3.Row
-        cur = conn.execute(query)
-        return [dict(row) for row in cur.fetchall()]
-    finally:
-        conn.close()
-
-# ---------- Prometheus metrics (#17) ------------------------------------------
-
-def prometheus_metrics(entries: list[Entry]) -> str:
-    lines: list[str] = []
-    lines.append("# HELP analyzelog_entries_total Total log entries")
-    lines.append("# TYPE analyzelog_entries_total counter")
-    lines.append(f"analyzelog_entries_total {len(entries)}")
-    users: Counter = Counter()
-    levels: Counter = Counter()
-    targets: Counter = Counter()
-    for e in entries:
-        if e.user:
-            users[e.user] += 1
-        if e.level:
-            levels[e.level.upper()] += 1
-        if e.target:
-            targets[e.target] += 1
-    lines.append("# HELP analyzelog_user_lines Lines per user")
-    lines.append("# TYPE analyzelog_user_lines gauge")
-    for u, n in users.most_common(50):
-        lines.append(f'analyzelog_user_lines{{user="{u}"}} {n}')
-    lines.append("# HELP analyzelog_level_counts Entries per severity level")
-    lines.append("# TYPE analyzelog_level_counts gauge")
-    for lv, n in levels.items():
-        lines.append(f'analyzelog_level_counts{{level="{lv}"}} {n}')
-    lines.append("# HELP analyzelog_target_counts Entries per target")
-    lines.append("# TYPE analyzelog_target_counts gauge")
-    for t, n in targets.most_common(50):
-        lines.append(f'analyzelog_target_counts{{target="{t}"}} {n}')
-    return "\n".join(lines)
-
-# ---------- Multi-file aggregation (#27) --------------------------------------
-
-class MultiLogAggregator:
-    def __init__(self) -> None:
-        self.sources: dict[str, list[Entry]] = {}
-
-    def add_file(self, label: str, path: str) -> None:
-        entries = list(iter_entries(path))
-        self.sources[label] = entries
+# =========================
+# IRCClient - FULL + CTCP
+# =========================
+class IRCClient:
+    def __init__(self, server: str, port: int, nick: str, ui_queue: asyncio.Queue,
+                 scoring_engine: ScoringEngine, use_ssl: bool = True):
+        self.server = server
+        self.port = port
+        self.nick = nick
+        self.use_ssl = use_ssl
+        self.reader: Optional[asyncio.StreamReader] = None
+        self.writer: Optional[asyncio.StreamWriter] = None
+        self.ui_queue = ui_queue
+        self.current_channel: Optional[str] = None
+        self.scoring = scoring_engine
+        self.users: Dict[str, UserState] = {}
+        self.running = True
+        self._identified = False
+        self.joined_channels: set = {DEFAULT_CHANNEL} if DEFAULT_CHANNEL else set()
+        self._ctcp_times: Dict[str, deque] = {}  # rate-limit CTCP replies
+        self._cap_ls_caps: set = set()           # accumulated caps across multiline CAP LS
+        self._cap_ls_values: dict = {}           # cap name → advertised value (e.g. sts=...)
+        self._active_caps: set = set()           # currently ACKed/enabled caps
+        self._batch_buffer: dict = {}            # batch ref → [(cmd,nick,params,prefix,tags)]
+        self._batch_types: dict = {}             # batch ref → batch type string
+        self._batch_params: dict = {}            # batch ref → original BATCH+ params (for multiline target)
+        self._current_batch_is_replay: bool = False  # True while replaying chathistory batch
+        self._monitor_nicks: set = set()         # nicks on MONITOR list
+        self._chathistory_cap: str = ""          # "chathistory" or "draft/chathistory"
+        self._replay_enabled: bool = False       # must be set True before /replay works
+        self._label_seq: int = 0                 # monotonic label counter (labeled-response)
+        self._pending_labels: set = set()        # labels sent on outgoing msgs, awaiting echo
+        self._whox_seq: int = 1                  # rotating token for WHOX queries (1–999)
+        self._whox_tokens: dict = {}             # token → requested-fields string
+        self._cap_req_queue: list = []           # individual caps queued after a CAP NAK
+        self._sasl_state: dict = {}              # per-mechanism state across AUTHENTICATE exchanges
+        self._auth_buffer: str = ""              # accumulates chunked AUTHENTICATE data (>400 chars)
+        self._network_announced: bool = False    # one-shot announce of NETWORK token
+        # Send queue — all outbound data goes here; _run_writer flushes it with
+        # flood-control rate limiting so the server never disconnects us for flooding.
+        self._send_queue: asyncio.Queue = asyncio.Queue(maxsize=512)
+        # Monotonic timestamp of the last PONG received from the server.
+        # Updated by _irc_pong; checked by keepalive to detect dead connections.
+        self._last_pong: float = 0.0
+        # The nick the user actually wants.  When a 433 collision forces us to
+        # use nick_ we remember the original and periodically try to reclaim it.
+        self._desired_nick: str = nick
+        # Background task that retries _desired_nick after a 433 collision.
+        self._nick_reclaim_task: Optional[asyncio.Task] = None
+        # IRCv3 message tags from the current line being dispatched.
+        # Set in process_line before calling each handler; read by handlers
+        # that need tag data (e.g. server-time).
+        self._current_msg_tags: dict = {}
+        # Tokens from ISUPPORT (005 numeric): e.g. NETWORK, PREFIX, CHANTYPES.
+        self._isupport: dict = {}
+        # Accumulates RPL_LIST (322) results between /list and RPL_LISTEND (323).
+        self._list_results: list = []
+        self._irc_handlers: dict = {}
+        self._build_irc_handlers()
+        # Strong references to fire-and-forget scoring tasks so they are not
+        # garbage-collected before they finish (asyncio only holds weak refs).
+        self._bg_tasks: set = set()
 
     @property
-    def all_entries(self) -> list[Entry]:
-        result: list[Entry] = []
-        for entries in self.sources.values():
-            result.extend(entries)
-        return result
+    def server_id(self) -> str:
+        return f"{self.server}:{self.port}"
 
-    def summary_by_source(self) -> dict[str, dict]:
-        return {label: summarize(entries, 50) for label, entries in self.sources.items()}
-
-# ---------- diff between two log files --------------------------------------
-
-def diff_summaries(a: dict, b: dict, top: int = 25) -> dict:
-    a_users = dict(a["top_users"])
-    b_users = dict(b["top_users"])
-    all_users = set(a_users) | set(b_users)
-    user_deltas = sorted(
-        ((u, b_users.get(u, 0) - a_users.get(u, 0),
-          a_users.get(u, 0), b_users.get(u, 0)) for u in all_users),
-        key=lambda r: -abs(r[1])
-    )[:top]
-    return {
-        "totals": (a["total"], b["total"], b["total"] - a["total"]),
-        "first_ts": (a["first_ts"], b["first_ts"]),
-        "last_ts": (a["last_ts"], b["last_ts"]),
-        "user_deltas": user_deltas,
-    }
-
-
-def print_log_diff(path_a: str, path_b: str, diff: dict) -> None:
-    ta, tb, dt = diff["totals"]
-    print(f"\nDiff: {path_a}  →  {path_b}")
-    print(f"  totals: {ta} → {tb}  (Δ {dt:+d})")
-    fa, fb = diff["first_ts"]
-    la, lb = diff["last_ts"]
-    print(f"  range A: {fa} → {la}")
-    print(f"  range B: {fb} → {lb}")
-    print(f"  top user-count deltas (B - A):")
-    for u, d, av, bv in diff["user_deltas"]:
-        print(f"    {d:+6d}  {u:30s}  {av} → {bv}")
-
-
-# ---------- watch / tail ----------------------------------------------------
-
-def watch_loop(path: str, on_new, poll_seconds: float = 2.0) -> None:
-    """Tail-like watcher; calls on_new(list[Entry]) for newly appended lines."""
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        size = 0
-    while True:
+    async def connect(self) -> None:
+        proto = "SSL" if self.use_ssl else "plain"
+        await self.ui_queue.put(("status", f"Connecting to {self.server}:{self.port} ({proto})..."))
         try:
-            time.sleep(poll_seconds)
-            try:
-                cur = os.path.getsize(path)
-            except OSError:
-                continue
-            if cur < size:
-                size = 0
-            if cur == size:
-                continue
-            new_entries: list[Entry] = []
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                f.seek(size)
-                for line in f:
-                    e = parse_line(line)
-                    if e is not None:
-                        new_entries.append(e)
-            size = cur
-            if new_entries:
-                on_new(new_entries)
-        except KeyboardInterrupt:
-            print("\n(watch stopped)")
-            return
-
-
-def watch_callback_default(new: list[Entry]) -> None:
-    print(f"\n[watch] +{len(new)} new lines")
-    for e in new[-10:]:
-        ts = _fmt_dt(e.ts)
-        u = e.user or "—"
-        t = e.target or ""
-        print(f"  {ts}  {u:>15}  {t:>10}  {(e.text or e.raw)[:160]}")
-
-
-class WatchBg:
-    """Background tail thread: appends new entries to shell.state.entries and
-    bumps a counter the prompt can read."""
-
-    def __init__(self, shell: "LogShell", poll: float = 2.0) -> None:
-        self.shell = shell
-        self.poll = poll
-        self._stop = threading.Event()
-        self.new_count = 0
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-
-    def _run(self) -> None:
-        path = self.shell.state.log_path
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            size = 0
-        while not self._stop.wait(self.poll):
-            try:
-                cur = os.path.getsize(path)
-            except OSError:
-                continue
-            if cur < size:
-                size = 0
-            if cur == size:
-                continue
-            new_entries: list[Entry] = []
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(size)
-                    for line in f:
-                        e = parse_line(line)
-                        if e is not None:
-                            new_entries.append(e)
-            except OSError:
-                continue
-            size = cur
-            if new_entries:
-                self.shell.state.entries.extend(new_entries)
-                self.new_count += len(new_entries)
-
-
-# ---------- Plugin system (#23) -----------------------------------------------
-
-class AnalysisPlugin:
-    name: str = "base"
-    def analyze(self, entries: list[Entry]) -> str:
-        return ""
-    def commands(self) -> dict[str, str]:
-        return {}
-
-_plugins: list[AnalysisPlugin] = []
-
-def register_plugin(plugin: AnalysisPlugin) -> None:
-    _plugins.append(plugin)
-
-def load_plugins_from(path: str) -> None:
-    if not os.path.isdir(path):
-        return
-    import importlib.util
-    for fname in sorted(os.listdir(path)):
-        if not fname.endswith(".py") or fname.startswith("_"):
-            continue
-        fpath = os.path.join(path, fname)
-        try:
-            spec = importlib.util.spec_from_file_location(fname[:-3], fpath)
-            if spec and spec.loader:
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                for attr in dir(mod):
-                    obj = getattr(mod, attr)
-                    if isinstance(obj, type) and issubclass(obj, AnalysisPlugin) and obj is not AnalysisPlugin:
-                        register_plugin(obj())
-        except Exception as exc:
-            print(f"Plugin load error {fname}: {exc}", file=sys.stderr)
-
-# ---------- Web API / Web UI (#24) --------------------------------------------
-
-_web_entries: list[Entry] = []
-_web_queue: Queue = Queue()
-
-class WebAPIHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/metrics":
-            self._json_response(prometheus_metrics(_web_entries))
-        elif parsed.path == "/api/summary":
-            self._json_dict(summarize(_web_entries, 25))
-        elif parsed.path == "/api/entries":
-            n_str = urllib.parse.parse_qs(parsed.query).get("n", ["50"])[0]
-            try:
-                n = int(n_str)
-            except ValueError:
-                n = 50
-            recent = [{"ts": str(e.ts), "user": e.user, "target": e.target,
-                       "level": e.level, "event": e.event, "text": e.text[:200]}
-                      for e in _web_entries[-n:]]
-            self._json_list(recent)
-        elif parsed.path == "/api/users":
-            users = sorted({e.user for e in _web_entries if e.user})
-            self._json_list(users)
-        elif parsed.path == "/" or parsed.path == "/index.html":
-            self._html_response("<html><body><h1>Log Analyzer</h1>"
-                                f"<p>{len(_web_entries)} entries loaded.</p>"
-                                "<ul><li><a href='/api/summary'>/api/summary</a></li>"
-                                "<li><a href='/api/entries'>/api/entries</a></li>"
-                                "<li><a href='/api/users'>/api/users</a></li>"
-                                "<li><a href='/metrics'>/metrics</a></li></ul></body></html>")
-        else:
-            self.send_error(404)
-    def _json_response(self, data: str) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(data.encode())
-    def _json_dict(self, d: dict) -> None:
-        self._json_response(json.dumps(d, indent=2, default=str))
-    def _json_list(self, lst: list) -> None:
-        self._json_response(json.dumps(lst, indent=2, default=str))
-    def _html_response(self, html: str) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html")
-        self.end_headers()
-        self.wfile.write(html.encode())
-    def log_message(self, format, *args) -> None:  # type: ignore[override]
-        pass
-
-def start_web_server(port: int = 8088, daemon: bool = True) -> HTTPServer:
-    server = HTTPServer(("127.0.0.1", port), WebAPIHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=daemon)
-    t.start()
-    return server
-
-# ---------- Slack/Discord webhook (#25) ---------------------------------------
-
-def send_webhook(url: str, message: str, webhook_type: str = "slack") -> bool:
-    if webhook_type == "slack":
-        payload = json.dumps({"text": message}).encode()
-    elif webhook_type == "discord":
-        payload = json.dumps({"content": message}).encode()
-    else:
-        payload = json.dumps({"text": message}).encode()
-    try:
-        req = urllib.request.Request(url, data=payload,
-                                     headers={"Content-Type": "application/json"},
-                                     method="POST")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200 or resp.status == 204
-    except (urllib.error.URLError, OSError) as exc:
-        print(f"Webhook send failed: {exc}", file=sys.stderr)
-        return False
-
-# ---------- Cron mode (#26) ---------------------------------------------------
-
-def cron_mode(entries: list[Entry], alert_engine: AlertEngine | None = None,
-              webhook_url: str | None = None, output_path: str | None = None) -> int:
-    s = summarize(entries, 15)
-    output = io.StringIO()
-    with contextlib.redirect_stdout(output):
-        print(f"=== Cron run at {datetime.now().isoformat()} ===")
-        print_report(s)
-        if alert_engine:
-            triggered: list[str] = []
-            for e in entries:
-                triggered.extend(alert_engine.evaluate(e))
-            if triggered:
-                print(f"\n=== Alert triggers ({len(triggered)}) ===")
-                for msg in triggered:
-                    print(f"  ALERT: {msg}")
-    result = output.getvalue()
-    print(result)
-    if output_path:
-        with open(output_path, "a", encoding="utf-8") as f:
-            f.write(result)
-    if webhook_url and alert_engine:
-        triggered_msgs = []
-        for e in entries:
-            triggered_msgs.extend(alert_engine.evaluate(e))
-        if triggered_msgs:
-            send_webhook(webhook_url, "\n".join(triggered_msgs[:5]))
-    return 0
-
-# ---------- TUI --------------------------------------------------------------
-
-@dataclass
-class ShellState:
-    log_path: str
-    entries: list[Entry] = field(default_factory=list)
-    focused_user: str | None = None
-    focused_target: str | None = None
-    since: datetime | None = None
-    until: datetime | None = None
-    top_n: int = 15
-    llm_url: str = "http://127.0.0.1:8033/"
-    llm_model: str = "local"
-    max_chunk_chars: int = 12000
-    llm_cache: LLMCache | None = None
-    views: dict[str, View] = field(default_factory=dict)
-    # New (TUI features 1-20):
-    aliases: dict[str, str] = field(default_factory=dict)
-    ignore_set: set[str] = field(default_factory=set)
-    notes: dict[str, str] = field(default_factory=dict)
-    last_output: str = ""
-    last_listing: list[str] = field(default_factory=list)   # for `pick`
-    last_entries: list[Entry] = field(default_factory=list)  # for `inspect`
-    focus_back: list[tuple] = field(default_factory=list)
-    focus_forward: list[tuple] = field(default_factory=list)
-    pager_enabled: bool = True
-    color_enabled: bool = True
-    watch_bg: "WatchBg | None" = None
-    # NEW feature fields:
-    alert_engine: AlertEngine = field(default_factory=AlertEngine)
-    aggregator: MultiLogAggregator = field(default_factory=MultiLogAggregator)
-    web_server: "HTTPServer | None" = None
-    webhook_url: str = ""
-    webhook_type: str = "slack"
-    cron_output: str = ""
-    multi_log_sources: dict[str, list[Entry]] = field(default_factory=dict)
-    plugin_dir: str = ""
-    # Dashboard + 12 new features:
-    dashboard_running: bool = False
-    auto_tag_cache: dict[str, str] = field(default_factory=dict)
-    profile_dir: str = ""
-    template_filter: str = ""
-    saved_profiles: dict[str, str] = field(default_factory=dict)
-
-
-class LogShell(cmd.Cmd):
-    intro = (
-        "analyzelog interactive shell.  Type 'commands' for a full reference, "
-        "'help <name>' for one command, 'quit' to exit.\n"
-    )
-    prompt = "(log) "
-
-    NO_CAPTURE_CMDS = {"watch"}
-    _REDIRECT_RE = re.compile(r"^(.*?)\s+(>>|>)\s+(\S+)\s*$")
-
-    def __init__(self, state: ShellState) -> None:
-        super().__init__()
-        self.state = state
-        # Load persistent config
-        loaded_aliases = _load_json(_aliases_path(), {})
-        if isinstance(loaded_aliases, dict):
-            self.state.aliases.update({k: v for k, v in loaded_aliases.items() if isinstance(v, str)})
-        loaded_ignore = _load_json(_ignore_path(), [])
-        if isinstance(loaded_ignore, list):
-            self.state.ignore_set.update(str(u) for u in loaded_ignore if isinstance(u, str))
-        loaded_notes = _load_json(_notes_path(), {})
-        if isinstance(loaded_notes, dict):
-            self.state.notes.update({k: v for k, v in loaded_notes.items() if isinstance(v, str)})
-        self._in_script = False
-        self._setup_readline()
-        self._refresh_prompt()
-
-    # --- helpers -------------------------------------------------------------
-
-    def _setup_readline(self) -> None:
-        if readline is None:
-            return
-        try:
-            readline.read_history_file(_history_path())
-        except (FileNotFoundError, OSError):
-            pass
-        try:
-            readline.set_history_length(2000)
-        except Exception:  # noqa: BLE001
-            pass
-        atexit.register(self._save_history)
-
-    def _save_history(self) -> None:
-        if readline is None:
-            return
-        try:
-            readline.write_history_file(_history_path())
-        except OSError:
-            pass
-
-    def _refresh_prompt(self) -> None:
-        path = self.state.log_path
-        n_total = len(self.state.entries)
-        n_active = len(self._active_entries())
-        bits = []
-        if self.state.focused_user:
-            bits.append(f"user={self.state.focused_user}")
-        if self.state.focused_target:
-            bits.append(f"target={self.state.focused_target}")
-        if self.state.since:
-            bits.append(f"since={self.state.since.date()}")
-        if self.state.until:
-            bits.append(f"until={self.state.until.date()}")
-        tag = (" [" + " ".join(bits) + "]") if bits else ""
-        count_str = f"n={n_active}/{n_total}" if n_active != n_total else f"n={n_total}"
-        bg_str = ""
-        if self.state.watch_bg and self.state.watch_bg.new_count > 0:
-            bg_str = f" +{self.state.watch_bg.new_count}new"
-        self.prompt = f"(log {path} {count_str}{tag}{bg_str}) "
-
-    def _time_filtered(self) -> list[Entry]:
-        """Time-filtered entries, ignoring the global ignore_set.
-        Used when a user is named explicitly."""
-        return apply_time_filter(self.state.entries, self.state.since, self.state.until)
-
-    def _active_entries(self) -> list[Entry]:
-        """Time-filtered + ignore_set applied. Used for stats / global commands."""
-        base = self._time_filtered()
-        if not self.state.ignore_set:
-            return base
-        ig = {u.lower() for u in self.state.ignore_set}
-        return [e for e in base if not (e.user and e.user.lower() in ig)]
-
-    def _resolve_user(self, arg: str) -> str | None:
-        arg = arg.strip()
-        if arg:
-            return arg
-        if self.state.focused_user:
-            return self.state.focused_user
-        print("No user given and no focused user. Try: user <nick>")
-        return None
-
-    def _filtered(self, user: str) -> list[Entry]:
-        return [e for e in self._time_filtered() if line_matches_user(e, user)]
-
-    def _filtered_by_target(self, target: str) -> list[Entry]:
-        t = target.lower()
-        return [e for e in self._active_entries()
-                if e.target and e.target.lower() == t]
-
-    def _split(self, line: str) -> list[str]:
-        try:
-            return shlex.split(line)
-        except ValueError:
-            return line.split()
-
-    def _push_focus(self) -> None:
-        snap = (self.state.focused_user, self.state.focused_target,
-                self.state.since, self.state.until)
-        self.state.focus_back.append(snap)
-        self.state.focus_forward.clear()
-
-    @staticmethod
-    def _split_chained(line: str) -> list[str]:
-        """Split line on top-level ';' respecting quotes."""
-        parts: list[str] = []
-        buf: list[str] = []
-        in_q: str | None = None
-        for ch in line:
-            if in_q:
-                if ch == in_q:
-                    in_q = None
-                buf.append(ch)
-            elif ch in ('"', "'"):
-                in_q = ch
-                buf.append(ch)
-            elif ch == ";":
-                parts.append("".join(buf).strip())
-                buf = []
-            else:
-                buf.append(ch)
-        parts.append("".join(buf).strip())
-        return [p for p in parts if p]
-
-    def _should_page(self, output: str) -> bool:
-        if not output:
-            return False
-        if not getattr(sys.__stdout__, "isatty", lambda: False)():
-            return False
-        try:
-            rows = shutil.get_terminal_size().lines
-        except OSError:
-            return False
-        return output.count("\n") > max(rows - 2, 10)
-
-    # --- nick / target / view completion sources -----------------------------
-
-    def _nicks(self) -> list[str]:
-        return sorted({e.user for e in self.state.entries if e.user})
-
-    def _targets(self) -> list[str]:
-        return sorted({e.target for e in self.state.entries if e.target})
-
-    def _complete_prefix(self, text: str, options: Iterable[str]) -> list[str]:
-        tl = text.lower()
-        return [o for o in options if o.lower().startswith(tl)]
-
-    def _complete_path(self, text: str) -> list[str]:
-        head, tail = os.path.split(text)
-        base = head or "."
-        try:
-            items = os.listdir(base)
-        except OSError:
-            return []
-        out = []
-        for it in items:
-            if not it.startswith(tail):
-                continue
-            full = os.path.join(head, it) if head else it
-            if os.path.isdir(os.path.join(base, it)):
-                full += os.sep
-            out.append(full)
-        return out
-
-    # --- input pipeline (alias / chaining / redirect / capture / pager) -----
-
-    def onecmd(self, line: str) -> bool:  # type: ignore[override]
-        if not isinstance(line, str):
-            return super().onecmd(line)
-        line = line.strip()
-        if not line:
-            return super().onecmd(line)
-
-        # ?? → commands
-        if line == "??":
-            line = "commands"
-
-        # Alias expansion (first whitespace-separated token only)
-        head, sep, rest = line.partition(" ")
-        if head in self.state.aliases:
-            line = self.state.aliases[head] + (sep + rest if sep else "")
-
-        # ; chaining: dispatch each sub-command via onecmd recursively
-        if ";" in line:
-            parts = self._split_chained(line)
-            if len(parts) > 1:
-                stop = False
-                for sub in parts:
-                    stop = bool(self.onecmd(sub))
-                    if stop:
-                        break
-                return stop
-
-        # Trailing redirect
-        redirect: tuple[str, str] | None = None
-        m = self._REDIRECT_RE.match(line)
-        if m:
-            line = m.group(1)
-            op, path = m.group(2), m.group(3)
-            redirect = (path, "a" if op == ">>" else "w")
-
-        # Real-time commands bypass capture (so foreground watch streams)
-        head_token = line.split()[0] if line.split() else ""
-        if head_token in self.NO_CAPTURE_CMDS:
-            return super().onecmd(line)
-
-        # Capture stdout for last/pager/redirect
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            try:
-                result = super().onecmd(line)
-            except Exception as exc:  # noqa: BLE001
-                print(f"Error: {exc}")
-                result = False
-        output = buf.getvalue()
-        self.state.last_output = output
-
-        if redirect:
-            path, mode = redirect
-            try:
-                with open(path, mode, encoding="utf-8") as f:
-                    f.write(output)
-                sys.stdout.write(f"Wrote {len(output)} chars to {path}\n")
-            except OSError as exc:
-                sys.stdout.write(f"Could not write {path}: {exc}\n")
-        elif self.state.pager_enabled and not self._in_script and self._should_page(output):
-            try:
-                pydoc.pager(output)
-            except Exception:  # noqa: BLE001
-                sys.stdout.write(output)
-        else:
-            sys.stdout.write(output)
-        return result
-
-    def postcmd(self, stop, line):  # type: ignore[override]
-        self._refresh_prompt()
-        return stop
-
-    # --- commands ------------------------------------------------------------
-
-    def do_load(self, arg: str) -> None:
-        """load <path>   Load a different log file."""
-        path = arg.strip().strip('"').strip("'")
-        if not path:
-            print(f"Currently loaded: {self.state.log_path} ({len(self.state.entries)} entries)")
-            return
-        try:
-            entries = list(iter_entries(path))
-        except FileNotFoundError:
-            print(f"File not found: {path}")
-            return
-        self.state.log_path = path
-        self.state.entries = entries
-        print(f"Loaded {len(entries)} entries from {path}")
-        self._refresh_prompt()
-
-    def do_reload(self, arg: str) -> None:
-        """reload   Re-read the current log file from disk."""
-        try:
-            self.state.entries = list(iter_entries(self.state.log_path))
-            print(f"Reloaded {len(self.state.entries)} entries from {self.state.log_path}")
-            self._refresh_prompt()
-        except FileNotFoundError:
-            print(f"File not found: {self.state.log_path}")
-
-    def do_report(self, arg: str) -> None:
-        """report [user]   Full stats report. With a user, restrict to lines for/about them."""
-        user = arg.strip() or self.state.focused_user
-        if user:
-            entries = self._filtered(user)
-            print(f"=== {self.state.log_path}  filtered to user '{user}' ===")
-        elif self.state.focused_target:
-            entries = self._filtered_by_target(self.state.focused_target)
-            print(f"=== {self.state.log_path}  filtered to target '{self.state.focused_target}' ===")
-        else:
-            entries = self._active_entries()
-            print(f"=== {self.state.log_path} ===")
-        print_report(summarize(entries, self.state.top_n))
-
-    def do_user(self, arg: str) -> None:
-        """user <nick>   Focus on a user (empty arg clears)."""
-        nick = arg.strip()
-        self._push_focus()
-        if not nick:
-            self.state.focused_user = None
-            print("Cleared focused user.")
-        else:
-            self.state.focused_user = nick
-            matched = self._filtered(nick)
-            print(f"Focused on '{nick}' — {len(matched)} matching lines.")
-        self._refresh_prompt()
-
-    def do_target(self, arg: str) -> None:
-        """target <chan>   Focus on a target/channel (empty arg clears)."""
-        t = arg.strip()
-        self._push_focus()
-        if not t:
-            self.state.focused_target = None
-            print("Cleared focused target.")
-        else:
-            self.state.focused_target = t
-            matched = self._filtered_by_target(t)
-            print(f"Focused on target '{t}' — {len(matched)} matching lines.")
-        self._refresh_prompt()
-
-    def do_since(self, arg: str) -> None:
-        """since <when>   Lower time bound (ISO date, '5h ago', 'now'; empty clears)."""
-        s = arg.strip()
-        self._push_focus()
-        if not s:
-            self.state.since = None
-            print("Cleared 'since'.")
-        else:
-            ts = parse_iso_arg(s)
-            if not ts:
-                self.state.focus_back.pop()
-                print(f"Could not parse: {s!r}")
-                return
-            self.state.since = ts
-            print(f"since = {ts}")
-        self._refresh_prompt()
-
-    def do_until(self, arg: str) -> None:
-        """until <when>   Upper time bound (ISO date, '5h ago', 'now'; empty clears)."""
-        s = arg.strip()
-        self._push_focus()
-        if not s:
-            self.state.until = None
-            print("Cleared 'until'.")
-        else:
-            ts = parse_iso_arg(s)
-            if not ts:
-                self.state.focus_back.pop()
-                print(f"Could not parse: {s!r}")
-                return
-            self.state.until = ts
-            print(f"until = {ts}")
-        self._refresh_prompt()
-
-    def do_clear_filters(self, arg: str) -> None:
-        """clear_filters   Clear focused user/target and since/until."""
-        self._push_focus()
-        self.state.focused_user = None
-        self.state.focused_target = None
-        self.state.since = None
-        self.state.until = None
-        print("Cleared all global filters.")
-        self._refresh_prompt()
-
-    def do_back(self, arg: str) -> None:
-        """back   Restore previous focus state."""
-        if not self.state.focus_back:
-            print("(no previous focus)")
-            return
-        cur = (self.state.focused_user, self.state.focused_target,
-               self.state.since, self.state.until)
-        self.state.focus_forward.append(cur)
-        prev = self.state.focus_back.pop()
-        (self.state.focused_user, self.state.focused_target,
-         self.state.since, self.state.until) = prev
-        print("Restored previous focus.")
-        self._refresh_prompt()
-
-    def do_forward(self, arg: str) -> None:
-        """forward   Re-apply focus undone by 'back'."""
-        if not self.state.focus_forward:
-            print("(no forward focus)")
-            return
-        cur = (self.state.focused_user, self.state.focused_target,
-               self.state.since, self.state.until)
-        self.state.focus_back.append(cur)
-        nxt = self.state.focus_forward.pop()
-        (self.state.focused_user, self.state.focused_target,
-         self.state.since, self.state.until) = nxt
-        print("Reapplied focus.")
-        self._refresh_prompt()
-
-    def do_analyze(self, arg: str) -> None:
-        """analyze [nick]   LLM behavior analysis on a user's lines."""
-        user = self._resolve_user(arg)
-        if not user:
-            return
-        matched = self._filtered(user)
-        if not matched:
-            print(f"No lines match '{user}'.")
-            return
-        analyze_user_with_llm(
-            user, [e.text for e in matched],
-            self.state.llm_url, self.state.llm_model,
-            self.state.max_chunk_chars, cache=self.state.llm_cache,
-        )
-
-    def do_ask(self, arg: str) -> None:
-        """ask [nick] "<question>"   Free-form LLM question about a user's lines."""
-        parts = self._split(arg)
-        if not parts:
-            print('Usage: ask [nick] "<question>"')
-            return
-        if len(parts) >= 2 and any(
-            e.user and e.user.lower() == parts[0].lower()
-            for e in self._active_entries()
-        ):
-            nick = parts[0]
-            question = " ".join(parts[1:])
-        else:
-            nick = self.state.focused_user
-            question = " ".join(parts)
-        if not nick:
-            print('Usage: ask <nick> "<question>"  (or set "user <nick>" first)')
-            return
-        matched = self._filtered(nick)
-        if not matched:
-            print(f"No lines match '{nick}'.")
-            return
-        ask_about_user_with_llm(
-            nick, question, [e.text for e in matched],
-            self.state.llm_url, self.state.llm_model,
-            self.state.max_chunk_chars, cache=self.state.llm_cache,
-        )
-
-    def do_show(self, arg: str) -> None:
-        """show [nick] [N]   Print up to N raw lines for the user (default 10)."""
-        parts = self._split(arg)
-        nick = None
-        n = 10
-        for p in parts:
-            if p.isdigit():
-                n = int(p)
-            else:
-                nick = p
-        user = self._resolve_user(nick or "")
-        if not user:
-            return
-        matched = self._filtered(user)
-        if not matched:
-            print(f"No lines match '{user}'.")
-            return
-        self.state.last_entries = matched[:n]
-        print(f"First {min(n, len(matched))}/{len(matched)} lines for '{user}':")
-        for e in matched[:n]:
-            print(f"  {e.raw[:300]}")
-
-    def do_interact(self, arg: str) -> None:
-        """interact <userA> <userB> [--no-llm] [--show N]"""
-        parts = self._split(arg)
-        if len(parts) < 2:
-            print("Usage: interact <userA> <userB> [--no-llm] [--show N]")
-            return
-        a, b = parts[0], parts[1]
-        no_llm = False
-        show_n = 0
-        i = 2
-        while i < len(parts):
-            tok = parts[i]
-            if tok == "--no-llm":
-                no_llm = True
-            elif tok == "--show" and i + 1 < len(parts) and parts[i + 1].isdigit():
-                show_n = int(parts[i + 1])
-                i += 1
-            else:
-                print(f"Unknown option: {tok}")
-                return
-            i += 1
-
-        matched = [e for e in self._active_entries() if line_is_interaction(e, a, b)]
-        if not matched:
-            print(f"No direct interactions found between '{a}' and '{b}'.")
-            return
-
-        print(f"=== {self.state.log_path}  interactions: {a} ↔ {b} ({len(matched)} lines) ===")
-        by_author = Counter(e.user for e in matched if e.user)
-        print("Lines per author:")
-        for nick, n in by_author.most_common():
-            print(f"  {n:>7}  {nick}")
-        by_target = Counter(e.target for e in matched if e.target)
-        if by_target:
-            print("Where they interact:")
-            for tgt, n in by_target.most_common(10):
-                print(f"  {n:>7}  {tgt}")
-        ts_list = [e.ts for e in matched if e.ts]
-        if ts_list:
-            print(f"Time range: {min(ts_list)}  →  {max(ts_list)}")
-
-        if show_n:
-            print(f"\nFirst {min(show_n, len(matched))} interaction lines:")
-            for e in matched[:show_n]:
-                print(f"  {e.text[:300]}")
-
-        if not no_llm:
-            analyze_interaction_with_llm(
-                a, b, [e.text for e in matched],
-                self.state.llm_url, self.state.llm_model,
-                self.state.max_chunk_chars, cache=self.state.llm_cache,
+            # 30-second connect timeout prevents hangs on unreachable hosts.
+            # limit=2^20 (1 MiB) sets the StreamReader internal buffer; the default
+            # 64 KB can stall on fast servers that send large NAMES / MOTD bursts.
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    self.server, self.port,
+                    ssl=_SSL_CTX if self.use_ssl else None,
+                    limit=2 ** 20),
+                timeout=30.0,
             )
-
-    def do_compare(self, arg: str) -> None:
-        """compare <userA> <userB> [<userC> ...] [--no-llm]
-        Multi-user behavior comparison: side-by-side table + LLM."""
-        parts = self._split(arg)
-        users = [p for p in parts if not p.startswith("--")]
-        flags = [p for p in parts if p.startswith("--")]
-        if len(users) < 2:
-            print("Usage: compare <userA> <userB> [<userC> ...] [--no-llm]")
-            return
-        no_llm = "--no-llm" in flags
-
-        active = self._active_entries()
-        profiles = [build_profile(active, u) for u in users]
-
-        print(f"=== {self.state.log_path}  compare: {' vs '.join(users)} ===")
-        if not any(p["authored"] for p in profiles):
-            print(f"None of {users} authored lines in this log.")
-            return
-        for p in profiles:
-            if p["authored"] == 0:
-                print(f"Note: '{p['user']}' has no authored lines; only mentions count.")
-
-        print_compare_table_n(profiles)
-
-        if not no_llm:
-            compare_n_users_with_llm(profiles, self.state.llm_url,
-                                     self.state.llm_model,
-                                     self.state.max_chunk_chars,
-                                     cache=self.state.llm_cache)
-
-    def do_top(self, arg: str) -> None:
-        """top [users|events|targets|levels] [N]"""
-        parts = self._split(arg) or ["users"]
-        kind = parts[0].lower()
-        n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else self.state.top_n
-        s = summarize(self._active_entries(), n)
-        key = {"users": "top_users", "events": "top_events",
-               "targets": "top_targets", "channels": "top_targets",
-               "levels": None}.get(kind)
-        if kind == "levels":
-            print(s["levels"] or "(none)")
-            return
-        if not key or not s.get(key):
-            print(f"Unknown or empty: {kind}. Try: users | events | targets | levels")
-            return
-        rows = s[key]
-        self.state.last_listing = [name for name, _ in rows]
-        for name, count in rows:
-            note = self.state.notes.get(name, "") if kind == "users" else ""
-            note_str = f"  // {note}" if note else ""
-            print(f"  {count:>7}  {name}{note_str}")
-
-    def do_hours(self, arg: str) -> None:
-        """hours [compact]   Activity histogram by hour-of-day. Auto-compact when narrow."""
-        s = summarize(self._active_entries(), self.state.top_n)
-        if not s["by_hour"]:
-            print("(no timestamps)")
-            return
-        try:
-            width = shutil.get_terminal_size().columns
-        except OSError:
-            width = 80
-        compact = arg.strip() == "compact" or width < 60
-        if compact:
-            all_hours = [s["by_hour"].get(h, 0) for h in range(24)]
-            print(f"  {sparkline(all_hours)}  (00..23)  total={sum(all_hours)}")
-            return
-        peak = max(s["by_hour"].values()) or 1
-        for h, n in s["by_hour"].items():
-            bar = "█" * int(40 * n / peak)
-            print(f"  {h:02d}  {n:>7}  {bar}")
-
-    def do_days(self, arg: str) -> None:
-        """days [compact]   Activity histogram by date. Auto-compact when narrow."""
-        s = summarize(self._active_entries(), self.state.top_n)
-        if not s["by_day"]:
-            print("(no timestamps)")
-            return
-        try:
-            width = shutil.get_terminal_size().columns
-        except OSError:
-            width = 80
-        compact = arg.strip() == "compact" or width < 60
-        if compact:
-            days = sorted(s["by_day"].items())
-            counts = [n for _, n in days]
-            print(f"  {sparkline(counts)}  ({days[0][0]}..{days[-1][0]})  total={sum(counts)}")
-            return
-        peak = max(s["by_day"].values()) or 1
-        for d, n in s["by_day"].items():
-            bar = "█" * int(40 * n / peak)
-            print(f"  {d}  {n:>7}  {bar}")
-
-    def do_errors(self, arg: str) -> None:
-        """errors   Error-like entries."""
-        active = self._active_entries()
-        s = summarize(active, self.state.top_n)
-        if not s["errors"]:
-            print("(none)")
-            return
-        # Re-derive Entry objects to populate last_entries (summarize loses them).
-        err_entries: list[Entry] = []
-        seen_raw = set(s["errors"])
-        for e in active:
-            if e.raw in seen_raw:
-                err_entries.append(e)
-                if len(err_entries) >= len(s["errors"]):
-                    break
-        self.state.last_entries = err_entries
-        for line in s["errors"]:
-            print(f"  {line[:300]}")
-
-    def do_grep(self, arg: str) -> None:
-        """grep [--user U] [--target T] [--since W] [--until W] [--score 'EXPR'] <regex>"""
-        parts = self._split(arg)
-        user = self.state.focused_user
-        target = self.state.focused_target
-        since = self.state.since
-        until = self.state.until
-        score_filters: list[tuple[str, str, float]] = []
-        positional: list[str] = []
-        i = 0
-        while i < len(parts):
-            tok = parts[i]
-            if tok == "--user" and i + 1 < len(parts):
-                user = parts[i + 1]; i += 2; continue
-            if tok == "--target" and i + 1 < len(parts):
-                target = parts[i + 1]; i += 2; continue
-            if tok == "--since" and i + 1 < len(parts):
-                since = parse_iso_arg(parts[i + 1]); i += 2; continue
-            if tok == "--until" and i + 1 < len(parts):
-                until = parse_iso_arg(parts[i + 1]); i += 2; continue
-            if tok == "--score" and i + 1 < len(parts):
-                try:
-                    score_filters = parse_score_filter(parts[i + 1])
-                except ValueError as exc:
-                    print(f"Bad score filter: {exc}"); return
-                i += 2; continue
-            positional.append(tok); i += 1
-        if not positional:
-            print("Usage: grep [--user U] [--target T] [--since W] [--until W] [--score 'EXPR'] <regex>")
-            return
-        pattern = " ".join(positional)
-        try:
-            rx = re.compile(pattern, re.I)
-        except re.error as exc:
-            print(f"Bad regex: {exc}")
-            return
-        u_l = user.lower() if user else None
-        t_l = target.lower() if target else None
-        matched: list[Entry] = []
-        for e in self.state.entries:
-            if not in_time_range(e.ts, since, until):
-                continue
-            if u_l and not (e.user and e.user.lower() == u_l) and u_l not in (e.raw or "").lower():
-                continue
-            if t_l and not (e.target and e.target.lower() == t_l):
-                continue
-            if score_filters and not matches_score_filter(e, score_filters):
-                continue
-            if rx.search(e.raw):
-                matched.append(e)
-                print(f"  {e.raw[:300]}")
-                if len(matched) >= 50:
-                    print("(truncated at 50 matches — refine your pattern)")
-                    break
-        self.state.last_entries = matched
-        if not matched:
-            print("(no matches)")
-
-    # --- new analytic commands ----------------------------------------------
-
-    def do_flagged(self, arg: str) -> None:
-        """flagged "EXPR" [user]   Lines where score expr matches.
-        e.g. flagged "llama>0.8"     flagged "llama>=0.7 heu>0.5" cfuser"""
-        parts = self._split(arg)
-        if not parts:
-            print('Usage: flagged "EXPR" [user]   e.g. flagged "llama>0.8"')
-            return
-        expr = parts[0]
-        user = parts[1] if len(parts) > 1 else self.state.focused_user
-        try:
-            filters = parse_score_filter(expr)
-        except ValueError as exc:
-            print(f"Bad score expression: {exc}")
-            return
-        u_l = user.lower() if user else None
-        cap = 100
-        matched: list[Entry] = []
-        for e in self._active_entries():
-            if u_l and not (e.user and e.user.lower() == u_l):
-                continue
-            if not matches_score_filter(e, filters):
-                continue
-            matched.append(e)
-            print(f"  {e.raw[:300]}")
-            if len(matched) >= cap:
-                print(f"(truncated at {cap} matches — refine your filter)")
+        except asyncio.TimeoutError:
+            raise ConnectionError(
+                f"Connection to {self.server}:{self.port} timed out after 30 s")
+        except Exception as e:
+            await self.ui_queue.put(("status", f"Connection failed: {e}"))
+            raise
+        # TCP_NODELAY: disable Nagle's algorithm so IRC commands are sent immediately
+        # rather than waiting to coalesce with future data (Nagle adds ~40-200 ms).
+        # SO_KEEPALIVE + TCP_KEEPIDLE/INTVL/CNT: OS-level dead-connection detection
+        # as a second line of defence behind our PING/PONG keepalive.
+        raw_sock = self.writer.get_extra_info("socket")
+        if raw_sock is not None:
+            try:
+                raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                if hasattr(socket, "TCP_KEEPIDLE"):
+                    raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                if hasattr(socket, "TCP_KEEPINTVL"):
+                    raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                if hasattr(socket, "TCP_KEEPCNT"):
+                    raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            except Exception:
+                pass  # socket options are best-effort
+        conn_label = "SSL connection" if self.use_ssl else "Connection"
+        await self.ui_queue.put(("status", f"{conn_label} established to {self.server}:{self.port}"))
+        # Flush any stale messages queued from a previous (failed) connection
+        # so they are not replayed on the new session.
+        while not self._send_queue.empty():
+            try:
+                self._send_queue.get_nowait()
+            except asyncio.QueueEmpty:
                 break
-        self.state.last_entries = matched
-        if not matched:
-            print("(no matches)")
-        else:
-            print(f"({len(matched)} match{'es' if len(matched) != 1 else ''})")
+        self._last_pong = time.monotonic()
+        # CAP LS must come before NICK/USER so the server holds registration
+        # open until we send CAP END (or complete SASL).
+        self.send_raw("CAP LS 302")
+        self.send_raw(f"NICK {self.nick}")
+        self.send_raw(f"USER {self.nick} 0 * :{self.nick}")
+        await self.ui_queue.put(("status", "Sent NICK and USER commands"))
 
-    def do_dist(self, arg: str) -> None:
-        """dist [user]   Score distributions / percentiles. No user → population."""
-        user = arg.strip() or self.state.focused_user
-        active = self._active_entries()
-        if user:
-            scores = collect_scores(active, user)
-            label = user
-        else:
-            scores = collect_scores(active)
-            label = "(population)"
-        print_score_dist(label, scores)
+    def send_raw(self, line: str) -> None:
+        """Enqueue a raw IRC line for delivery by the rate-limited writer task.
 
-    def do_zscores(self, arg: str) -> None:
-        """zscores [user]   Per-score z-scores for user vs population."""
-        user = self._resolve_user(arg)
-        if not user:
+        Synchronous so it can be called from anywhere.  Drops lines when the queue
+        is full (512 items = a multi-second burst) to avoid unbounded memory growth
+        under pathological conditions.
+        """
+        # Strip CRLF and null bytes to prevent IRC command injection
+        line = line.replace("\r", "").replace("\n", "").replace("\x00", "")
+        if not line:
             return
-        active = self._active_entries()
-        profile = build_profile(active, user)
-        pop = population_score_stats(active)
-        print_zscores(profile, pop)
-
-    def do_similar(self, arg: str) -> None:
-        """similar [threshold] [min_lines]   Find user pairs with similar fingerprints."""
-        parts = self._split(arg)
-        threshold = 0.95
-        min_lines = 5
-        if len(parts) >= 1:
-            try:
-                threshold = float(parts[0])
-            except ValueError:
-                print("threshold must be a float between 0 and 1"); return
-        if len(parts) >= 2:
-            try:
-                min_lines = int(parts[1])
-            except ValueError:
-                print("min_lines must be int"); return
-        pairs = find_similar_users(self._active_entries(),
-                                   min_lines=min_lines, threshold=threshold)
-        # Record both members of each pair for `pick`
-        seen: list[str] = []
-        for a, b, *_ in pairs:
-            if a not in seen:
-                seen.append(a)
-            if b not in seen:
-                seen.append(b)
-        self.state.last_listing = seen
-        print_similar_users(pairs)
-
-    def do_bursts(self, arg: str) -> None:
-        """bursts [user] [window_seconds] [z_threshold]   Detect activity bursts."""
-        parts = self._split(arg)
-        nick = None
-        window = 60
-        z = 3.0
-        floats: list[float] = []
-        for p in parts:
-            try:
-                v = float(p)
-                floats.append(v)
-            except ValueError:
-                if nick is None:
-                    nick = p
-        if len(floats) >= 1:
-            window = int(floats[0])
-        if len(floats) >= 2:
-            z = floats[1]
-        user = self._resolve_user(nick or "")
-        if not user:
-            return
-        bursts = detect_bursts(self._active_entries(), user,
-                               window_seconds=window, z_threshold=z)
-        print_bursts(user, bursts, window)
-
-    def do_threads(self, arg: str) -> None:
-        """threads [user]   Reply/mention reconstruction around a user."""
-        user = self._resolve_user(arg)
-        if not user:
-            return
-        thread = build_thread_for_user(self._active_entries(), user)
-        if not thread:
-            print(f"No thread lines for {user}.")
-            return
-        self.state.last_entries = [e for e, _ in thread[:200]]
-        print(f"\nThread reconstruction for {user} ({len(thread)} lines):")
-        for e, tgt in thread[:200]:
-            arrow = f" -> {tgt}" if tgt else ""
-            ts = _fmt_dt(e.ts)
-            print(f"  {ts}  {(e.user or '?'):>15}{arrow:<20}  {(e.text or e.raw)[:160]}")
-        if len(thread) > 200:
-            print(f"(showing first 200 of {len(thread)})")
-
-    def do_edges(self, arg: str) -> None:
-        """edges [N]   Top N reply/mention edges."""
-        parts = self._split(arg)
-        n = int(parts[0]) if parts and parts[0].isdigit() else 25
-        edges = build_edge_graph(self._active_entries())
-        if not edges:
-            print("(no edges detected)")
-            return
-        print(f"\nTop {min(n, len(edges))} edges (source -> target, weight):")
-        for (a, b), w in edges.most_common(n):
-            print(f"  {w:>5}  {a} -> {b}")
-
-    def do_view(self, arg: str) -> None:
-        """view {save NAME | load NAME | list | drop NAME | show NAME}
-        Save the current global filters as a named view."""
-        parts = self._split(arg)
-        if not parts:
-            self.do_view("list")
-            return
-        cmd_ = parts[0].lower()
-        if cmd_ == "list":
-            if not self.state.views:
-                print("(no saved views)")
-                return
-            for name, v in self.state.views.items():
-                print(f"  {name}: {view_describe(v)}")
-            return
-        if cmd_ == "save":
-            if len(parts) < 2:
-                print("Usage: view save NAME"); return
-            name = parts[1]
-            self.state.views[name] = View(
-                name=name,
-                user=self.state.focused_user,
-                target=self.state.focused_target,
-                since=self.state.since,
-                until=self.state.until,
-            )
-            print(f"Saved view '{name}': {view_describe(self.state.views[name])}")
-            return
-        if cmd_ == "load":
-            if len(parts) < 2 or parts[1] not in self.state.views:
-                print("Usage: view load NAME (existing: " + ", ".join(self.state.views) + ")")
-                return
-            v = self.state.views[parts[1]]
-            self.state.focused_user = v.user
-            self.state.focused_target = v.target
-            self.state.since = v.since
-            self.state.until = v.until
-            print(f"Loaded view '{v.name}': {view_describe(v)}")
-            self._refresh_prompt()
-            return
-        if cmd_ == "drop":
-            if len(parts) < 2:
-                print("Usage: view drop NAME"); return
-            self.state.views.pop(parts[1], None)
-            print(f"Dropped view '{parts[1]}'.")
-            return
-        if cmd_ == "show":
-            if len(parts) < 2 or parts[1] not in self.state.views:
-                print("Usage: view show NAME"); return
-            v = self.state.views[parts[1]]
-            print(f"  {v.name}: {view_describe(v)}")
-            return
-        print(f"Unknown view subcommand: {cmd_}")
-
-    def do_export(self, arg: str) -> None:
-        """export {profile <user> <path.json|csv> | report <path.json> | edges <path.csv|dot>}"""
-        parts = self._split(arg)
-        if len(parts) < 2:
-            print("Usage: export profile <user> <path>  |  export report <path>  |  export edges <path>")
-            return
-        kind = parts[0].lower()
-        if kind == "profile":
-            if len(parts) < 3:
-                print("Usage: export profile <user> <path>"); return
-            user, path = parts[1], parts[2]
-            profile = build_profile(self._active_entries(), user)
-            ext = os.path.splitext(path)[1].lower()
-            if ext == ".csv":
-                export_profile_csv(profile, path)
-            else:
-                export_profile_json(profile, path)
-            print(f"Wrote {path}")
-            return
-        if kind == "report":
-            path = parts[1]
-            export_summary_json(summarize(self._active_entries(), self.state.top_n), path)
-            print(f"Wrote {path}")
-            return
-        if kind == "edges":
-            path = parts[1]
-            edges = build_edge_graph(self._active_entries())
-            ext = os.path.splitext(path)[1].lower()
-            if ext == ".dot":
-                export_edges_dot(edges, path)
-            else:
-                export_edges_csv(edges, path)
-            print(f"Wrote {path} ({len(edges)} edges)")
-            return
-        print(f"Unknown export kind: {kind}")
-
-    def do_diff(self, arg: str) -> None:
-        """diff <other.log>   Diff current log against another."""
-        path = arg.strip()
-        if not path:
-            print("Usage: diff <other.log>"); return
+        # IRC protocol maximum is 512 bytes including CRLF (RFC 1459 §2.3).
+        # Encode first so multi-byte UTF-8 chars are truncated on a byte boundary.
+        encoded = line.encode("utf-8", "replace")[:510]
         try:
-            other = list(iter_entries(path))
-        except FileNotFoundError:
-            print(f"File not found: {path}"); return
-        a = summarize(self._active_entries(), 1000)
-        b = summarize(other, 1000)
-        print_log_diff(self.state.log_path, path, diff_summaries(a, b))
+            self._send_queue.put_nowait(encoded + b"\r\n")
+        except asyncio.QueueFull:
+            pass  # drop; flood-protection is better than memory exhaustion
 
-    def do_watch(self, arg: str) -> None:
-        """watch [poll_seconds] [--bg | --stop]
-        Tail the current log file. --bg runs in a background thread (prompt
-        shows '+N new'); --stop terminates a running background watch."""
-        parts = self._split(arg)
-        if "--stop" in parts:
-            if self.state.watch_bg:
-                self.state.watch_bg.stop()
-                self.state.watch_bg = None
-                print("Stopped background watch.")
-            else:
-                print("(no background watch running)")
-            return
-        bg = "--bg" in parts
-        nums = [p for p in parts if p not in ("--bg", "--stop")]
-        poll = 2.0
-        if nums:
+    async def _run_writer(self) -> None:
+        """Consume the send queue, forwarding data to the server with flood control.
+
+        Token-bucket: steady rate of 4 lines/second, burst capacity of 10.
+        IRC servers typically kick clients that exceed ~10 lines/second; this
+        keeps us well under that limit even on /join floods or mass-kicks.
+
+        Batching: after the first token is consumed we drain all immediately
+        available messages (up to remaining token budget) and send them in a
+        single writelines() + drain() call.  This reduces kernel round-trips
+        dramatically during connect bursts (NAMES, MOTD, JOIN floods, etc.).
+
+        The wait_for timeout is intentionally absent: the task is cancelled by
+        run_connection's finally block, so CancelledError is the exit path.
+        """
+        RATE  = 4.0   # tokens replenished per second
+        BURST = 10.0  # maximum token bucket size
+        tokens = BURST
+        last_refill = time.monotonic()
+
+        while self.running:
             try:
-                poll = float(nums[0])
-            except ValueError:
-                print("poll_seconds must be a number"); return
-        if bg:
-            if self.state.watch_bg:
-                print("(background watch already running; use 'watch --stop')")
-                return
-            self.state.watch_bg = WatchBg(self, poll=poll)
-            self.state.watch_bg.start()
-            print(f"Watching {self.state.log_path} in background (poll={poll}s). 'watch --stop' to halt.")
-            return
+                data = await self._send_queue.get()
+            except asyncio.CancelledError:
+                break
 
-        def on_new(new: list[Entry]) -> None:
-            self.state.entries.extend(new)
-            watch_callback_default(new)
-            self._refresh_prompt()
+            # Refill the bucket for time elapsed since last send
+            now = time.monotonic()
+            tokens = min(BURST, tokens + (now - last_refill) * RATE)
+            last_refill = now
 
-        print(f"Watching {self.state.log_path} (poll={poll}s). Ctrl-C to stop.")
-        watch_loop(self.state.log_path, on_new, poll_seconds=poll)
+            # If the bucket is empty, sleep until we have a token
+            if tokens < 1.0:
+                wait = (1.0 - tokens) / RATE
+                try:
+                    await asyncio.sleep(wait)
+                except asyncio.CancelledError:
+                    break
+                now = time.monotonic()
+                tokens = min(BURST, tokens + (now - last_refill) * RATE)
+                last_refill = now
 
-    def do_set(self, arg: str) -> None:
-        """set <key> <value>   Configure: top, llm_url, llm_model, max_chunk_chars,
-        llm_cache, pager (on/off), color (on/off)."""
-        parts = self._split(arg)
-        if len(parts) < 2:
-            self.do_settings("")
-            return
-        key, value = parts[0], " ".join(parts[1:])
-        bool_yes = {"on", "yes", "true", "1"}
-        if key == "top":
+            tokens -= 1.0
+
+            # Batch: absorb all messages that are already queued (up to token
+            # budget) so they share a single drain() syscall.
+            batch = [data]
+            while tokens >= 1.0:
+                try:
+                    batch.append(self._send_queue.get_nowait())
+                    tokens -= 1.0
+                except asyncio.QueueEmpty:
+                    break
+
             try:
-                self.state.top_n = int(value)
-            except ValueError:
-                print("top must be an integer"); return
-        elif key == "llm_url":
-            self.state.llm_url = value
-        elif key == "llm_model":
-            self.state.llm_model = value
-        elif key == "max_chunk_chars":
-            try:
-                self.state.max_chunk_chars = int(value)
-            except ValueError:
-                print("max_chunk_chars must be an integer"); return
-        elif key == "llm_cache":
-            if value.lower() in {"none", "off", ""}:
-                self.state.llm_cache = None
-            else:
-                self.state.llm_cache = LLMCache(value)
-            print(f"llm_cache = {value or '(off)'}")
-            return
-        elif key == "pager":
-            self.state.pager_enabled = value.lower() in bool_yes
-            print(f"pager = {self.state.pager_enabled}")
-            return
-        elif key == "color":
-            on = value.lower() in bool_yes
-            self.state.color_enabled = on
-            _Color.enabled = on
-            print(f"color = {on}")
-            return
-        elif key == "webhook_url":
-            self.state.webhook_url = value
-        elif key == "webhook_type":
-            self.state.webhook_type = value
-        elif key == "plugin_dir":
-            self.state.plugin_dir = value
-        else:
-            print(f"Unknown setting: {key}. See 'settings'.")
-            return
-        attr = "top_n" if key == "top" else key
-        print(f"{key} = {getattr(self.state, attr)}")
+                if self.writer and not self.writer.is_closing():
+                    self.writer.writelines(batch)
+                    await self.writer.drain()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                await self.ui_queue.put(("status", f"Write error: {e}"))
+                try:
+                    if self.writer:
+                        self.writer.close()
+                except Exception:
+                    pass
+                break
 
-    def do_settings(self, arg: str) -> None:
-        """settings   Show current settings."""
-        st = self.state
-        print(f"  log_path        = {st.log_path}")
-        print(f"  entries         = {len(st.entries)}  active = {len(self._active_entries())}")
-        print(f"  focused_user    = {st.focused_user}")
-        print(f"  focused_target  = {st.focused_target}")
-        print(f"  since           = {st.since}")
-        print(f"  until           = {st.until}")
-        print(f"  top             = {st.top_n}")
-        print(f"  llm_url         = {st.llm_url}")
-        print(f"  llm_model       = {st.llm_model}")
-        print(f"  max_chunk_chars = {st.max_chunk_chars}")
-        if st.llm_cache:
-            print(f"  llm_cache       = {st.llm_cache.path}  ({len(st.llm_cache)} entries)")
-        else:
-            print(f"  llm_cache       = (off)")
-        print(f"  pager           = {st.pager_enabled}")
-        print(f"  color           = {st.color_enabled}")
-        if st.views:
-            print(f"  views           = {', '.join(st.views)}")
-        if st.aliases:
-            print(f"  aliases         = {len(st.aliases)} ({', '.join(list(st.aliases)[:5])}{'...' if len(st.aliases) > 5 else ''})")
-        if st.ignore_set:
-            print(f"  ignored         = {len(st.ignore_set)} users")
-        if st.notes:
-            print(f"  notes           = {len(st.notes)} users")
-        if st.watch_bg:
-            print(f"  watch_bg        = running (+{st.watch_bg.new_count} new since last check)")
-        print(f"  webhook_url     = {st.webhook_url or '(not set)'}")
-        print(f"  webhook_type    = {st.webhook_type}")
-        print(f"  plugin_dir      = {st.plugin_dir or '(not set)'}")
-        print(f"  rules           = {len(st.alert_engine.rules)} alert rules")
-        print(f"  multi_sources   = {len(st.multi_log_sources)} sources")
-        if st.web_server:
-            print(f"  web_server      = running (:{st.web_server.server_port})")
-        print(f"  back/fwd        = {len(st.focus_back)}/{len(st.focus_forward)}")
-
-    def do_commands(self, arg: str) -> None:
-        """commands   Print all commands with a short description and usage."""
-        ref: list[tuple[str, str, str]] = [
-            ("load", "load <path>", "Load a different log file."),
-            ("reload", "reload", "Re-read the current log file from disk."),
-            ("watch", "watch [poll_seconds] [--bg | --stop]",
-             "Tail the log (foreground or background)."),
-            ("report", "report [user]", "Full stats report (honors since/until/focused_target)."),
-            ("info", "info [user]", "One-line summary of a user (with note if any)."),
-            ("user", "user <nick>", "Set the focused user."),
-            ("target", "target <chan>", "Set the focused target/channel."),
-            ("since", "since <when>", "Lower time bound (ISO date or '5h ago')."),
-            ("until", "until <when>", "Upper time bound."),
-            ("back", "back", "Restore previous focus state."),
-            ("forward", "forward", "Re-apply focus undone by 'back'."),
-            ("clear_filters", "clear_filters", "Clear focused user/target and since/until."),
-            ("analyze", "analyze [nick]", "LLM behavior analysis on a user's lines."),
-            ("ask", 'ask [nick] "<question>"', "Free-form LLM question via the chunking pipeline."),
-            ("interact", "interact <A> <B> [--show N] [--no-llm]",
-             "Direct exchanges between two users + LLM relationship analysis."),
-            ("compare", "compare <A> <B> [<C>...] [--no-llm]",
-             "Multi-user behavior comparison: side-by-side table + LLM."),
-            ("show", "show [nick] [N]", "Print up to N raw lines for the user (default 10)."),
-            ("flagged", 'flagged "EXPR" [user]',
-             'Lines where score expression matches (e.g. "llama>0.8 heu>0.5").'),
-            ("dist", "dist [user]", "Score distributions / percentiles (no user = population)."),
-            ("zscores", "zscores [user]", "Per-score z-scores for user vs population."),
-            ("similar", "similar [threshold] [min_lines]", "Find user pairs with similar fingerprints."),
-            ("bursts", "bursts [user] [window_s] [z]", "Detect activity bursts."),
-            ("threads", "threads [user]", "Reply/mention reconstruction around a user."),
-            ("edges", "edges [N]", "Top N reply/mention edges in the corpus."),
-            ("top", "top [users|events|targets|levels] [N]", "Show a top-N ranking."),
-            ("hours", "hours [compact]", "Activity histogram by hour-of-day (sparkline if narrow)."),
-            ("days", "days [compact]", "Activity histogram by date (sparkline if narrow)."),
-            ("errors", "errors", "Error-like entries."),
-            ("grep", "grep [--user U] [--target T] [--since W] [--until W] [--score E] <regex>",
-             "Filtered regex search (cap 50)."),
-            ("pick", "pick <N>", "Focus on the Nth item from the previous listing."),
-            ("inspect", "inspect <N>", "Show full details for the Nth entry from the previous listing."),
-            ("last", "last", "Re-print the previous command's output."),
-            ("view", "view {save|load|drop|show|list} [NAME]", "Save/load named filter sets."),
-            ("export", "export {profile <user> <path> | report <path> | edges <path>}",
-             "Serialize profiles, summary, or edge graph."),
-            ("diff", "diff <other.log>", "Diff current log against another."),
-            ("script", "script <path>", "Run TUI commands from a file (one per line; # comments)."),
-            ("alias", "alias [<name> = <command>]",
-             "Define/list/remove aliases (persisted)."),
-            ("ignore", "ignore [add|drop|list] <user...>",
-             "Maintain global ignore list (excluded from analyses)."),
-            ("note", "note <user> [<text> | --del]", "Attach a note to a user (persisted)."),
-            ("set", "set <key> <value>",
-             "Configure: top, llm_url, llm_model, max_chunk_chars, llm_cache, pager, color, webhook_url, webhook_type, plugin_dir."),
-            ("settings", "settings", "Show current settings."),
-            ("sessions", "sessions [user] [gap_min]", "Detect user sessions with configurable gap."),
-            ("response_times", "response_times [user] [window_sec]", "Response time analysis between users."),
-            ("sentiment", "sentiment [user]", "Sentiment analysis for a user."),
-            ("topics", "topics [user]", "Keyword and n-gram extraction for a user."),
-            ("sequences", "sequences [min_support]", "Common user interaction sequences."),
-            ("anomalies", "anomalies [user] [z]", "Detect behavioral anomalies."),
-            ("lifecycle", "lifecycle [user]", "User lifecycle analysis (first/last seen, trend, stages)."),
-            ("pattern", "pattern [user]", "Pattern-of-life analysis (hourly/weekly profile)."),
-            ("rules", "rules [add|remove|toggle] ...", "Manage alert rules engine."),
-            ("correlate", "correlate <path> [window_s]", "Cross-log event correlation."),
-            ("timeline", "timeline [user] [width]", "ASCII timeline visualization."),
-            ("heatmap", "heatmap [user] [months]", "Calendar activity heatmap."),
-            ("net", "net [N]", "ASCII network graph of top interaction edges."),
-            ("export_html", "export_html <path> [user...]", "Generate HTML report."),
-            ("export_sql", "export_sql <path>", "Export entries to SQLite database."),
-            ("sql", "sql <db> <query>", "Query a SQLite export."),
-            ("prometheus", "prometheus", "Print Prometheus metrics."),
-            ("multi", "multi {add|list|clear|report} ...", "Multi-log aggregation."),
-            ("aggregate", "aggregate", "Alias for 'multi report'."),
-            ("llm_explain", "llm_explain [user] [z]", "Detect anomalies and have LLM explain them."),
-            ("summarize", "summarize <A> <B>", "LLM conversation summarization."),
-            ("cluster", "cluster [min_lines] [N]", "LLM clustering of user behavior."),
-            ("auto_report", "auto_report", "LLM-generated narrative report."),
-            ("plugin", "plugin {load|list|reload} [dir]", "Manage analysis plugins."),
-            ("web", "web {start|stop|status} [port]", "Start/stop the web API server."),
-            ("webportal", "webportal {enable|disable}", "Start/stop the web-based console on port 80."),
-            ("webhook", "webhook {set|test|clear} ...", "Configure Slack/Discord webhook."),
-            ("cron", "cron [--output <path>] [--webhook-url <url>]", "Run analysis in cron mode."),
-            ("templates", "templates [N]", "Extract common log line templates."),
-            ("changepoints", "changepoints [user] [window_days]", "Detect behavioral change points."),
-            ("rootcause", "rootcause <user> [lookback_sec]", "Find root causes preceding a user's activity."),
-            ("forecast", "forecast [user] [days]", "Forecast future activity volume."),
-            ("multifactor", "multifactor [user]", "Multi-factor anomaly score."),
-            ("chart", "chart {timeline|histogram|network} <path> ...", "Generate matplotlib charts."),
-            ("dataframe", "dataframe [expression]", "View entries as pandas DataFrame."),
-            ("recurrence", "recurrence [user]", "Detect periodic patterns (weekly/daily/hourly)."),
-            ("churn", "churn [user]", "Predict churn risk for a user."),
-            ("pareto", "pareto [users|events|targets|levels]", "Pareto analysis (80/20 rule)."),
-            ("dashboard", "dashboard", "Launch curses real-time dashboard."),
-            ("watch_alert", "watch_alert [poll_sec]", "Tail log with alert-engine evaluation + webhook."),
-            ("forecast_anomaly", "forecast_anomaly <user> [z] [days]", "Anomaly detection using forecast baseline."),
-            ("alert_fatigue", "alert_fatigue [window_h]", "Alert fatigue scores for each rule."),
-            ("export_html_drilldown", "export_html_drilldown <path> [user...]", "Collapsible HTML report."),
-            ("session_times", "session_times <A> <B> [gap]", "Response times per session."),
-            ("influence", "influence <seed> [hops] [win_s]", "Trace multi-hop reply chains."),
-            ("template_filter", "template_filter <id>", "Filter current view by template ID."),
-            ("drift", "drift <user> [wa_days] [wb_days] [gap]", "Detect behavioral drift across windows."),
-            ("save_profile", "save_profile <user> <path>", "Compute and save user profile to JSON."),
-            ("load_profile", "load_profile <path>", "Load and display a saved profile."),
-            ("compare_profiles", "compare_profiles <path1> <path2> ...", "Compare saved profiles."),
-            ("auto_tag", "auto_tag [user]", "LLM-based auto-tagging of a user."),
-            ("auto_tag_bulk", "auto_tag_bulk [N]", "Auto-tag top N users by activity."),
-            ("recurrence_breach", "recurrence_breach <user> [days]", "Check recurrence pattern breach."),
-            ("save_config", "save_config", "Persist current shell config to disk."),
-            ("load_config", "load_config", "Reload shell config from disk."),
-            ("commands", "commands  (or ??)", "Print this reference."),
-            ("help", "help [name]  (or ?<name>)", "Built-in help."),
-            ("quit", "quit  (exit, Ctrl-D)", "Exit the shell."),
-        ]
-        usage_w = min(max(len(u) for _, u, _ in ref), 70)
-        print(f"\n  {'COMMAND'.ljust(usage_w)}   DESCRIPTION")
-        print(f"  {'-' * usage_w}   {'-' * 40}")
-        for _name, usage, desc in ref:
-            print(f"  {usage[:usage_w].ljust(usage_w)}   {desc}")
-        print(
-            "\n  Tips:\n"
-            "    - Quote args containing spaces.\n"
-            "    - Global filters (user/target/since/until) apply to most commands.\n"
-            "    - 'view save NAME' captures the current global filters.\n"
-            "    - 'set llm_url http://host:port/' switches the LLM endpoint at runtime.\n"
-            "    - Launch with --c to print this reference on startup."
-        )
-
-    # --- NEW: sessions (#5) -------------------------------------------------
-    def do_sessions(self, arg: str) -> None:
-        """sessions [user] [gap_minutes]   Detect user sessions."""
-        parts = self._split(arg)
-        user = parts[0] if parts and not parts[0].replace(".", "").isdigit() else self.state.focused_user
-        gap = 30
-        for p in parts:
-            try:
-                gap = int(p)
-            except ValueError:
-                if user is None:
-                    user = p
-        user = self._resolve_user(user or "")
-        if not user:
-            return
-        sessions = detect_sessions(self._active_entries(), user, gap)
-        if not sessions:
-            print(f"No sessions for '{user}'.")
-            return
-        print(f"\nSessions for '{user}' (gap={gap}min):")
-        total_lines = sum(s.line_count for s in sessions)
-        for i, s in enumerate(sessions, 1):
-            dur = (s.end - s.start).total_seconds()
-            dur_s = f"{dur / 60:.0f}min" if dur < 3600 else f"{dur / 3600:.1f}h"
-            print(f"  #{i:<3d}  {s.start:%H:%M} - {s.end:%H:%M}  {dur_s:>10}  {s.line_count:>4d} lines")
-        print(f"  Total: {len(sessions)} sessions, {total_lines} lines")
-
-    # --- NEW: response_times (#6) -------------------------------------------
-    def do_response_times(self, arg: str) -> None:
-        """response_times [user] [window_sec]   Response time analysis."""
-        parts = self._split(arg)
-        user = parts[0] if parts else None
-        window = 300
-        for p in parts:
-            try:
-                window = int(p)
-            except ValueError:
-                user = p
-        rts = compute_response_times(self._active_entries(), window)
-        if user:
-            u = user.lower()
-            rts = [r for r in rts if r.responder.lower() == u or r.responded_to.lower() == u]
-        if not rts:
-            print("(no response time data)")
-            return
-        delays = [r.delay_seconds for r in rts]
-        mean_d = statistics.mean(delays)
-        print(f"\nResponse times ({len(rts)} exchanges):")
-        print(f"  Mean: {mean_d:.0f}s  Median: {statistics.median(delays):.0f}s")
-        by_responder: Counter = Counter()
-        for r in rts:
-            by_responder[f"{r.responder} -> {r.responded_to}"] += 1
-        print("  Top responder pairs:")
-        for pair, cnt in by_responder.most_common(10):
-            avg = statistics.mean([r.delay_seconds for r in rts if f"{r.responder} -> {r.responded_to}" == pair])
-            print(f"    {cnt:>4d}x  {pair:<30s}  avg={avg:.0f}s")
-
-    # --- NEW: sentiment (#4) -------------------------------------------------
-    def do_sentiment(self, arg: str) -> None:
-        """sentiment [user]   Sentiment analysis for a user (or focused)."""
-        user = self._resolve_user(arg)
-        if not user:
-            return
-        s = user_sentiment(self._active_entries(), user)
-        if not s:
-            print(f"(no data for '{user}')")
-            return
-        print(f"\nSentiment for '{user}':")
-        print(f"  n={s['n']}")
-        print(f"  mean compound: {s['mean_compound']:.3f}")
-        print(f"  positive rate: {s['pos_rate']:.1%}")
-        print(f"  negative rate: {s['neg_rate']:.1%}")
-        print(f"  agreement rate: {s['agree_rate']:.1%}")
-
-    # --- NEW: topics (#3) ----------------------------------------------------
-    def do_topics(self, arg: str) -> None:
-        """topics [user]   Keyword and n-gram extraction for a user (or focused)."""
-        user = self._resolve_user(arg)
-        if not user:
-            return
-        t = user_topics(self._active_entries(), user)
-        if not t or not t.get("keywords"):
-            print(f"(no topic data for '{user}')")
-            return
-        print(f"\nTopics for '{user}':")
-        print("  Top keywords:")
-        for kw, n in t["keywords"][:15]:
-            print(f"    {n:>5d}  {kw}")
-        print("  Top bigrams:")
-        for kw, n in t["bigrams"][:10]:
-            print(f"    {n:>5d}  {kw}")
-        print("  Top trigrams:")
-        for kw, n in t["trigrams"][:5]:
-            print(f"    {n:>5d}  {kw}")
-
-    # --- NEW: sequences (#14) ------------------------------------------------
-    def do_sequences(self, arg: str) -> None:
-        """sequences [min_support]   Find common user interaction sequences."""
-        min_support = int(arg.strip()) if arg.strip().isdigit() else 3
-        seqs = find_common_sequences(self._active_entries(), min_support=min_support)
-        if not seqs:
-            print("(no sequences found)")
-            return
-        print(f"\nCommon sequences (min_support={min_support}):")
-        for s in seqs:
-            pat = " -> ".join(s.pattern)
-            print(f"  {s.count:>5d}x  {pat}")
-
-    # --- NEW: anomalies (#8) -------------------------------------------------
-    def do_anomalies(self, arg: str) -> None:
-        """anomalies [user] [z_threshold]   Detect behavioral anomalies."""
-        parts = self._split(arg)
-        user = parts[0] if parts else self.state.focused_user
-        z = 2.5
-        for p in parts:
-            try:
-                z = float(p)
-            except ValueError:
-                user = p
-        user = self._resolve_user(user or "")
-        if not user:
-            return
-        anoms = detect_anomalies(self._active_entries(), user, z)
-        if not anoms:
-            print(f"(no anomalies for '{user}' at z>={z})")
-            return
-        print(f"\nAnomalies for '{user}' (z>={z}):")
-        for a in anoms:
-            dir_ = "HIGH" if a.value > a.expected else "LOW"
-            print(f"  {dir_:>4}  {a.metric:<20s} value={a.value:.1f} expected={a.expected:.1f} z={a.zscore:.2f}  {a.day or ''} h{a.hour or ''}")
-
-    # --- NEW: lifecycle (#10) ------------------------------------------------
-    def do_lifecycle(self, arg: str) -> None:
-        """lifecycle [user]   User lifecycle analysis."""
-        user = self._resolve_user(arg)
-        if not user:
-            return
-        lc = analyze_lifecycle(self._active_entries(), user)
-        if not lc.first_seen:
-            print(f"(no data for '{user}')")
-            return
-        print(f"\nLifecycle for '{user}':")
-        print(f"  First seen: {_fmt_dt(lc.first_seen)}")
-        print(f"  Last seen:  {_fmt_dt(lc.last_seen)}")
-        print(f"  Active days: {lc.active_days} / {lc.total_days} total ({lc.active_days / max(lc.total_days, 1) * 100:.0f}%)")
-        print(f"  Trend: {lc.activity_trend}")
-        print(f"  Stages ({len(lc.stages)}):")
-        for i, (stage, st, en) in enumerate(lc.stages, 1):
-            dur = (en - st).days
-            print(f"    #{i} {stage}  {st.date()} - {en.date()}  ({dur}d)")
-
-    # --- NEW: pattern (#11) --------------------------------------------------
-    def do_pattern(self, arg: str) -> None:
-        """pattern [user]   Pattern-of-life analysis for a user."""
-        user = self._resolve_user(arg)
-        if not user:
-            return
-        pol = pattern_of_life(self._active_entries(), user)
-        if not pol.hourly_profile:
-            print(f"(insufficient data for '{user}')")
-            return
-        print(f"\nPattern of life for '{user}' (consistency={pol.consistency_score:.2f}):")
-        print("  Hourly activity profile (normalized):")
-        glyphs = "▁▂▃▄▅▆▇█"
-        vals = [pol.hourly_profile.get(h, 0) for h in range(24)]
-        peak_v = max(vals) or 1
-        bar = "".join(glyphs[min(int(v / peak_v * 7), 7)] for v in vals)
-        print(f"    {bar}  (00..23)")
-        print(f"  Peak hour: {pol.peak_hour}:00")
-        print(f"  Quiet hours: {', '.join(f'{h}:00' for h in pol.quiet_hours) or 'none'}")
-        print("  Weekday profile:")
-        days = "Mon Tue Wed Thu Fri Sat Sun".split()
-        for d in range(7):
-            bar_len = int(pol.weekday_profile.get(d, 0) / (max(pol.weekday_profile.values()) or 1) * 20)
-            print(f"    {days[d]}: {'█' * bar_len}")
-
-    # --- NEW: rules / alert (#13) --------------------------------------------
-    def do_rules(self, arg: str) -> None:
-        """rules   List alert rules.
-        rules add <name> <field> <op> <value> <message>
-        rules remove <name>
-        rules toggle <name>"""
-        parts = self._split(arg)
-        if not parts:
-            if not self.state.alert_engine.rules:
-                print("(no alert rules)")
-                return
-            print("Alert rules:")
-            for r in self.state.alert_engine.rules:
-                status = "ON" if r.enabled else "OFF"
-                print(f"  [{status}] {r.name}: if {r.field} {r.op} {r.value!r} -> {r.message}")
-            return
-        sub = parts[0].lower()
-        if sub == "add" and len(parts) >= 6:
-            self.state.alert_engine.add(AlertRule(parts[1], parts[2], parts[3], parts[4], " ".join(parts[5:])))
-            print(f"Added rule '{parts[1]}'.")
-        elif sub == "remove" and len(parts) >= 2:
-            if self.state.alert_engine.remove(parts[1]):
-                print(f"Removed rule '{parts[1]}'.")
-            else:
-                print(f"(no rule '{parts[1]}')")
-        elif sub == "toggle" and len(parts) >= 2:
-            for r in self.state.alert_engine.rules:
-                if r.name == parts[1]:
-                    r.enabled = not r.enabled
-                    print(f"Rule '{parts[1]}' toggled {'ON' if r.enabled else 'OFF'}")
-                    return
-            print(f"(no rule '{parts[1]}')")
-        else:
-            print("Usage: rules [add <name> <field> <op> <value> <message> | remove <name> | toggle <name>]")
-
-    # --- NEW: correlate (#12) ------------------------------------------------
-    def do_correlate(self, arg: str) -> None:
-        """correlate <path> [window_sec]   Cross-log event correlation."""
-        parts = self._split(arg)
-        if not parts:
-            print("Usage: correlate <other_log_path> [window_seconds]")
-            return
-        path = parts[0]
-        window = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 60
-        try:
-            other = list(iter_entries(path))
-        except FileNotFoundError:
-            print(f"File not found: {path}")
-            return
-        corr = correlate_logs(self.state.entries, other, window)
-        if not corr:
-            print("(no correlations found)")
-            return
-        print(f"\nCorrelations (window={window}s, {len(corr)} pairs):")
-        for c in corr[:20]:
-            print(f"  {c.count:>5d}x  {c.event_a:<25s}  ~~  {c.event_b:<25s}  avg_delay={c.avg_delay_seconds:.0f}s")
-
-    # --- NEW: timeline (#1) --------------------------------------------------
-    def do_timeline(self, arg: str) -> None:
-        """timeline [user] [width]   ASCII timeline visualization."""
-        parts = self._split(arg)
-        user = parts[0] if parts and not parts[0].isdigit() else self.state.focused_user
-        width = 60
-        for p in parts:
-            if p.isdigit():
-                width = min(int(p), 200)
-        lines = ascii_timeline(self._active_entries(), user, width=width)
-        print(f"\n{lines}")
-
-    # --- NEW: heatmap (#2) ---------------------------------------------------
-    def do_heatmap(self, arg: str) -> None:
-        """heatmap [user] [months]   Calendar activity heatmap."""
-        parts = self._split(arg)
-        user = parts[0] if parts and not parts[0].isdigit() else self.state.focused_user
-        months = 3
-        for p in parts:
-            if p.isdigit():
-                months = min(int(p), 12)
-        print(f"\n{calendar_heatmap(self._active_entries(), user, months)}")
-
-    # --- NEW: net (#7) -------------------------------------------------------
-    def do_net(self, arg: str) -> None:
-        """net [N]   ASCII network graph of top interaction edges."""
-        n = int(arg.strip()) if arg.strip().isdigit() else 15
-        edges = build_edge_graph(self._active_entries())
-        print(f"\n{ascii_network_graph(edges, top_n=n)}")
-
-    # --- NEW: export_html / export_sql (#15, #18) ----------------------------
-    def do_export_html(self, arg: str) -> None:
-        """export_html <path> [user...]   Generate HTML report."""
-        parts = self._split(arg)
-        if not parts:
-            print("Usage: export_html <path> [user...]")
-            return
-        path = parts[0]
-        users = parts[1:] if len(parts) > 1 else None
-        s = summarize(self._active_entries(), self.state.top_n)
-        profiles = None
-        if users:
-            profiles = [build_profile(self._active_entries(), u) for u in users]
-        write_html_report(path, s, profiles)
-
-    def do_export_sql(self, arg: str) -> None:
-        """export_sql <path>   Export entries to SQLite database."""
-        path = arg.strip()
-        if not path:
-            print("Usage: export_sql <path>")
-            return
-        print(export_to_sqlite(self.state.entries, path))
-
-    def do_sql(self, arg: str) -> None:
-        """sql <db_path> <query>   Query a previously exported SQLite database."""
-        parts = self._split(arg)
-        if len(parts) < 2:
-            print("Usage: sql <db_path> <query>")
-            return
-        db_path, query = parts[0], " ".join(parts[1:])
-        try:
-            rows = query_sqlite(db_path, query)
-        except sqlite3.Error as exc:
-            print(f"SQL error: {exc}")
-            return
-        if not rows:
-            print("(no results)")
-            return
-        headers = list(rows[0].keys())
-        print("  " + "  ".join(f"{h:<20s}" for h in headers))
-        print("  " + "-" * (20 * len(headers)))
-        for row in rows[:100]:
-            print("  " + "  ".join(f"{str(row.get(h, ''))[:20]:<20s}" for h in headers))
-        if len(rows) > 100:
-            print(f"  ...({len(rows) - 100} more rows)")
-
-    # --- NEW: prometheus (#17) -----------------------------------------------
-    def do_prometheus(self, arg: str) -> None:
-        """prometheus   Print Prometheus metrics for the current log."""
-        print(prometheus_metrics(self._active_entries()))
-
-    # --- NEW: multi / aggregate (#27) ----------------------------------------
-    def do_multi(self, arg: str) -> None:
-        """multi {add <label> <path> | list | clear | report}   Multi-log aggregation."""
-        parts = self._split(arg)
-        if not parts:
-            print("Usage: multi add <label> <path>  |  multi list  |  multi clear  |  multi report")
-            return
-        sub = parts[0].lower()
-        if sub == "add" and len(parts) >= 3:
-            label, path = parts[1], parts[2]
-            try:
-                entries = list(iter_entries(path))
-            except FileNotFoundError:
-                print(f"File not found: {path}")
-                return
-            self.state.multi_log_sources[label] = entries
-            print(f"Added '{label}': {len(entries)} entries from {path}")
-        elif sub == "list":
-            if not self.state.multi_log_sources:
-                print("(no sources)")
-                return
-            for label, entries in self.state.multi_log_sources.items():
-                print(f"  {label}: {len(entries)} entries")
-        elif sub == "clear":
-            self.state.multi_log_sources.clear()
-            print("Cleared all multi-log sources.")
-        elif sub == "report":
-            if not self.state.multi_log_sources:
-                print("(no sources)")
-                return
-            for label, entries in self.state.multi_log_sources.items():
-                s = summarize(entries, self.state.top_n)
-                print(f"\n=== {label} ===")
-                print_report(s)
-        else:
-            print(f"Unknown subcommand: {sub}")
-
-    # --- NEW: llm_explain (#19) ----------------------------------------------
-    def do_llm_explain(self, arg: str) -> None:
-        """llm_explain [user] [z]   Detect anomalies and have LLM explain them."""
-        parts = self._split(arg)
-        user = parts[0] if parts else self.state.focused_user
-        z = 2.5
-        for p in parts:
-            try:
-                z = float(p)
-            except ValueError:
-                user = p
-        user = self._resolve_user(user or "")
-        if not user:
-            return
-        anoms = detect_anomalies(self._active_entries(), user, z)
-        if not anoms:
-            print(f"(no anomalies for '{user}')")
-            return
-        context = [e.text or e.raw for e in self._filtered(user)[-100:]]
-        llm_explain_anomalies(anoms, context, self.state.llm_url, self.state.llm_model,
-                              self.state.max_chunk_chars, cache=self.state.llm_cache)
-
-    # --- NEW: summarize (#20) ------------------------------------------------
-    def do_summarize(self, arg: str) -> None:
-        """summarize <userA> <userB>   LLM conversation summarization."""
-        parts = self._split(arg)
-        if len(parts) < 2:
-            print("Usage: summarize <userA> <userB>")
-            return
-        a, b = parts[0], parts[1]
-        matched = [e for e in self._active_entries() if line_is_interaction(e, a, b)]
-        if not matched:
-            print(f"(no interaction data between {a} and {b})")
-            return
-        llm_summarize_conversation(a, b, [e.text for e in matched],
-                                   self.state.llm_url, self.state.llm_model,
-                                   self.state.max_chunk_chars, cache=self.state.llm_cache)
-
-    # --- NEW: cluster (#21) --------------------------------------------------
-    def do_cluster(self, arg: str) -> None:
-        """cluster [min_lines] [N]   LLM clustering of user behavior."""
-        parts = self._split(arg)
-        min_lines = 5
-        max_users = 15
-        for p in parts:
-            if p.isdigit():
-                if min_lines == 5:
-                    min_lines = int(p)
-                else:
-                    max_users = int(p)
-        counts: Counter = Counter(e.user for e in self._active_entries() if e.user)
-        candidates = sorted((u for u, n in counts.items() if n >= min_lines), key=lambda u: -counts[u])[:max_users]
-        if len(candidates) < 3:
-            print("Need at least 3 users with sufficient data.")
-            return
-        profiles = [build_profile(self._active_entries(), u) for u in candidates]
-        llm_cluster_users(profiles, self.state.llm_url, self.state.llm_model,
-                          self.state.max_chunk_chars, cache=self.state.llm_cache)
-
-    # --- NEW: auto_report (#22) ----------------------------------------------
-    def do_auto_report(self, arg: str) -> None:
-        """auto_report   LLM-generated narrative report of the log."""
-        s = summarize(self._active_entries(), self.state.top_n)
-        counts: Counter = Counter(e.user for e in self._active_entries() if e.user)
-        top_users = [u for u, _ in counts.most_common(10)]
-        profiles = [build_profile(self._active_entries(), u) for u in top_users]
-        llm_auto_report(s, profiles, self.state.llm_url, self.state.llm_model,
-                        self.state.max_chunk_chars, cache=self.state.llm_cache)
-
-    # --- NEW: plugin (#23) ---------------------------------------------------
-    def do_plugin(self, arg: str) -> None:
-        """plugin {load <dir> | list | reload}   Manage analysis plugins."""
-        parts = self._split(arg)
-        if not parts:
-            if not _plugins:
-                print("(no plugins loaded)")
-                return
-            print("Loaded plugins:")
-            for p in _plugins:
-                print(f"  {p.name}")
-            return
-        sub = parts[0].lower()
-        if sub == "load" and len(parts) >= 2:
-            path = parts[1]
-            if not os.path.isdir(path):
-                print(f"Not a directory: {path}")
-                return
-            load_plugins_from(path)
-            print(f"Loaded {len(_plugins)} plugins from {path}")
-        elif sub == "list":
-            print(f"Plugins: {len(_plugins)} loaded")
-        elif sub == "reload":
-            _plugins.clear()
-            if self.state.plugin_dir:
-                load_plugins_from(self.state.plugin_dir)
-            print(f"Reloaded: {len(_plugins)} plugins")
-        else:
-            print(f"Unknown: {sub}")
-
-    # --- NEW: web (#24) ------------------------------------------------------
-    def do_web(self, arg: str) -> None:
-        """web {start [port] | stop | status}   Start/stop the web API server."""
-        parts = self._split(arg)
-        if not parts or parts[0].lower() == "status":
-            if self.state.web_server:
-                print(f"Web server running on port {self.state.web_server.server_port}")
-            else:
-                print("(web server not running)")
-            return
-        sub = parts[0].lower()
-        if sub == "start":
-            if self.state.web_server:
-                print("(web server already running)")
-                return
-            port = int(parts[1]) if len(parts) > 1 else 8088
-            global _web_entries  # noqa: PLW0603
-            _web_entries = self.state.entries
-            self.state.web_server = start_web_server(port)
-            print(f"Web server started at http://127.0.0.1:{port}")
-        elif sub == "stop":
-            if self.state.web_server:
-                self.state.web_server.shutdown()
-                self.state.web_server = None
-                print("Web server stopped.")
-            else:
-                print("(not running)")
-
-    def do_webportal(self, arg: str) -> None:
-        """webportal {enable|disable|status}   Start/stop/query the web-based console on port 80."""
-        global _webportal_server
-        parts = self._split(arg)
-        if not parts:
-            print("Usage: webportal enable  |  webportal disable")
-            return
-        sub = parts[0].lower()
-        if sub == "enable":
-            if _webportal_server:
-                print("Web portal already running at http://127.0.0.1:80")
-                return
-            try:
-                _webportal_server = start_webportal(self, "127.0.0.1", 80)
-                print("Web portal started at http://127.0.0.1:80")
-            except OSError as exc:
-                print(f"Could not start web portal: {exc}")
-        elif sub == "disable":
-            if _webportal_server:
-                srv = _webportal_server
-                _webportal_server = None
-                threading.Thread(target=lambda: (srv.shutdown(), srv.server_close()), daemon=True).start()
-                print("Web portal stopping...")
-            else:
-                print("(web portal not running)")
-        elif sub == "status":
-            if _webportal_server:
-                print("Web portal is running at http://127.0.0.1:80")
-            else:
-                print("Web portal is not running")
-        else:
-            print("Usage: webportal enable  |  webportal disable  |  webportal status")
-
-    # --- NEW: webhook (#25) --------------------------------------------------
-    def do_webhook(self, arg: str) -> None:
-        """webhook {set <url> [slack|discord] | test <message> | clear}   Configure webhook."""
-        parts = self._split(arg)
-        if not parts:
-            if self.state.webhook_url:
-                print(f"Webhook: {self.state.webhook_url} ({self.state.webhook_type})")
-            else:
-                print("(no webhook configured)")
-            return
-        sub = parts[0].lower()
-        if sub == "set" and len(parts) >= 2:
-            self.state.webhook_url = parts[1]
-            self.state.webhook_type = parts[2] if len(parts) > 2 else "slack"
-            print(f"Webhook set to {self.state.webhook_url} ({self.state.webhook_type})")
-        elif sub == "test" and len(parts) >= 2:
-            if not self.state.webhook_url:
-                print("(no webhook configured)")
-                return
-            ok = send_webhook(self.state.webhook_url, " ".join(parts[1:]), self.state.webhook_type)
-            print(f"Webhook test: {'OK' if ok else 'FAILED'}")
-        elif sub == "clear":
-            self.state.webhook_url = ""
-            print("Webhook cleared.")
-
-    # --- NEW: cron (#26) -----------------------------------------------------
-    def do_cron(self, arg: str) -> None:
-        """cron [--output <path>] [--webhook-url <url>]   Run analysis in cron mode."""
-        parts = self._split(arg)
-        output_path = None
-        wh_url = self.state.webhook_url
-        i = 0
-        while i < len(parts):
-            if parts[i] == "--output" and i + 1 < len(parts):
-                output_path = parts[i + 1]; i += 2
-            elif parts[i] == "--webhook-url" and i + 1 < len(parts):
-                wh_url = parts[i + 1]; i += 2
-            else:
-                i += 1
-        cron_mode(self._active_entries(), self.state.alert_engine, wh_url, output_path)
-
-    # --- NEW: multi-file analysis clustering / aggregate command alias --------
-    def do_aggregate(self, arg: str) -> None:
-        """aggregate   Alias for 'multi report'."""
-        self.do_multi("report")
-
-    # --- NEW 10 features: templates / changepoints / rootcause / forecast / multifactor / chart / dataframe / recurrence / churn / pareto ---
-
-    def do_templates(self, arg: str) -> None:
-        """templates [N]   Extract common log line templates."""
-        n = int(arg.strip()) if arg.strip().isdigit() else 20
-        templates = extract_log_templates(self._active_entries(), n)
-        if not templates:
-            print("(no templates)")
-            return
-        print(f"\nLog templates ({len(templates)}):")
-        for template, count, sample in templates:
-            print(f"  {count:>5d}x  {template[:160]}")
-
-    def do_changepoints(self, arg: str) -> None:
-        """changepoints [user] [window_days]   Detect behavioral change points."""
-        parts = self._split(arg)
-        user = parts[0] if parts else self.state.focused_user
-        window = 3
-        for p in parts:
-            try:
-                window = int(p)
-            except ValueError:
-                user = p
-        user = self._resolve_user(user or "")
-        if not user:
-            return
-        cps = detect_change_points(self._active_entries(), user, window)
-        if not cps:
-            print(f"(no change points for '{user}')")
-            return
-        print(f"\nChange points for '{user}':")
-        for cp in cps:
-            dir_ = "UP" if cp.after_val > cp.before_val else "DOWN"
-            print(f"  {dir_:>4}  {cp.metric:<15s}  at {cp.at.date()}  {cp.before_val:.1f} -> {cp.after_val:.1f}  (effect={cp.effect_size:.2f})")
-
-    def do_rootcause(self, arg: str) -> None:
-        """rootcause <user> [lookback_sec]   Find root causes preceding a user's activity."""
-        parts = self._split(arg)
-        if not parts:
-            print("Usage: rootcause <user> [lookback_seconds]")
-            return
-        user = parts[0]
-        lookback = int(parts[1]) if len(parts) > 1 else 120
-        causes = trace_root_causes(self._active_entries(), user, lookback)
-        if not causes:
-            print(f"(no root causes found for '{user}')")
-            return
-        print(f"\nRoot causes for '{user}' (lookback={lookback}s):")
-        for rc in causes[:15]:
-            print(f"  {rc.occurrences:>4d}x  corr={rc.correlation:.2f}  lag={rc.avg_lag_seconds:.0f}s  {rc.preceding_user:<20s} {rc.preceding_event}")
-
-    def do_forecast(self, arg: str) -> None:
-        """forecast [user] [days]   Forecast future activity."""
-        parts = self._split(arg)
-        user = parts[0] if parts else self.state.focused_user
-        days = 7
-        for p in parts:
-            try:
-                days = int(p)
-            except ValueError:
-                user = p
-        fc = forecast_activity(self._active_entries(), user, days)
-        if not fc.predictions:
-            print("(insufficient data for forecast)")
-            return
-        label = f" for '{user}'" if user else ""
-        print(f"\nForecast{label}: trend={fc.trend}")
-        dates = sorted(fc.daily_counts.keys())
-        counts = [fc.daily_counts[d] for d in dates]
-        if len(counts) > 1:
-            glyphs = "▁▂▃▄▅▆▇█"
-            peak = max(counts) or 1
-            bar = "".join(glyphs[min(int(c / peak * 7), 7)] for c in counts[-min(len(counts), 30):])
-            print(f"  Recent activity: {bar}")
-        print(f"  Predictions ({days}d ahead):")
-        for d, v in fc.predictions:
-            print(f"    {d}:  {v:.0f}")
-
-    def do_multifactor(self, arg: str) -> None:
-        """multifactor [user]   Multi-factor anomaly score."""
-        user = self._resolve_user(arg)
-        if not user:
-            return
-        mf = multi_factor_anomaly(self._active_entries(), user)
-        if not mf:
-            print(f"(insufficient data for '{user}')")
-            return
-        print(f"\nMulti-factor anomaly for '{user}':")
-        print(f"  Composite score: {mf.composite_score:+.3f}  ({'ANOMALOUS' if abs(mf.composite_score) > 1.5 else 'normal'})")
-        print(f"  Daily volume z:  {mf.daily_z:+.2f}" if mf.daily_z is not None else "  Daily volume z:  N/A")
-        print(f"  Hourly z:        {mf.hourly_z:+.2f}" if mf.hourly_z is not None else "  Hourly z:        N/A")
-        print(f"  Sentiment z:     {mf.sentiment_z:+.2f}" if mf.sentiment_z is not None else "  Sentiment z:     N/A")
-
-    def do_chart(self, arg: str) -> None:
-        """chart {timeline <path> [user] | histogram <path> [key] [user] | network <path> [N]}
-        Generate matplotlib charts."""
-        parts = self._split(arg)
-        if not parts:
-            print("Usage: chart timeline <path> [user]  |  chart histogram <path> [key] [user]  |  chart network <path> [N]")
-            return
-        sub = parts[0].lower()
-        if sub == "timeline" and len(parts) >= 2:
-            path = parts[1]
-            user = parts[2] if len(parts) > 2 else None
-            chart_timeline(self._active_entries(), path, user)
-        elif sub == "histogram" and len(parts) >= 2:
-            path = parts[1]
-            user = parts[3] if len(parts) > 3 else None
-            if user:
-                scores = collect_scores(self._active_entries(), user)
-                for key in SCORE_KEYS:
-                    if scores.get(key):
-                        chart_histogram(scores[key], path.replace(".png", f"_{key}.png"), label=f"{key} ({user})")
-                        print(f"  Chart saved: {path.replace('.png', f'_{key}.png')}")
-            else:
-                scores = collect_scores(self._active_entries())
-                for key in SCORE_KEYS:
-                    if scores.get(key):
-                        chart_histogram(scores[key], path.replace(".png", f"_{key}.png"), label=f"{key} (population)")
-        elif sub == "network" and len(parts) >= 2:
-            path = parts[1]
-            n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 15
-            edges = build_edge_graph(self._active_entries())
-            chart_network(edges, path, n)
-        else:
-            print("Usage: chart timeline <path> [user]  |  chart histogram <path> [key] [user]  |  chart network <path> [N]")
-
-    def do_dataframe(self, arg: str) -> None:
-        """dataframe [expression]   View entries as pandas DataFrame with optional eval expression."""
-        print(dataframe_view(self._active_entries(), arg.strip()))
-
-    def do_recurrence(self, arg: str) -> None:
-        """recurrence [user]   Detect periodic patterns in a user's activity."""
-        user = self._resolve_user(arg)
-        if not user:
-            return
-        recs = detect_recurrence(self._active_entries(), user)
-        if not recs:
-            print(f"(no recurrence patterns for '{user}')")
-            return
-        print(f"\nRecurrence patterns for '{user}':")
-        for r in recs:
-            print(f"  [{r.pattern_type:>7}]  confidence={r.confidence:.0%}  {r.description}")
-
-    def do_churn(self, arg: str) -> None:
-        """churn [user]   Predict churn risk for a user."""
-        user = self._resolve_user(arg)
-        if not user:
-            return
-        pred = predict_churn(self._active_entries(), user)
-        level = "HIGH" if pred.risk_score > 0.6 else "MEDIUM" if pred.risk_score > 0.3 else "LOW"
-        print(f"\nChurn prediction for '{user}': risk={level} ({pred.risk_score:.2f})")
-        if pred.factors:
-            print("  Factors:")
-            for f in pred.factors:
-                print(f"    - {f}")
-
-    def do_pareto(self, arg: str) -> None:
-        """pareto [users|events|targets|levels]   Pareto analysis (80/20 rule)."""
-        cat = arg.strip() or "users"
-        p = pareto_analysis(self._active_entries(), cat)
-        if not p.items:
-            print(f"(no data for {cat})")
-            return
-        print(f"\nPareto analysis ({cat}): top {p.top_80_pct_count} account for ~80% of activity")
-        for name, count, cum in p.items[:25]:
-            bar = "█" * int(cum / 5)
-            print(f"  {cum:>5.0f}%  {bar:<20s}  {count:>7d}  {name}")
-        if len(p.items) > 25:
-            print(f"  ...({len(p.items) - 25} more)")
-
-    # --- Dashboard mode (#16) -------------------------------------------------
-    def do_dashboard(self, arg: str) -> None:
-        """dashboard   Launch curses real-time dashboard."""
-        run_dashboard(self.state.entries, self.state.alert_engine, self.state.log_path)
-
-    # --- Watch-mode alerting (feature a) --------------------------------------
-    def do_watch_alert(self, arg: str) -> None:
-        """watch_alert [poll_sec]   Tail log with alert-engine evaluation + webhook."""
-        poll = float(arg.strip()) if arg.strip() else 2.0
-        print(f"Watching {self.state.log_path} with alerts. Ctrl-C to stop.")
-        watch_with_alerts(self.state.log_path, self.state.alert_engine,
-                          self.state.webhook_url, self.state.webhook_type, poll)
-
-    # --- Forecast-aware anomaly (feature b) -----------------------------------
-    def do_forecast_anomaly(self, arg: str) -> None:
-        """forecast_anomaly <user> [z] [forecast_days]   Anomaly detection using forecast baseline."""
-        parts = arg.strip().split()
-        if not parts:
-            print("Usage: forecast_anomaly <user> [z] [forecast_days]")
-            return
-        user = parts[0]
-        z = float(parts[1]) if len(parts) > 1 else 2.5
-        fdays = int(parts[2]) if len(parts) > 2 else 7
-        result = forecast_aware_anomaly(self.state.entries, user, z, fdays)
-        if result.get("anomalies"):
-            print(f"\nForecast-based anomalies for {user}:")
-            for a in result["anomalies"]:
-                print(f"  {a['date']}: actual={a['actual']} expected={a['expected']:.1f}")
-        else:
-            print(f"No forecast-based anomalies for {user}")
-
-    # --- Alert fatigue scoring (feature c) ------------------------------------
-    def do_alert_fatigue(self, arg: str) -> None:
-        """alert_fatigue [window_hours]   Compute alert fatigue scores for each rule."""
-        window = int(arg.strip()) if arg.strip() else 1
-        scores = alert_fatigue_scores(self.state.alert_engine, self.state.entries, window)
-        if not scores:
-            print("(no alert rules defined)")
-            return
-        print(f"\nAlert fatigue scores (last {window}h window):")
-        for s in scores:
-            bar = "█" * int(s.signal_rate * 20)
-            print(f"  {s.rule_name:<20s}  fires={s.fires_total:<5d}  rate={s.signal_rate:.0%}  {bar:<20s}  {s.suggestion}")
-
-    # --- Drill-down HTML report (feature d) -----------------------------------
-    def do_export_html_drilldown(self, arg: str) -> None:
-        """export_html_drilldown <path> [user...]   Collapsible HTML report."""
-        parts = arg.strip().split()
-        if not parts:
-            print("Usage: export_html_drilldown <path> [user...]")
-            return
-        path = parts[0]
-        users = parts[1:] or [self.state.focused_user] if self.state.focused_user else []
-        s = summarize(self._active_entries(), self.state.top_n)
-        profiles = [build_profile(self._active_entries(), u) for u in users if u] if users else None
-        write_html_report_drilldown(path, s, profiles)
-        print(f"Drill-down HTML report written to {path}")
-
-    # --- Session-aware metrics (feature e) ------------------------------------
-    def do_session_times(self, arg: str) -> None:
-        """session_times <user_a> <user_b> [gap_min]   Response times per session."""
-        parts = arg.strip().split()
-        if len(parts) < 2:
-            print("Usage: session_times <user_a> <user_b> [gap_min]")
-            return
-        ua, ub = parts[0], parts[1]
-        gap = int(parts[2]) if len(parts) > 2 else 30
-        results = session_response_times(self.state.entries, ua, ub, gap)
-        if not results:
-            print("(no session data)")
-            return
-        print(f"\nSession-aware response times ({ua} <-> {ub}):")
-        for r in results[:20]:
-            print(f"  [{r['session_start']}] {r['responder']} responded in {r['delay_seconds']:.0f}s")
-        if len(results) > 20:
-            print(f"  ...({len(results) - 20} more)")
-
-    # --- Influence chain tracking (feature f) ----------------------------------
-    def do_influence(self, arg: str) -> None:
-        """influence <seed_user> [max_hops] [window_s]   Trace multi-hop reply chains."""
-        parts = arg.strip().split()
-        if not parts:
-            print("Usage: influence <seed_user> [max_hops] [window_s]")
-            return
-        user = parts[0]
-        hops = int(parts[1]) if len(parts) > 1 else 3
-        win = int(parts[2]) if len(parts) > 2 else 300
-        chains = influence_chains(self.state.entries, user, hops, win)
-        if not chains:
-            print(f"(no chains found for {user})")
-            return
-        print(f"\nInfluence chains from {user} ({len(chains)} chains):")
-        for i, ch in enumerate(chains[:20], 1):
-            labels = [c["user"] for c in ch]
-            print(f"  #{i:3d}  {' -> '.join(labels)}")
-        if len(chains) > 20:
-            print(f"  ...({len(chains) - 20} more)")
-
-    # --- Template-based filtering (feature g) ---------------------------------
-    def do_template_filter(self, arg: str) -> None:
-        """template_filter <template_id>   Filter current view by template ID."""
-        tid = arg.strip()
-        if not tid:
-            print("Usage: template_filter <template_id>")
-            return
-        self.state.template_filter = tid
-        filtered = filter_by_template(self._active_entries(), tid)
-        if not filtered:
-            print(f"(no entries match template {tid})")
-            return
-        print(f"\nEntries matching template '{tid}' ({len(filtered)}):")
-        for e in filtered[:30]:
-            print(f"  {e.raw[:200]}")
-        if len(filtered) > 30:
-            print(f"  ...({len(filtered) - 30} more)")
-
-    # --- Drift monitoring (feature h) -----------------------------------------
-    def do_drift(self, arg: str) -> None:
-        """drift <user> [window_a_days] [window_b_days] [gap_days]   Detect behavioral drift."""
-        parts = arg.strip().split()
-        if not parts:
-            print("Usage: drift <user> [window_a_days] [window_b_days] [gap_days]")
-            return
-        user = parts[0]
-        wa = int(parts[1]) if len(parts) > 1 else 7
-        wb = int(parts[2]) if len(parts) > 2 else 7
-        gap = int(parts[3]) if len(parts) > 3 else 0
-        result = drift_detection(self.state.entries, user, wa, wb, gap)
-        print(f"\nDrift analysis for {user}:")
-        if result.get("drift_detected"):
-            print(f"  DRIFT DETECTED: score={result['drift_score']}")
-            print(f"  avg hourly delta={result['avg_hourly_delta']}  max={result['max_hourly_delta']}")
-        elif result.get("note"):
-            print(f"  {result['note']}")
-        else:
-            print(f"  No significant drift (score={result.get('drift_score', '?')})")
-
-    # --- Behavioral profile persistence (feature i) ---------------------------
-    def do_save_profile(self, arg: str) -> None:
-        """save_profile <user> <path>   Compute and save a user profile to JSON."""
-        parts = arg.strip().split()
-        if len(parts) < 2:
-            print("Usage: save_profile <user> <path>")
-            return
-        user, path = parts[0], parts[1]
-        msg = save_profile(user, self._active_entries(), path)
-        print(msg)
-
-    def do_load_profile(self, arg: str) -> None:
-        """load_profile <path>   Load and display a saved profile."""
-        path = arg.strip()
-        if not path:
-            print("Usage: load_profile <path>")
-            return
-        prof = load_profile(path)
-        if prof:
-            print(f"\nLoaded profile from {path}:")
-            print(json.dumps(prof, indent=2, default=str)[:2000])
-
-    def do_compare_profiles(self, arg: str) -> None:
-        """compare_profiles <path1> <path2> [...]   Compare saved profiles."""
-        paths = arg.strip().split()
-        if len(paths) < 2:
-            print("Usage: compare_profiles <path1> <path2> [...]")
-            return
-        profiles = compare_saved_profiles(paths)
-        if len(profiles) < 2:
-            print("(could not load enough profiles)")
-            return
-        print(f"\nComparing {len(profiles)} saved profiles:")
-        for p in profiles:
-            user = p.get("user") or p.get("nick") or "?"
-            sm = p.get("score_means", {})
-            scores = " ".join(f"{k}={v:.3f}" for k, v in sm.items() if isinstance(v, float))
-            print(f"  {user:<20s}  lines={p.get('authored', '?'):>6s}  {scores}")
-
-    # --- Auto-tagging (feature j) ---------------------------------------------
-    def do_auto_tag(self, arg: str) -> None:
-        """auto_tag [user]   LLM-based auto-tagging of a user (uses focused_user if no arg)."""
-        user = self._resolve_user(arg)
-        if not user:
-            return
-        tag = auto_tag_user(self._active_entries(), user,
-                            self.state.llm_url, self.state.llm_model,
-                            self.state.max_chunk_chars, self.state.llm_cache)
-        self.state.auto_tag_cache[user] = tag
-        print(f"\nTags for {user}: {tag}")
-
-    def do_auto_tag_bulk(self, arg: str) -> None:
-        """auto_tag_bulk [N]   Auto-tag top N users by activity."""
-        n = int(arg.strip()) if arg.strip() else 10
-        tags = auto_tag_bulk(self._active_entries(), self.state.llm_url, self.state.llm_model,
-                             self.state.max_chunk_chars, self.state.llm_cache, n)
-        if not tags:
-            print("(no data)")
-            return
-        print(f"\nAuto-tags for top {n} users:")
-        for user, tag in tags.items():
-            print(f"  {user:<20s}  {tag}")
-
-    # --- Recurrence breach alert (feature k) ----------------------------------
-    def do_recurrence_breach(self, arg: str) -> None:
-        """recurrence_breach <user> [recent_days]   Check if user breaks their recurrence pattern."""
-        parts = arg.strip().split()
-        if not parts:
-            print("Usage: recurrence_breach <user> [recent_days]")
-            return
-        user = parts[0]
-        days = int(parts[1]) if len(parts) > 1 else 3
-        result = check_recurrence_breach(self.state.entries, user, days)
-        if result.get("breach"):
-            print(f"\nRECURRENCE BREACH for {user}:")
-            for b in result.get("breaches", []):
-                print(f"  {json.dumps(b)}")
-        else:
-            print(f"No recurrence breach for {user}: {result.get('note', 'pattern intact')}")
-
-    # --- Config persistence (feature l) --------------------------------------
-    def do_save_config(self, arg: str) -> None:
-        """save_config   Persist current shell config (rules, webhook, etc.)."""
-        save_shell_config(self.state)
-        print(f"Config saved to {_SHELL_CONFIG_PATH}")
-
-    def do_load_config(self, arg: str) -> None:
-        """load_config   Reload shell config from disk."""
-        load_shell_config(self.state)
-        print(f"Config loaded from {_SHELL_CONFIG_PATH}")
-
-    def do_quit(self, arg: str) -> bool:
-        """quit   Exit the shell."""
-        global _webportal_server
-        save_shell_config(self.state)
-        if self.state.watch_bg:
-            self.state.watch_bg.stop()
-            self.state.watch_bg = None
-        if self.state.web_server:
-            self.state.web_server.shutdown()
-            self.state.web_server = None
-        if _webportal_server:
-            _webportal_server.shutdown()
-            _webportal_server.server_close()
-            _webportal_server = None
-        if self.state.llm_cache:
-            self.state.llm_cache.save()
-        self._save_history()
+    def _ctcp_allowed(self, nick: str) -> bool:
+        """Allow at most 3 CTCP replies per nick per 30 s."""
+        now = time.monotonic()
+        q = self._ctcp_times.get(nick)
+        if q is not None:
+            while q and now - q[0] > 30:
+                q.popleft()
+            if not q:
+                # All timestamps expired — evict the entry so _ctcp_times doesn't
+                # accumulate thousands of empty deques from high-nick-churn channels.
+                del self._ctcp_times[nick]
+                q = None
+        if q is None:
+            q = deque()
+            self._ctcp_times[nick] = q
+        if len(q) >= 3:
+            return False
+        q.append(now)
         return True
 
-    do_exit = do_quit
-    do_EOF = do_quit
+    async def keepalive(self) -> None:
+        """Send PING every 45 s and disconnect if no PONG arrives within 120 s.
 
-    def emptyline(self) -> bool:
+        Dead TCP connections (e.g. NAT timeout, Wi-Fi handoff) do not always
+        produce a RST/FIN; without this check the client would sit silently
+        disconnected until the 300 s readline timeout fires.
+        """
+        PING_INTERVAL = 45.0
+        PONG_TIMEOUT  = 120.0
+        while self.running and self.writer:
+            try:
+                self.send_raw(f"PING :keepalive-{int(time.time())}")
+                await asyncio.sleep(PING_INTERVAL)
+                if time.monotonic() - self._last_pong > PONG_TIMEOUT:
+                    await self.ui_queue.put(("status", "Ping timeout — reconnecting"))
+                    try:
+                        self.writer.close()
+                    except Exception:
+                        pass
+                    break
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                break
+
+    async def _delayed_nickserv_identify(self) -> None:
+        """Send NickServ IDENTIFY after a short delay without blocking the read loop."""
+        await asyncio.sleep(1.5)
+        if self.writer and not self.writer.is_closing():
+            self.send_raw(f"PRIVMSG NickServ :IDENTIFY {NICKSERV_PASSWORD}")
+            await self.ui_queue.put(("status", "Auto-identified to NickServ"))
+            self._identified = True
+
+    async def run_connection(self) -> None:
+        """Connect + keepalive with exponential-backoff auto-reconnect."""
+        DELAYS = [5, 15, 30, 60]
+        attempt = 0
+        while self.running:
+            self._identified = False
+            # Reset all per-connection state. Anything populated by
+            # the previous session (caps, ISUPPORT, batches,
+            # chathistory cap, ...) would otherwise leak into the
+            # new connection and produce subtle bugs (stale
+            # CASEMAPPING, dropped self-echoes from the old server,
+            # network name never re-announced, ...).
+            self._cap_ls_caps.clear()
+            self._cap_ls_values.clear()
+            self._active_caps.clear()
+            self._isupport.clear()
+            self._batch_buffer.clear()
+            self._batch_types.clear()
+            self._batch_params.clear()
+            self._cap_req_queue.clear()
+            self._sasl_state.clear()
+            self._auth_buffer = ""
+            self._network_announced = False
+            self._current_msg_tags = {}
+            self._chathistory_cap = ""
+            self._current_batch_is_replay = False
+            self._label_seq = 0
+            self._pending_labels.clear()
+            self._whox_seq = 1
+            self._whox_tokens.clear()
+            keepalive_task: Optional[asyncio.Task] = None
+            writer_task:    Optional[asyncio.Task] = None
+            try:
+                await self.connect()
+                attempt = 0
+                keepalive_task = asyncio.create_task(self.keepalive())
+                writer_task    = asyncio.create_task(self._run_writer())
+                await self.handle_incoming()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                await self.ui_queue.put(("status", f"Connection error: {e}"))
+            finally:
+                # Cancel background tasks and drain any leftover sends
+                for task in (keepalive_task, writer_task):
+                    if task and not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                while not self._send_queue.empty():
+                    try:
+                        self._send_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                # Ensure the writer is closed so the OS releases the socket fd
+                if self.writer:
+                    try:
+                        if not self.writer.is_closing():
+                            self.writer.close()
+                        await asyncio.wait_for(self.writer.wait_closed(), timeout=2.0)
+                    except Exception:
+                        pass
+                    self.writer = None
+                    self.reader = None
+
+            if not self.running:
+                break
+
+            delay = DELAYS[min(attempt, len(DELAYS) - 1)]
+            attempt += 1
+            await self.ui_queue.put(("status", f"Reconnecting in {delay}s... (attempt {attempt})"))
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                break
+
+    async def handle_incoming(self) -> None:
+        # No per-readline wait_for: keepalive() detects dead TCP connections within
+        # PONG_TIMEOUT (120 s) and calls writer.close(), which feeds EOF to the reader
+        # and unblocks readline().  Removing wait_for eliminates one Task allocation
+        # per received line — measurable on busy channels with hundreds of messages/min.
+        try:
+            while self.running:
+                line = await self.reader.readline()
+                if not line:
+                    await self.ui_queue.put(("status", "Server closed the connection"))
+                    break
+                text = line.decode("utf-8", "ignore").rstrip("\r\n")
+                if text:
+                    try:
+                        await self.process_line(text)
+                    except Exception as _line_exc:
+                        await self.ui_queue.put(("status", f"[err] line handler: {_line_exc}"))
+        except Exception as e:
+            await self.ui_queue.put(("status", f"Read error: {e}"))
+        finally:
+            if self.writer:
+                try:
+                    self.writer.close()
+                except Exception:
+                    pass
+            await self.ui_queue.put(("status", "Disconnected from IRC"))
+
+    @staticmethod
+    def _parse_irc_line(raw: str):
+        """Parse a raw IRC line (including IRCv3 message-tag prefix).
+
+        Returns (cmd, nick, params, prefix, tags) where:
+          cmd    – upper-cased command string
+          nick   – nick extracted from prefix (or server name if no '!')
+          params – list of parameters; trailing (after ' :') is the last element
+          prefix – raw prefix string (needed for NOTICE '!' check)
+          tags   – dict of IRCv3 message tags (empty dict if none present)
+        Returns None if the line cannot be parsed.
+
+        IRCv3 tagged lines look like:
+          @time=2024-01-01T12:00:00.000Z;msgid=abc :nick!u@h PRIVMSG #ch :text
+        Without this handling, any server that sends server-time would have ALL
+        its messages silently dropped since the '@' breaks the ':' prefix check.
+        """
+        if not raw:
+            return None
+        # --- IRCv3 message tags (RFC; section 3.3) ---
+        tags: dict = {}
+        if raw.startswith("@"):
+            try:
+                tag_str, raw = raw[1:].split(" ", 1)
+            except ValueError:
+                return None
+            for t in tag_str.split(";"):
+                if not t:
+                    continue
+                if "=" in t:
+                    k, v = t.split("=", 1)
+                    # Unescape IRCv3 tag escape sequences in a single
+                    # left-to-right pass. A chain of .replace() calls
+                    # is order-dependent and can re-decode the bytes
+                    # produced by an earlier replacement (e.g. an input
+                    # containing \\: would be mis-decoded).
+                    # Per IRCv3:
+                    #     \: → ;   \s → space   \\ → \
+                    #     \r → CR  \n → LF
+                    #     unknown \X → X (drop the backslash)
+                    #     trailing lone \ → dropped
+                    _out: list = []
+                    _it = iter(v)
+                    for _c in _it:
+                        if _c == "\\":
+                            _n = next(_it, "")
+                            if   _n == ":":  _out.append(";")
+                            elif _n == "s":  _out.append(" ")
+                            elif _n == "\\": _out.append("\\")
+                            elif _n == "r":  _out.append("\r")
+                            elif _n == "n":  _out.append("\n")
+                            elif _n == "":   pass  # trailing \ — drop
+                            else:             _out.append(_n)
+                        else:
+                            _out.append(_c)
+                    v = "".join(_out)
+                    tags[k] = v
+                else:
+                    tags[t] = ""
+        # --- standard prefix / command / params ---
+        prefix = ""
+        trailing = None
+        if raw.startswith(":"):
+            try:
+                prefix, raw = raw[1:].split(" ", 1)
+            except ValueError:
+                return None
+        if " :" in raw:
+            args, trailing = raw.split(" :", 1)
+            parts = args.split()
+        else:
+            parts = raw.split()
+        if not parts:
+            return None
+        cmd = parts[0].upper()
+        params: List[str] = parts[1:]
+        if trailing is not None:
+            params.append(trailing)
+        nick = prefix.split("!")[0] if "!" in prefix else prefix
+        return cmd, nick, params, prefix, tags
+
+    async def process_line(self, line: str) -> None:
+        parsed = self._parse_irc_line(line)
+        if parsed is None:
+            return
+        cmd, nick, params, prefix, tags = parsed
+        self._current_msg_tags = tags
+        # If this line carries a batch tag (and we're tracking that batch),
+        # buffer it for later bulk dispatch instead of dispatching immediately.
+        # BATCH itself is never buffered — it controls the batch lifecycle.
+        if cmd != "BATCH":
+            batch_ref = tags.get("batch")
+            if batch_ref and batch_ref in self._batch_buffer:
+                self._batch_buffer[batch_ref].append((cmd, nick, params, prefix, tags))
+                return
+        handler = self._irc_handlers.get(cmd)
+        if handler:
+            await handler(nick, params, prefix)
+        elif cmd not in _SILENT_NUMERICS:
+            if cmd in _SERVER_INFO:
+                await self.ui_queue.put(("status", f"{cmd} {' '.join(params)}"))
+
+    # ── IRC command handlers ──────────────────────────────────────────────────
+
+    async def _irc_ping(self, nick, params, prefix):
+        self.send_raw(f"PONG :{params[0] if params else 'keepalive'}")
+
+    async def _irc_pong(self, nick, params, prefix):
+        self._last_pong = time.monotonic()
+
+    # Capabilities we request whenever the server offers them.
+    _WANT_CAPS = (
+        "away-notify", "multi-prefix", "account-notify", "extended-join",
+        "chghost", "server-time", "echo-message", "userhost-in-names",
+        "message-tags", "batch", "labeled-response", "invite-notify",
+        "account-tag", "standard-replies", "setname",
+        "chathistory", "draft/chathistory",
+        "draft/multiline", "draft/format",
+        "message-redaction", "read-marker",
+        "draft/account-registration",
+    )
+
+    async def _irc_cap(self, nick, params, prefix):
+        subcmd = params[1].upper() if len(params) > 1 else ""
+        if subcmd == "LS":
+            # CAP LS 302 sends caps across multiple lines; "*" means more coming.
+            # Preserve cap values (e.g. sts=port=6697,duration=3600).
+            more_coming = len(params) > 2 and params[2] == "*"
+            for raw_cap in (params[-1] if params else "").split():
+                if "=" in raw_cap:
+                    cname, cval = raw_cap.split("=", 1)
+                else:
+                    cname, cval = raw_cap, ""
+                cname = cname.lower()
+                self._cap_ls_caps.add(cname)
+                if cval:
+                    self._cap_ls_values[cname] = cval
+            if not more_coming:
+                if "sts" in self._cap_ls_values and not self.use_ssl:
+                    self._handle_sts(self._cap_ls_values["sts"])
+                if "chathistory" in self._cap_ls_caps:
+                    self._chathistory_cap = "chathistory"
+                elif "draft/chathistory" in self._cap_ls_caps:
+                    self._chathistory_cap = "draft/chathistory"
+                want = [c for c in self._WANT_CAPS if c in self._cap_ls_caps]
+                # If both std and draft chathistory are advertised, ask
+                # for only the std one — some servers NAK requests that
+                # name both variants.
+                if "chathistory" in want and "draft/chathistory" in want:
+                    want.remove("draft/chathistory")
+                _sasl_creds_ok = (
+                    SASL_MECHANISM == "EXTERNAL"
+                        and bool(SASL_CERT and SASL_KEY)
+                    or SASL_MECHANISM == "ECDSA-NIST256P-CHALLENGE"
+                        and bool(SASL_KEY)
+                    or bool(NICKSERV_PASSWORD)
+                )
+                if "sasl" in self._cap_ls_caps and _sasl_creds_ok:
+                    want.append("sasl")
+                self.send_raw(f"CAP REQ :{' '.join(want)}" if want else "CAP END")
+                self._cap_ls_caps.clear()
+        elif subcmd == "ACK":
+            acked = set((params[-1] if params else "").lower().split())
+            self._active_caps |= acked
+            if "sasl" in acked:
+                self.send_raw(f"AUTHENTICATE {SASL_MECHANISM}")
+            else:
+                self.send_raw("CAP END")
+        elif subcmd == "NAK":
+            # Server rejected a batched REQ. Retry each cap
+            # individually so we still get whichever subset the
+            # server actually supports. Only when the retry queue
+            # drains do we fall through to CAP END (and only if
+            # SASL is not still in flight — its numeric handlers
+            # own CAP END themselves).
+            nak_caps = (params[-1] if params else "").lower().split()
+            if len(nak_caps) > 1:
+                self._cap_req_queue.extend(nak_caps)
+            self._flush_cap_req_queue()
+        elif subcmd == "NEW":
+            # Dynamic cap announcement — request any we want that we don't have yet.
+            new_avail: dict = {}
+            for raw_cap in (params[-1] if params else "").split():
+                if "=" in raw_cap:
+                    cname, cval = raw_cap.split("=", 1)
+                else:
+                    cname, cval = raw_cap, ""
+                new_avail[cname.lower()] = cval
+                if cval:
+                    self._cap_ls_values[cname.lower()] = cval
+            if "sts" in new_avail and not self.use_ssl:
+                self._handle_sts(new_avail["sts"])
+            want = [c for c in self._WANT_CAPS
+                    if c in new_avail and c not in self._active_caps]
+            if want:
+                self.send_raw(f"CAP REQ :{' '.join(want)}")
+        elif subcmd == "DEL":
+            removed = {c.lower() for c in (params[-1] if params else "").split()}
+            self._active_caps -= removed
+            await self.ui_queue.put(("status", f"[cap] server withdrew: {' '.join(removed)}"))
+
+    # ------------------------------------------------------------------
+    # SASL helpers
+    # ------------------------------------------------------------------
+
+    def _send_authenticate(self, payload: str) -> None:
+        """Send AUTHENTICATE with 400-char chunking per IRCv3 SASL spec."""
+        if not payload:
+            self.send_raw("AUTHENTICATE +")
+            return
+        for i in range(0, len(payload), 400):
+            self.send_raw(f"AUTHENTICATE {payload[i:i+400]}")
+        if len(payload) % 400 == 0:
+            # Exact multiple — trailing empty chunk signals end of message.
+            self.send_raw("AUTHENTICATE +")
+
+    async def _sasl_plain(self, _challenge: str) -> None:
+        payload = base64.b64encode(
+            f"{self.nick}\0{self.nick}\0{NICKSERV_PASSWORD}".encode("utf-8")
+        ).decode()
+        self._send_authenticate(payload)
+
+    async def _sasl_external(self, _challenge: str) -> None:
+        # Empty authzid — server derives identity from TLS client-cert CN/SAN.
+        self._send_authenticate("")
+
+    async def _sasl_scram_sha256(self, server_data: str) -> None:
+        """SCRAM-SHA-256 (RFC 5802) state machine."""
+        step = self._sasl_state.get("step", 0)
+
+        if step == 0 and not NICKSERV_PASSWORD:
+            await self.ui_queue.put((
+                "status",
+                "[SASL] SCRAM-SHA-256 requires IRC_NICKSERV_PASSWORD — aborting"))
+            self.send_raw("AUTHENTICATE *")
+            self._sasl_state = {}
+            return
+
+        if step == 0:
+            # Server sent "+" — begin exchange with client-first-message.
+            cnonce = base64.b64encode(os.urandom(18)).decode()
+            # Escape '=' → '=3D' and ',' → '=2C' in username per spec.
+            safe_nick = self.nick.replace("=", "=3D").replace(",", "=2C")
+            cfm_bare = f"n={safe_nick},r={cnonce}"
+            cfm = f"n,,{cfm_bare}"
+            self._sasl_state = {"step": 1, "cnonce": cnonce, "cfm_bare": cfm_bare}
+            self._send_authenticate(base64.b64encode(cfm.encode("utf-8")).decode())
+
+        elif step == 1:
+            # Server sent server-first-message: r=…,s=…,i=…
+            if not server_data:
+                await self.ui_queue.put(("status", "[SASL] SCRAM: empty server-first — aborting"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+            sfm = base64.b64decode(server_data).decode("utf-8")
+            sfm_parts: dict = {}
+            for part in sfm.split(","):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    sfm_parts[k] = v
+
+            r = sfm_parts.get("r", "")
+            s = sfm_parts.get("s", "")
+            i_str = sfm_parts.get("i", "4096")
+            cnonce = self._sasl_state["cnonce"]
+
+            if not r.startswith(cnonce):
+                await self.ui_queue.put(("status", "[SASL] SCRAM: server nonce mismatch — aborting"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+
+            salt = base64.b64decode(s)
+            iterations = int(i_str)
+            pw = NICKSERV_PASSWORD.encode("utf-8")
+
+            salted_pw   = hashlib.pbkdf2_hmac("sha256", pw, salt, iterations)
+            client_key  = hmac.new(salted_pw, b"Client Key", hashlib.sha256).digest()
+            stored_key  = hashlib.sha256(client_key).digest()
+            server_key  = hmac.new(salted_pw, b"Server Key", hashlib.sha256).digest()
+
+            # GS2 header for no channel binding: "n,," → base64 = "biws"
+            cb = base64.b64encode(b"n,,").decode()
+            cfw_noproof = f"c={cb},r={r}"
+            auth_message = f"{self._sasl_state['cfm_bare']},{sfm},{cfw_noproof}"
+
+            client_sig   = hmac.new(stored_key, auth_message.encode("utf-8"), hashlib.sha256).digest()
+            client_proof = bytes(a ^ b for a, b in zip(client_key, client_sig))
+            server_sig   = hmac.new(server_key, auth_message.encode("utf-8"), hashlib.sha256).digest()
+
+            cfm_final = f"{cfw_noproof},p={base64.b64encode(client_proof).decode()}"
+            self._sasl_state = {
+                "step": 2,
+                "expected_server_sig": base64.b64encode(server_sig).decode(),
+            }
+            self._send_authenticate(base64.b64encode(cfm_final.encode("utf-8")).decode())
+
+        elif step == 2:
+            # Server-final-message (optional — server may go straight to 903).
+            if server_data:
+                try:
+                    sfinal = base64.b64decode(server_data).decode("utf-8")
+                    for part in sfinal.split(","):
+                        if part.startswith("v="):
+                            expected = self._sasl_state.get("expected_server_sig", "")
+                            if part[2:] != expected:
+                                await self.ui_queue.put(
+                                    ("status", "[SASL] SCRAM: server signature mismatch (MITM?)"))
+                            break
+                except Exception:
+                    pass
+            self._sasl_state = {}
+
+    async def _sasl_ecdsa(self, server_data: str) -> None:
+        """ECDSA-NIST256P-CHALLENGE state machine."""
+        step = self._sasl_state.get("step", 0)
+
+        if step == 0:
+            # Server sent "+" — send account name (nick).
+            self._sasl_state = {"step": 1}
+            self._send_authenticate(base64.b64encode(self.nick.encode("utf-8")).decode())
+
+        elif step == 1:
+            # Server sent the challenge to sign.
+            if not server_data:
+                await self.ui_queue.put(("status", "[SASL] ECDSA: empty challenge — aborting"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+            if not CRYPTOGRAPHY_AVAILABLE:
+                await self.ui_queue.put((
+                    "status",
+                    "[SASL] ECDSA requires the 'cryptography' package — pip install cryptography",
+                ))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+            if not SASL_KEY:
+                await self.ui_queue.put(("status", "[SASL] ECDSA: IRC_SASL_KEY not set — aborting"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+                return
+            try:
+                challenge_bytes = base64.b64decode(server_data)
+                with open(SASL_KEY, "rb") as _kf:
+                    private_key = _load_pem_private_key(_kf.read(), password=None)
+                # sign() hashes with SHA-256 internally before signing.
+                sig = private_key.sign(challenge_bytes, _ecdsa_ec.ECDSA(_ecdsa_hashes.SHA256()))
+                self._send_authenticate(base64.b64encode(sig).decode())
+                self._sasl_state = {}
+            except Exception as exc:
+                await self.ui_queue.put(("status", f"[SASL] ECDSA signing failed: {exc}"))
+                self.send_raw("AUTHENTICATE *")
+                self._sasl_state = {}
+
+    async def _irc_authenticate(self, nick, params, prefix):
+        chunk = params[0] if params else "+"
+        # IRCv3 SASL: each chunk is ≤ 400 chars of base64; accumulate until
+        # we get a short chunk (or "+").  "+" alone means empty payload.
+        if len(chunk) == 400:
+            self._auth_buffer += chunk
+            return
+        server_data = self._auth_buffer + ("" if chunk == "+" else chunk)
+        self._auth_buffer = ""
+
+        mech = SASL_MECHANISM
+        if mech == "PLAIN":
+            await self._sasl_plain(server_data)
+        elif mech == "EXTERNAL":
+            await self._sasl_external(server_data)
+        elif mech == "SCRAM-SHA-256":
+            await self._sasl_scram_sha256(server_data)
+        elif mech == "ECDSA-NIST256P-CHALLENGE":
+            await self._sasl_ecdsa(server_data)
+        else:
+            await self.ui_queue.put(("status", f"[SASL] Unknown mechanism '{mech}' — aborting"))
+            self.send_raw("AUTHENTICATE *")
+
+    async def _irc_sasl_ok(self, nick, params, prefix):  # 903
+        await self.ui_queue.put(("status", "SASL authentication successful — ident set"))
+        self._identified = True
+        self.send_raw("CAP END")
+
+    async def _irc_sasl_fail(self, nick, params, prefix):  # 904
+        await self.ui_queue.put(("status", "SASL authentication failed — falling back to NickServ"))
+        # Abort the SASL session cleanly before ending CAP.
+        self.send_raw("AUTHENTICATE *")
+        self.send_raw("CAP END")
+
+    def _irc_lower(self, s: str) -> str:
+        r"""Casefold *s* per the server's CASEMAPPING ISUPPORT token.
+
+        The default is rfc1459, which folds {|}~ to []\^ in addition
+        to ASCII case. This matters for nick/channel equality checks:
+        plain str.lower() would treat 'Foo[' and 'foo{' as different.
+        """
+        mapping = self._isupport.get("CASEMAPPING", "rfc1459")
+        s = s.lower()
+        if mapping == "ascii":
+            return s
+        if mapping == "strict-rfc1459":
+            return s.translate(str.maketrans(r"\[]", r"|{}"))
+        # rfc1459 (default)
+        return s.translate(str.maketrans("[\\]^", "{|}~"))
+
+    def _flush_cap_req_queue(self) -> None:
+        """Pop the next queued single-cap REQ, or send CAP END.
+
+        Used after CAP NAK to retry caps one at a time. SASL is
+        deliberately *not* flushed here: when SASL is in flight
+        the SASL numeric handlers (903/904) own CAP END, and we
+        must not race them.
+        """
+        if self._cap_req_queue:
+            cap = self._cap_req_queue.pop(0)
+            self.send_raw(f"CAP REQ :{cap}")
+        elif "sasl" not in self._active_caps:
+            self.send_raw("CAP END")
+
+    def _handle_sts(self, sts_value: str) -> None:
+        """Parse Strict Transport Security CAP value and warn if TLS upgrade needed.
+
+        Per IRCv3 STS:
+          • duration=0 → server is *revoking* its policy. No warning.
+          • port must be a valid TCP port number; ignore garbage.
+        """
+        params: dict = {}
+        for part in sts_value.split(","):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                params[k] = v
+            else:
+                params[part] = ""
+        # Validate port — fall back to the IRC TLS default if missing/garbage.
+        port_str = params.get("port", "6697")
+        try:
+            port_int = int(port_str)
+            if not (1 <= port_int <= 65535):
+                raise ValueError
+            port = str(port_int)
+        except (TypeError, ValueError):
+            port = "6697"
+        # Validate duration — treat malformed as 0 (revoke).
+        try:
+            duration_int = int(params.get("duration", "0") or "0")
+        except (TypeError, ValueError):
+            duration_int = 0
+        if duration_int <= 0:
+            # Server is revoking its STS policy. Nothing to warn about.
+            return
+        preload = "preload" in params
+        msg = (f"[STS] Server requires TLS — reconnect with SSL on port {port} "
+               f"(policy duration={duration_int}s{', preload' if preload else ''}). "
+               f"Use /server {self.server} {port} ssl to upgrade.")
+        try:
+            self.ui_queue.put_nowait(("status", msg))
+        except Exception:
+            pass
+
+    def send_tagged(self, tags: dict, line: str) -> None:
+        """Prepend IRCv3 message tags to *line* when message-tags cap is active."""
+        if tags and "message-tags" in self._active_caps:
+            def _esc(v: str) -> str:
+                return (v.replace("\\", "\\\\").replace(";", "\\:")
+                          .replace(" ", "\\s").replace("\r", "\\r")
+                          .replace("\n", "\\n"))
+            tag_str = ";".join(
+                f"{k}={_esc(str(v))}" if v else k for k, v in tags.items()
+            )
+            self.send_raw(f"@{tag_str} {line}")
+        else:
+            self.send_raw(line)
+
+    def _next_label(self) -> str:
+        """Generate a unique label for labeled-response."""
+        self._label_seq += 1
+        return f"eyrc-{self._label_seq}"
+
+    async def _irc_logged_in(self, nick, params, prefix):  # 900
+        account = params[2] if len(params) > 2 else "?"
+        await self.ui_queue.put(("status", f"Logged in as {account}"))
+
+    async def _irc_welcome(self, nick, params, prefix):  # 001
+        await self.ui_queue.put(("clear_users",))
+        await self.ui_queue.put(("status", "Successfully logged in to IRC"))
+        if not self._identified and NICKSERV_PASSWORD:
+            asyncio.create_task(self._delayed_nickserv_identify())
+        for ch in sorted(self.joined_channels):
+            self.send_raw(f"JOIN {ch}")
+            await self.ui_queue.put(("status", f"Joining {ch}..."))
+        for ch in sorted(_AUTOJOIN_CHANNELS):
+            if self._irc_lower(ch) not in (self._irc_lower(c) for c in self.joined_channels):
+                self.send_raw(f"JOIN {ch}")
+                await self.ui_queue.put(("status", f"Joining {ch}..."))
+        if not self.current_channel and DEFAULT_CHANNEL:
+            self.current_channel = DEFAULT_CHANNEL
+
+    async def _irc_join(self, nick, params, prefix):
+        if not params:
+            return
+        channel = params[0]
+        await self.ui_queue.put(("join", nick, channel))
+        if nick == self.nick:
+            await self.ui_queue.put(("self_join", channel))
+
+    async def _irc_part(self, nick, params, prefix):
+        if params:
+            await self.ui_queue.put(("part", nick, params[0]))
+
+    async def _irc_kick(self, nick, params, prefix):
+        if params:
+            reason = params[-1] if len(params) > 2 else ""
+            await self.ui_queue.put(("kick", nick, params[0],
+                                     params[1] if len(params) > 1 else "", reason))
+
+    async def _irc_topic_cmd(self, nick, params, prefix):
+        if params:
+            await self.ui_queue.put(("topic", params[0], params[-1] if len(params) > 1 else ""))
+
+    async def _irc_mode(self, nick, params, prefix):
+        await self.ui_queue.put(("mode", nick, params))
+
+    async def _irc_whois_reply(self, cmd_key: str, nick, params, prefix):
+        w = params[1] if len(params) > 1 else "?"
+        if cmd_key == "311" and len(params) >= 5:
+            user, host = params[2], params[3]
+            real = params[5] if len(params) > 5 else ""
+            text = f"[whois] {w}  ({user}@{host})  \"{real}\""
+        elif cmd_key == "312" and len(params) >= 3:
+            srv  = params[2]
+            info = params[3] if len(params) > 3 else ""
+            text = f"[whois] {w}  server: {srv}" + (f" — {info}" if info else "")
+        elif cmd_key == "313":
+            text = f"[whois] {w}  is an IRC operator"
+        elif cmd_key == "317" and len(params) >= 3:
+            try:
+                secs = int(params[2])
+                parts_idle = []
+                if secs >= 3600:
+                    parts_idle.append(f"{secs // 3600}h")
+                parts_idle.append(f"{(secs % 3600) // 60}m {secs % 60}s")
+                idle_str = " ".join(parts_idle)
+            except ValueError:
+                idle_str = params[2]
+            sign_str = ""
+            if len(params) > 3 and params[3].isdigit():
+                sign_str = "  signed on: " + time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(int(params[3])))
+            text = f"[whois] {w}  idle: {idle_str}{sign_str}"
+        elif cmd_key == "318":
+            text = f"[whois] ── end of whois for {w} ──"
+        elif cmd_key == "319" and len(params) >= 3:
+            text = f"[whois] {w}  channels: {params[2]}"
+        elif cmd_key == "307":
+            text = f"[whois] {w}  is a registered nick"
+        elif cmd_key == "330" and len(params) >= 3:
+            text = f"[whois] {w}  logged in as: {params[2]}"
+        elif cmd_key == "671":
+            text = f"[whois] {w}  is using a secure connection (SSL/TLS)"
+        else:
+            text = f"[whois] {' '.join(params[1:])}"
+        await self.ui_queue.put(("whois", text))
+
+    async def _irc_privmsg(self, nick, params, prefix):
+        if len(params) < 2:
+            return
+        tags = self._current_msg_tags
+        # labeled-response: if the echo carries a label we sent, discard it cleanly.
+        label = tags.get("label", "")
+        if label and label in self._pending_labels:
+            self._pending_labels.discard(label)
+            return
+        # Fallback nick-based echo dedup (when labeled-response not negotiated).
+        if (self._irc_lower(nick) == self._irc_lower(self.nick)
+                and not self._current_batch_is_replay):
+            return
+        target = params[0]
+        msg    = params[1]
+        # server-time: prefer server-provided timestamp over local clock
+        ts_str = _parse_server_time(tags["time"]) if "time" in tags else None
+        # account-tag: sender's services account (if server advertises it)
+        account  = tags.get("account", "")
+        msgid    = tags.get("msgid", "")
+        reply_to = tags.get("+reply", "")
+        is_replay = self._current_batch_is_replay
+
+        # ACTION must be checked before the generic CTCP block — both use \x01
+        # wrappers and falling into the CTCP branch silently drops /me lines.
+        is_action = msg.startswith("\x01ACTION ") and msg.endswith("\x01")
+        if is_action:
+            msg = msg[len("\x01ACTION "):-1]
+        elif msg.startswith("\x01") and msg.endswith("\x01"):
+            # Generic CTCP request
+            ctcp = msg[1:-1].split(" ", 1)
+            ctcp_cmd  = ctcp[0].upper()
+            ctcp_args = ctcp[1] if len(ctcp) > 1 else ""
+            if not self._ctcp_allowed(nick):
+                return
+            if ctcp_cmd == "PING":
+                safe_args = ctcp_args.replace("\x01", "")[:100]
+                self.send_raw(f"NOTICE {nick} :\x01PING {safe_args}\x01")
+            elif ctcp_cmd == "VERSION":
+                self.send_raw(f"NOTICE {nick} :\x01VERSION eyearesee IRC client v3.0\x01")
+                await self.ui_queue.put(("status", f"-!- CTCP VERSION from {nick}"))
+            elif ctcp_cmd == "TIME":
+                self.send_raw(
+                    f"NOTICE {nick} :\x01TIME "
+                    f"{time.strftime('%a, %d %b %Y %H:%M:%S %Z', time.localtime())}\x01")
+                await self.ui_queue.put(("status", f"-!- CTCP TIME from {nick}"))
+            elif ctcp_cmd == "CLIENTINFO":
+                self.send_raw(
+                    f"NOTICE {nick} :\x01CLIENTINFO "
+                    f"PING VERSION TIME CLIENTINFO USERINFO SOURCE FINGER\x01")
+            elif ctcp_cmd == "USERINFO":
+                self.send_raw(f"NOTICE {nick} :\x01USERINFO {self.nick} is using eyearesee\x01")
+            elif ctcp_cmd == "SOURCE":
+                self.send_raw(f"NOTICE {nick} :\x01SOURCE https://github.com (custom eyearesee)\x01")
+            elif ctcp_cmd == "FINGER":
+                self.send_raw(f"NOTICE {nick} :\x01FINGER No finger info\x01")
+            return  # CTCP — never treat as normal message
+
+        if nick not in self.users:
+            u = UserState(nick)
+            if nick in _NICK_AI_HISTORY:
+                u.seed_ai_history(_NICK_AI_HISTORY[nick])
+            self.users[nick] = u
+        u_state = self.users[nick]
+        u_score = self.scoring.score_user(u_state)
+        m_score = self.scoring.score_message(None, u_state)
+        # Display immediately with a placeholder AI score (0); a background task
+        # scores the message and sends an "ai_score" update once ML inference finishes.
+        # Extra fields: ts_str (server-time or None), account (account-tag or ""),
+        #               is_replay (True when delivered inside a chathistory batch).
+        await self.ui_queue.put(("msg", nick, target, msg, u_score, m_score, 0, 0,
+                                 is_action, ts_str, account, is_replay, msgid, reply_to))
+        if is_replay:
+            return  # don't score replayed history; it's already been seen
+        _t = asyncio.create_task(self._score_msg_bg(nick, target, msg, u_state, u_score, m_score))
+        self._bg_tasks.add(_t)
+        _t.add_done_callback(self._bg_tasks.discard)
+
+    async def _irc_nick_change(self, nick, params, prefix):
+        new_nick = params[0] if params else ""
+        if nick == self.nick:
+            self.nick = new_nick
+            # If we reclaimed our desired nick, stop the recovery loop.
+            if new_nick == self._desired_nick:
+                if self._nick_reclaim_task and not self._nick_reclaim_task.done():
+                    self._nick_reclaim_task.cancel()
+                    await self.ui_queue.put(("status", f"Reclaimed nick {new_nick}"))
+        await self.ui_queue.put(("nick_change", nick, new_nick))
+
+    async def _irc_notice(self, nick, params, prefix):
+        text = params[-1] if params else ""
+        if "!" in prefix:  # user NOTICE (not server)
+            target = params[0] if params else self.nick
+            display_target = target if target.startswith("#") else "*status*"
+            await self.ui_queue.put(("notice", nick, display_target, text))
+        else:
+            await self.ui_queue.put(("status", f"NOTICE {text}"))
+
+    async def _irc_quit(self, nick, params, prefix):
+        self.users.pop(nick, None)
+        reason = params[-1] if params else ""
+        await self.ui_queue.put(("quit", nick, reason))
+
+    async def _irc_names(self, nick, params, prefix):  # 353 RPL_NAMREPLY
+        if len(params) < 4:
+            return
+        channel = params[2]
+        prefix_isup = self._isupport.get("PREFIX", "(qaohv)~&@%+")
+        prefix_chars = prefix_isup.split(")", 1)[1] if ")" in prefix_isup else "@+%&~!"
+        pairs = []
+        for entry in params[3].split():
+            bare = entry.lstrip(prefix_chars)
+            if "!" in bare:
+                bare = bare.split("!", 1)[0]
+            if bare:
+                mode_char = entry[0] if entry and entry[0] in prefix_chars else ""
+                pairs.append(f"{mode_char}{bare}")
+        await self.ui_queue.put(("names", channel, " ".join(pairs)))
+
+    async def _irc_who_reply(self, nick, params, prefix):  # 352/314
+        await self.ui_queue.put(("status", f"{params[0] if params else ''} {' '.join(params[1:])}"))
+
+    async def _irc_away_reply(self, nick, params, prefix):  # 301
+        await self.ui_queue.put(("status", f"Away: {' '.join(params[1:])}"))
+
+    async def _irc_chanmode(self, nick, params, prefix):  # 324 RPL_CHANNELMODEIS
+        if len(params) >= 3:
+            channel = params[1]
+            modestr = params[2]
+            mode_args = params[3:]
+            await self.ui_queue.put(("chanmode", channel, modestr, mode_args))
+
+    async def _irc_topic_reply(self, nick, params, prefix):  # 332
+        channel = params[1] if len(params) > 1 else ""
+        topic   = params[-1] if len(params) > 2 else ""
+        await self.ui_queue.put(("topic", channel, topic))
+
+    async def _irc_no_topic(self, nick, params, prefix):  # 331
+        channel = params[1] if len(params) > 1 else ""
+        await self.ui_queue.put(("status", f"No topic set for {channel}"))
+
+    async def _irc_nick_in_use(self, nick, params, prefix):  # 433
+        # During registration: append underscore and retry.
+        # After registration: server rejected a NICK change — just report it.
+        if not self._identified:
+            self.nick = (self.nick + "_")[:30]
+            self.send_raw(f"NICK {self.nick}")
+            await self.ui_queue.put(("status", f"Nickname in use — trying {self.nick}"))
+            # Start a background loop that periodically tries to reclaim the
+            # original nick.  Only start one; cancel any stale previous one.
+            if self._nick_reclaim_task and not self._nick_reclaim_task.done():
+                self._nick_reclaim_task.cancel()
+            self._nick_reclaim_task = asyncio.create_task(self._nick_reclaim_loop())
+        else:
+            wanted = params[1] if len(params) > 1 else "?"
+            await self.ui_queue.put(("status", f"Nickname {wanted} is already in use"))
+
+    async def _irc_bad_nick(self, nick, params, prefix):  # 432
+        bad = params[1] if len(params) > 1 else "?"
+        await self.ui_queue.put(("status", f"Erroneous nickname rejected by server: {bad}"))
+
+    async def _irc_join_error(self, nick, params, prefix):  # 471/473/474/475/477/489
+        channel = params[1] if len(params) > 1 else ""
+        text    = params[-1] if len(params) > 2 else ""
+        await self.ui_queue.put(("join_error", channel, f"Cannot join {channel}: {text}"))
+
+    async def _irc_away_notify(self, nick, params, prefix):  # AWAY cap
+        reason = params[-1] if params else ""
+        if reason:
+            await self.ui_queue.put(("status", f"* {nick} is away: {reason}"))
+        else:
+            await self.ui_queue.put(("status", f"* {nick} is back"))
+
+    async def _irc_chghost(self, nick, params, prefix):
+        new_user = params[0] if params else ""
+        new_host = params[1] if len(params) > 1 else ""
+        await self.ui_queue.put(("status", f"* {nick} changed host to {new_user}@{new_host}"))
+
+    async def _irc_account(self, nick, params, prefix):
+        account = params[0] if params else "*"
+        # Persist on the UserState (creating one if we haven't seen
+        # this nick before) so account-tag consumers elsewhere see
+        # a consistent value. setattr keeps us forward-compatible
+        # even if UserState doesn't yet declare `account`.
+        u = self.users.get(nick)
+        if u is None:
+            u = UserState(nick)
+            self.users[nick] = u
+        try:
+            u.account = "" if account == "*" else account
+        except Exception:
+            pass  # __slots__ without `account` — ignore
+        if account == "*":
+            await self.ui_queue.put(("status", f"* {nick} logged out of services"))
+        else:
+            await self.ui_queue.put(("status", f"* {nick} is identified as {account}"))
+
+    async def _irc_setname(self, nick, params, prefix):
+        realname = params[0] if params else ""
+        await self.ui_queue.put(("status", f"* {nick} changed real name to: {realname}"))
+
+    async def _irc_batch(self, nick, params, prefix):
+        if not params:
+            return
+        ref_dir = params[0]
+        if ref_dir.startswith("+"):
+            ref = ref_dir[1:]
+            self._batch_buffer[ref] = []
+            self._batch_types[ref] = params[1] if len(params) > 1 else ""
+            self._batch_params[ref] = params  # save full params for multiline target
+        elif ref_dir.startswith("-"):
+            ref = ref_dir[1:]
+            buffered   = self._batch_buffer.pop(ref, [])
+            batch_type = self._batch_types.pop(ref, "")
+            open_params = self._batch_params.pop(ref, [])
+            # draft/multiline: combine lines into a single message
+            if batch_type == "draft/multiline":
+                await self._handle_multiline_batch(buffered, open_params)
+                return
+            is_replay = batch_type in ("chathistory", "draft/chathistory")
+            prev_replay = self._current_batch_is_replay
+            self._current_batch_is_replay = is_replay
+            try:
+                for bcmd, bnick, bparams, bprefix, btags in buffered:
+                    handler = self._irc_handlers.get(bcmd)
+                    if handler:
+                        self._current_msg_tags = btags
+                        try:
+                            await handler(bnick, bparams, bprefix)
+                        except Exception as _batch_exc:
+                            await self.ui_queue.put(
+                                ("status", f"[err] batch {bcmd}: {_batch_exc}"))
+            finally:
+                self._current_batch_is_replay = prev_replay
+                self._current_msg_tags = {}
+
+    async def _handle_multiline_batch(self, buffered: list, open_params: list) -> None:
+        """Combine draft/multiline batch lines into a single PRIVMSG dispatch."""
+        target = open_params[2] if len(open_params) > 2 else ""
+        if not target or not buffered:
+            return
+        combined: list = []
+        first_tags: dict = {}
+        first_nick: str = ""
+        for bcmd, bnick, bparams, bprefix, btags in buffered:
+            if bcmd != "PRIVMSG":
+                continue
+            if not first_nick:
+                first_nick = bnick
+                first_tags = btags
+            line_text = bparams[1] if len(bparams) > 1 else ""
+            concat = "draft/multiline-concat" in btags
+            if combined and not concat:
+                combined.append("\n")
+            combined.append(line_text)
+        if not combined or not first_nick:
+            return
+        combined_text = "".join(combined)
+        prev_tags = self._current_msg_tags
+        self._current_msg_tags = first_tags
+        try:
+            await self._irc_privmsg(first_nick, [target, combined_text], "")
+        finally:
+            self._current_msg_tags = prev_tags
+
+    async def _irc_redact(self, nick, params, prefix):
+        """Handle incoming REDACT command (message-redaction CAP)."""
+        if len(params) < 2:
+            return
+        target = params[0]
+        msgid  = params[1]
+        reason = params[2] if len(params) > 2 else ""
+        await self.ui_queue.put(("redact", nick, target, msgid, reason))
+
+    async def _irc_markread(self, nick, params, prefix):
+        """Handle incoming MARKREAD response (read-marker CAP)."""
+        if len(params) < 2:
+            return
+        target = params[0]
+        ts_arg = params[1]  # e.g. "timestamp=2024-01-15T14:30:00.000Z"
+        await self.ui_queue.put(("markread", target, ts_arg))
+
+    async def _irc_tagmsg(self, nick, params, prefix):
+        tags = self._current_msg_tags
+        target = params[0] if params else ""
+        typing_state = tags.get("+typing", "")
+        if typing_state in ("active", "paused", "done"):
+            await self.ui_queue.put(("typing", nick, target, typing_state))
+        react    = tags.get("+react", "")
+        reply_to = tags.get("+reply", "")
+        if react and reply_to:
+            await self.ui_queue.put(("react", nick, target, reply_to, react))
+
+    async def _irc_invite(self, nick, params, prefix):
+        if len(params) < 2:
+            return
+        invitee = params[0]
+        channel = params[1]
+        if self._irc_lower(invitee) == self._irc_lower(self.nick):
+            await self.ui_queue.put(("status", f"*** {nick} invites you to join {channel}"))
+        else:
+            # invite-notify: someone else in the channel was invited
+            await self.ui_queue.put(("status", f"*** {nick} invited {invitee} to {channel}"))
+
+    async def _irc_fail(self, nick, params, prefix):
+        await self.ui_queue.put(("status", f"[FAIL] {' '.join(params)}"))
+
+    async def _irc_warn(self, nick, params, prefix):
+        await self.ui_queue.put(("status", f"[WARN] {' '.join(params)}"))
+
+    async def _irc_note(self, nick, params, prefix):
+        await self.ui_queue.put(("status", f"[NOTE] {' '.join(params)}"))
+
+    async def _irc_mononline(self, nick, params, prefix):   # 730 RPL_MONONLINE
+        for entry in (params[-1] if params else "").split(","):
+            if entry:
+                bare = entry.split("!")[0] if "!" in entry else entry
+                await self.ui_queue.put(("status", f"[monitor] {bare} is online"))
+
+    async def _irc_monoffline(self, nick, params, prefix):  # 731 RPL_MONOFFLINE
+        for n in (params[-1] if params else "").split(","):
+            if n:
+                await self.ui_queue.put(("status", f"[monitor] {n} is offline"))
+
+    async def _irc_monlist(self, nick, params, prefix):     # 732 RPL_MONLIST
+        nicks = [n for n in (params[-1] if params else "").split(",") if n]
+        if nicks:
+            await self.ui_queue.put(("status", f"[monitor] watching: {', '.join(nicks)}"))
+
+    async def _irc_monlistfull(self, nick, params, prefix): # 734 ERR_MONLISTFULL
+        await self.ui_queue.put(("status", f"[monitor] list full — {' '.join(params[1:])}"))
+
+    async def _irc_reg_success(self, nick, params, prefix):  # 920 RPL_REG_SUCCESS
+        acct = params[1] if len(params) > 1 else "?"
+        await self.ui_queue.put(("status", f"[register] '{acct}' registered successfully"))
+
+    async def _irc_reg_verification(self, nick, params, prefix):  # 921 RPL_REG_VERIFICATION_REQUIRED
+        acct = params[1] if len(params) > 1 else "?"
+        detail = params[-1] if len(params) > 2 else ""
+        await self.ui_queue.put(("status",
+            f"[register] '{acct}' needs email verification" + (f" — {detail}" if detail else "")))
+
+    async def _irc_reg_error(self, nick, params, prefix):  # 922–924 ERR_REG_*
+        msg = params[-1] if params else "unknown error"
+        await self.ui_queue.put(("status", f"[register] error: {msg}"))
+
+    async def _irc_whox_reply(self, nick, params, prefix):  # 354 RPL_WHOSPCRPL
+        vals = params[1:]  # drop our nick (params[0])
+        token = vals[0] if vals else ""
+        fields = self._whox_tokens.get(token, "")
+        if fields:
+            # WHOX servers always return fields in this fixed order (§ WHOX spec),
+            # skipping any that weren't requested. 't' is first and already consumed.
+            FIELD_ORDER = "cuihsnfdlar"
+            FIELD_LABELS = {
+                'c': 'chan',  'u': 'user', 'i': 'ip',   'h': 'host',
+                's': 'server','n': 'nick', 'f': 'flags', 'd': 'hop',
+                'l': 'idle',  'a': 'acct', 'r': 'real',
+            }
+            ordered = [f for f in FIELD_ORDER if f in fields]
+            data = vals[1:]  # values after token
+            parts = [f"{FIELD_LABELS.get(f, f)}={data[i]}"
+                     for i, f in enumerate(ordered) if i < len(data)]
+            await self.ui_queue.put(("status", f"[who] {'  '.join(parts)}"))
+        else:
+            await self.ui_queue.put(("status", f"[who] {' '.join(vals)}"))
+
+    async def _irc_list(self, nick, params, prefix):  # 322 RPL_LIST
+        if len(params) >= 3:
+            channel = params[1]
+            num_users = params[2] if len(params) > 2 else "0"
+            topic = params[-1] if len(params) > 3 else ""
+            self._list_results.append((channel, num_users, topic))
+
+    async def _irc_listend(self, nick, params, prefix):  # 323 RPL_LISTEND
+        results = self._list_results
+        self._list_results = []
+        await self.ui_queue.put(("list_results", results))
+
+    async def _irc_isupport(self, nick, params, prefix):  # 005 RPL_ISUPPORT
+        """Parse ISUPPORT tokens and extract useful server capabilities."""
+        # params = [yournick, TOKEN, TOKEN=value, ..., "are supported by this server"]
+        for token in params[1:-1]:
+            if not token:
+                continue
+            if token.startswith("-"):
+                self._isupport.pop(token[1:], None)
+            elif "=" in token:
+                k, v = token.split("=", 1)
+                self._isupport[k] = v
+            else:
+                self._isupport[token] = True
+        # Announce the network name the first time we see it.
+        # The flag lives on the instance, not in _isupport, so it
+        # doesn't shadow real ISUPPORT tokens.
+        if "NETWORK" in self._isupport and not self._network_announced:
+            self._network_announced = True
+            await self.ui_queue.put(("status",
+                f"Network: {self._isupport['NETWORK']}"))
+
+    async def _irc_no_such_nick(self, nick, params, prefix):  # 401 ERR_NOSUCHNICK
+        target = params[1] if len(params) > 1 else params[0] if params else "?"
+        await self.ui_queue.put(("status", f"No such nick/channel: {target}"))
+
+    async def _nick_reclaim_loop(self) -> None:
+        """Periodically send NICK <desired> to reclaim the original nick.
+
+        Runs after a 433 collision forces us onto nick_.  Tries every 30 s.
+        Cancelled automatically by _irc_nick_change once we succeed.
+        """
+        try:
+            await asyncio.sleep(30)
+            while self.running and self.nick != self._desired_nick:
+                self.send_raw(f"NICK {self._desired_nick}")
+                await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            pass
+
+    def _build_irc_handlers(self) -> None:
+        """Populate the IRC command dispatch table."""
+        h = self._irc_handlers
+        h["PING"]         = self._irc_ping
+        h["PONG"]         = self._irc_pong
+        h["CAP"]          = self._irc_cap
+        h["AUTHENTICATE"] = self._irc_authenticate
+        h["903"]          = self._irc_sasl_ok
+        h["904"]          = self._irc_sasl_fail
+        h["900"]          = self._irc_logged_in
+        h["001"]          = self._irc_welcome
+        h["JOIN"]         = self._irc_join
+        h["PART"]         = self._irc_part
+        h["KICK"]         = self._irc_kick
+        h["TOPIC"]        = self._irc_topic_cmd
+        h["MODE"]         = self._irc_mode
+        h["PRIVMSG"]      = self._irc_privmsg
+        h["NICK"]         = self._irc_nick_change
+        h["NOTICE"]       = self._irc_notice
+        h["INVITE"]       = self._irc_invite
+        h["QUIT"]         = self._irc_quit
+        h["353"]          = self._irc_names
+        h["301"]          = self._irc_away_reply
+        h["332"]          = self._irc_topic_reply
+        h["331"]          = self._irc_no_topic
+        h["433"]          = self._irc_nick_in_use
+        h["432"]          = self._irc_bad_nick
+        h["401"]          = self._irc_no_such_nick
+        h["322"]          = self._irc_list
+        h["323"]          = self._irc_listend
+        h["324"]          = self._irc_chanmode
+        h["005"]          = self._irc_isupport
+        h["AWAY"]         = self._irc_away_notify
+        h["CHGHOST"]      = self._irc_chghost
+        h["ACCOUNT"]      = self._irc_account
+        h["SETNAME"]      = self._irc_setname
+        h["BATCH"]        = self._irc_batch
+        h["TAGMSG"]       = self._irc_tagmsg
+        h["REDACT"]       = self._irc_redact
+        h["MARKREAD"]     = self._irc_markread
+        h["FAIL"]         = self._irc_fail
+        h["WARN"]         = self._irc_warn
+        h["NOTE"]         = self._irc_note
+        h["730"]          = self._irc_mononline
+        h["731"]          = self._irc_monoffline
+        h["732"]          = self._irc_monlist
+        h["734"]          = self._irc_monlistfull
+        h["354"]          = self._irc_whox_reply
+        h["920"]          = self._irc_reg_success
+        h["921"]          = self._irc_reg_verification
+        h["922"] = h["923"] = h["924"] = self._irc_reg_error
+        # WHOIS numerics — bind each with its code via a closure
+        for _code in _WHOIS_REPLIES:
+            _c = _code
+            h[_c] = lambda nick, params, prefix, c=_c: self._irc_whois_reply(c, nick, params, prefix)
+        # WHO replies
+        for _code in _WHO_REPLIES:
+            h[_code] = self._irc_who_reply
+        # Channel join error numerics
+        for _code in _ERROR_REPLIES:
+            h[_code] = self._irc_join_error
+
+    # ====================== Commands ======================
+    def cmd_join(self, channel: str) -> None:
+        self.send_raw(f"JOIN {channel}")
+        self.current_channel = channel
+        self.joined_channels.add(channel)
+
+    def cmd_part(self, channel: str, msg: Optional[str] = None) -> None:
+        self.joined_channels.discard(channel)
+        if msg:
+            self.send_raw(f"PART {channel} :{msg}")
+        else:
+            self.send_raw(f"PART {channel}")
+
+    def cmd_nick(self, new_nick: str) -> None:
+        self.send_raw(f"NICK {new_nick}")
+        self.nick = new_nick
+        self._desired_nick = new_nick  # user intentionally chose this nick
+
+    def cmd_whois(self, target: str) -> None:
+        self.send_raw(f"WHOIS {target}")
+
+    def cmd_mode(self, target: str, modes: str = "") -> None:
+        self.send_raw(f"MODE {target} {modes}" if modes else f"MODE {target}")
+
+    def cmd_topic(self, channel: str, topic: Optional[str] = None) -> None:
+        self.send_raw(f"TOPIC {channel} :{topic}" if topic else f"TOPIC {channel}")
+
+    def cmd_kick(self, channel: str, user: str, reason: str = "") -> None:
+        self.send_raw(f"KICK {channel} {user} :{reason}" if reason else f"KICK {channel} {user}")
+
+    def cmd_msg(self, target: str, text: str, is_action: bool = False) -> Optional[tuple]:
+        if "\n" in text and not is_action and "draft/multiline" in self._active_caps:
+            return self._cmd_msg_multiline(target, text)
+        body = f":\x01ACTION {text}\x01" if is_action else f":{text}"
+        if "labeled-response" in self._active_caps:
+            label = self._next_label()
+            self._pending_labels.add(label)
+            self.send_tagged({"label": label}, f"PRIVMSG {target} {body}")
+        else:
+            self.send_raw(f"PRIVMSG {target} {body}")
+
+        if self.nick not in self.users:
+            u = UserState(self.nick)
+            if self.nick in _NICK_AI_HISTORY:
+                u.seed_ai_history(_NICK_AI_HISTORY[self.nick])
+            self.users[self.nick] = u
+        u_state = self.users[self.nick]
+        u_state.record_message(text)
+        u_score = self.scoring.score_user(u_state)
+        m_score = 50
+        a_score = 0  # own messages are human
+        rolling_ai = int(u_state.rolling_ai_likelihood())
+        return ("msg", self.nick, target, text, u_score, m_score, a_score, rolling_ai, is_action)
+
+    def _cmd_msg_multiline(self, target: str, text: str) -> Optional[tuple]:
+        """Send text containing \\n as a draft/multiline BATCH."""
+        ref = f"ml{self._next_label()}"
+        self.send_raw(f"BATCH +{ref} draft/multiline {target}")
+        for ln in text.split("\n"):
+            self.send_tagged({"batch": ref}, f"PRIVMSG {target} :{ln}")
+        self.send_raw(f"BATCH -{ref}")
+        if self.nick not in self.users:
+            u = UserState(self.nick)
+            self.users[self.nick] = u
+        u_state = self.users[self.nick]
+        u_state.record_message(text)
+        u_score = self.scoring.score_user(u_state)
+        rolling_ai = int(u_state.rolling_ai_likelihood())
+        return ("msg", self.nick, target, text, u_score, 50, 0, rolling_ai, False)
+
+    def cmd_service(self, service: str, command: str) -> None:
+        self.send_raw(f"PRIVMSG {service} :{command}")
+
+    def cmd_ctcp(self, target: str, ctcp_cmd: str, args: str = "") -> None:
+        payload = f"{ctcp_cmd} {args}".strip()
+        self.send_raw(f"PRIVMSG {target} :\x01{payload}\x01")
+
+    def cmd_notice(self, target: str, text: str) -> None:
+        self.send_raw(f"NOTICE {target} :{text}")
+
+    def cmd_away(self, msg: str = "") -> None:
+        self.send_raw(f"AWAY :{msg}" if msg else "AWAY")
+
+    def cmd_invite(self, nick: str, channel: str) -> None:
+        self.send_raw(f"INVITE {nick} {channel}")
+
+    def cmd_who(self, target: str) -> None:
+        self.send_raw(f"WHO {target}")
+
+    def cmd_whox(self, target: str, fields: str = "tnhuafr") -> None:
+        """Send WHOX query (extended WHO) when server advertises WHOX in ISUPPORT.
+
+        't' is always injected so the 354 reply carries the token, letting
+        _irc_whox_reply map positional fields back to human-readable labels.
+        The token rotates 1–999 so concurrent queries don't collide.
+        """
+        if "WHOX" in self._isupport:
+            f = fields.replace(" ", "")
+            if "t" not in f:
+                f = "t" + f
+            token = str(self._whox_seq)
+            self._whox_seq = self._whox_seq % 999 + 1
+            self._whox_tokens[token] = f
+            self.send_raw(f"WHO {target} %{f},{token}")
+        else:
+            self.send_raw(f"WHO {target}")
+
+    def cmd_whowas(self, nick: str) -> None:
+        self.send_raw(f"WHOWAS {nick}")
+
+    def cmd_names(self, channel: str = "") -> None:
+        self.send_raw(f"NAMES {channel}" if channel else "NAMES")
+
+    def cmd_monitor_add(self, nicks: List[str]) -> None:
+        self._monitor_nicks.update(n.lower() for n in nicks)
+        self.send_raw(f"MONITOR + {','.join(nicks)}")
+
+    def cmd_monitor_remove(self, nicks: List[str]) -> None:
+        for n in nicks:
+            self._monitor_nicks.discard(n.lower())
+        self.send_raw(f"MONITOR - {','.join(nicks)}")
+
+    def cmd_monitor_clear(self) -> None:
+        self._monitor_nicks.clear()
+        self.send_raw("MONITOR C")
+
+    def cmd_monitor_list(self) -> None:
+        self.send_raw("MONITOR L")
+
+    def cmd_monitor_status(self) -> None:
+        self.send_raw("MONITOR S")
+
+    def cmd_chathistory(self, channel: str, count: int = 50) -> None:
+        if self._chathistory_cap:
+            self.send_raw(f"CHATHISTORY LATEST {channel} * {count}")
+        else:
+            try:
+                self.ui_queue.put_nowait(("status",
+                    "Server does not support chat history (chathistory CAP missing)"))
+            except Exception:
+                pass
+
+    def cmd_tagmsg(self, target: str, tags: dict) -> None:
+        """Send a TAGMSG (client-only tags, no visible body text)."""
+        self.send_tagged(tags, f"TAGMSG {target}")
+
+    async def _score_msg_bg(self, nick: str, target: str, msg: str,
+                            u_state: "UserState", u_score: int, m_score: int) -> None:
+        """Run AI inference off the read loop, then push an update event."""
+        if not self.scoring.ai_detector.enabled:
+            # AI detection off (--no-ai or /aitoggle), but we still want a
+            # complete audit trail in ai_scores.log.  Skip record_message so
+            # the rolling-average isn't polluted with synthetic zeros.
+            log_ai_event(
+                nick, target, msg, u_score, m_score, 0,
+                int(u_state.rolling_ai_likelihood()),
+            )
+            return
+        a_score = 0
+        detail: Dict[str, float] = {"prob": 0.0, "heu": 0.0, "bino": 0.0, "cls": 0.0, "llama": 0.0}
+        try:
+            # Confirmed bots: skip inference entirely — score is always 100.
+            # Also ingest the message into their fingerprint to keep learning.
+            if nick in self.scoring.confirmed_bot_nicks:
+                fp = self.scoring.bot_fingerprints.get(nick)
+                if fp is not None:
+                    fp.ingest(msg)
+                a_score = 100
+            else:
+                global _ML_SEM
+                if _ML_SEM is None:
+                    _ML_SEM = asyncio.Semaphore(2)
+                loop = asyncio.get_running_loop()
+                _recent_embeds = list(u_state._recent_embeds)
+                async with _ML_SEM:
+                    detail = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            _ML_EXECUTOR,
+                            lambda: self.scoring.ai_detector.predict_detailed(
+                                msg, recent_embeds=_recent_embeds)),
+                        timeout=15.0)
+                prob = detail["prob"]
+                # Optional LLM-based classification: blended in when /model is set.
+                # Weight: 60% local ensemble (fast, always-on) + 40% LLM signal.
+                detect_model = self.scoring.ai_detector.active_detect_model
+                if detect_model:
+                    llm_prob = await _llm_classify_ai(msg, detect_model)
+                    prob = 0.60 * prob + 0.40 * llm_prob
+                # Fingerprint similarity boost: if this message strongly resembles
+                # a confirmed bot's writing style, nudge the probability up.
+                # Excluded nicks: this user's own fingerprint (if they were later
+                # confirmed too) — only cross-nick learning applies here.
+                fp_sim = self.scoring.max_fingerprint_similarity(msg, exclude_nick=nick)
+                if fp_sim > 0.0:
+                    # Max +35 percentage points at full similarity; tapers off smoothly.
+                    prob = min(1.0, prob + 0.35 * fp_sim)
+
+                # Behavioral: timing regularity via log-normal distribution model.
+                # Human IRC typing has irregular gaps (high log-variance, sporadic
+                # z-scores); bots produce near-constant intervals.
+                _timing_score = u_state.timing_anomaly_score()
+                if _timing_score > 0.0:
+                    prob = min(1.0, prob + 0.20 * _timing_score)
+
+                # Rolling momentum: if this user is already tracking as AI across
+                # several past messages, give new messages a small confidence nudge
+                # so the rolling average crosses the suspect threshold faster.
+                _rolling_prior = u_state.rolling_ai_likelihood()
+                if _rolling_prior >= 75.0 and len(u_state.ai_scores) >= 4:
+                    prob = min(1.0, prob + 0.10)
+
+                # Collaborative blocklist boost (Area 3): if this message contains
+                # n-grams that have been /learn_tell'd, boost the score.
+                _blocklist_score = self.scoring.blocklist_overlap_score(msg)
+                if _blocklist_score > 0.0:
+                    prob = min(1.0, prob + 0.30 * _blocklist_score)
+
+                a_score = int(prob * 100)
+        except asyncio.CancelledError:
+            # Task cancelled (e.g. during shutdown) — log the partial result before
+            # propagating so the message is never silently dropped from the audit log.
+            u_state.record_message(msg, a_score)
+            log_ai_event(
+                nick, target, msg, u_score, m_score, a_score,
+                int(u_state.rolling_ai_likelihood()),
+                heu_score=detail.get("heu", 0), bino_score=detail.get("bino", 0),
+                cls_score=detail.get("cls", 0), llama_score=detail.get("llama", 0),
+                adv_score=detail.get("adv", 0), embed_score=detail.get("embed", 0),
+                watermark_score_val=detail.get("watermark", 0),
+            )
+            raise
+        except Exception:
+            # Inference failed for some other reason (timeout, ML error, etc).
+            # Don't record_message — that would skew the rolling AI average
+            # toward 'human' and mislead the suspect heuristic — but still
+            # write the message to ai_scores.log so the audit trail is
+            # complete.  Whatever partial signals we managed to compute are
+            # preserved in `detail`; un-set fields stay at 0.0.
+            log_ai_event(
+                nick, target, msg, u_score, m_score, a_score,
+                int(u_state.rolling_ai_likelihood()),
+                heu_score=detail.get("heu", 0), bino_score=detail.get("bino", 0),
+                cls_score=detail.get("cls", 0), llama_score=detail.get("llama", 0),
+                adv_score=detail.get("adv", 0), embed_score=detail.get("embed", 0),
+                watermark_score_val=detail.get("watermark", 0),
+            )
+            return
+        u_state.record_message(msg, a_score)
+        # Store per-signal breakdown for explainability (Area 6)
+        u_state._recent_signals.append({
+            "prob": detail.get("prob", 0), "heu": detail.get("heu", 0),
+            "bino": detail.get("bino", 0), "cls": detail.get("cls", 0),
+            "llama": detail.get("llama", 0), "adv": detail.get("adv", 0),
+            "embed": detail.get("embed", 0), "watermark": detail.get("watermark", 0),
+        })
+        # Store sentence embedding for future semantic-drift detection
+        if self.scoring.ai_detector._embed_model is not None and len(msg.split()) >= 3:
+            try:
+                emb = self.scoring.ai_detector._embed_text(msg)
+                if emb is not None:
+                    u_state._recent_embeds.append(emb)
+            except Exception:
+                pass
+        rolling_ai = int(u_state.rolling_ai_likelihood())
+        log_ai_event(
+            nick, target, msg, u_score, m_score, a_score, rolling_ai,
+            heu_score=detail.get("heu", 0), bino_score=detail.get("bino", 0),
+            cls_score=detail.get("cls", 0), llama_score=detail.get("llama", 0),
+            adv_score=detail.get("adv", 0), embed_score=detail.get("embed", 0),
+            watermark_score_val=detail.get("watermark", 0),
+        )
+        await self.ui_queue.put(("ai_score", nick, rolling_ai))
+
+# =========================
+# Per-server state container
+# =========================
+# =========================
+# Plugin System
+# =========================
+
+class PluginAPI:
+    """Public interface passed to plugin setup(api) functions.
+
+    Plugin files should define a top-level setup(api) function.  Optionally
+    they may also define teardown(api) which is called on /unloadplugin.
+
+    Minimal plugin example
+    ----------------------
+    def setup(api):
+        @api.command("hello")
+        async def hello(api, args):
+            await api.status(f"Hello, {args or 'world'}!")
+    """
+
+    def __init__(self, name: str, tui: "TUI") -> None:
+        self.name = name
+        self._tui = tui
+        self._commands: Dict[str, Callable] = {}
+        self._hooks: Dict[str, List[Callable]] = {}
+
+    # ── Command registration ─────────────────────────────────────────────────
+
+    def command(self, name: str) -> Callable:
+        """Decorator: register a /name slash command.
+
+        The decorated function receives (api, args) where args is the
+        remainder of the input line after the command name.  Both sync and
+        async functions are accepted.
+        """
+        def decorator(fn: Callable) -> Callable:
+            self._commands[name.lower()] = fn
+            return fn
+        return decorator
+
+    def register(self, name: str, handler: Callable) -> None:
+        """Imperatively register a slash command handler."""
+        self._commands[name.lower()] = handler
+
+    # ── Event hook registration ──────────────────────────────────────────────
+
+    def on(self, event: str) -> Callable:
+        """Decorator: register an event hook.
+
+        Supported events:
+          on_message(api, nick, target, msg, is_action, is_replay)
+          on_join(api, nick, channel)
+          on_part(api, nick, channel)
+          on_quit(api, nick, reason)
+          on_nick_change(api, old_nick, new_nick)
+
+        Both sync and async callbacks are accepted.
+        """
+        def decorator(fn: Callable) -> Callable:
+            self._hooks.setdefault(event, []).append(fn)
+            return fn
+        return decorator
+
+    # ── Status / output helpers ──────────────────────────────────────────────
+
+    async def status(self, text: str) -> None:
+        """Post text to the *status* window."""
+        await self._tui.ui_queue.put(("status", text))
+
+    def add_to_window(self, window_name: str, text: str) -> None:
+        """Append a timestamped line to *window_name* (creates the window if absent)."""
+        win = self._tui.window_by_name.get(window_name)
+        if win is None:
+            win = self._tui.ensure_window(window_name, is_channel=window_name.startswith("#"))
+        win.add_line(text, timestamp=True)
+        self._tui._chat_dirty = True
+        self._tui.dirty = True
+
+    # ── IRC helpers ──────────────────────────────────────────────────────────
+
+    def send(self, target: str, text: str) -> None:
+        """Send an IRC PRIVMSG to *target* (channel or nick)."""
+        self._tui._active_client().cmd_msg(target, text)
+
+    def send_raw(self, line: str) -> None:
+        """Send a raw IRC line."""
+        self._tui._active_client().send_raw(line)
+
+    # ── State accessors ──────────────────────────────────────────────────────
+
+    @property
+    def current_channel(self) -> Optional[str]:
+        return self._tui.current_channel
+
+    @property
+    def current_window(self) -> str:
+        return self._tui.get_current_window().name
+
+    def get_window_lines(self, window_name: str) -> List[str]:
+        win = self._tui.window_by_name.get(window_name)
+        return list(win.lines) if win else []
+
+    def ensure_window(self, name: str, is_channel: bool = False) -> None:
+        self._tui.ensure_window(name, is_channel=is_channel)
+
+
+class PluginManager:
+    """Loads, tracks, and routes commands for all active plugins."""
+
+    def __init__(self) -> None:
+        self._plugins: Dict[str, Tuple[PluginAPI, Any]] = {}          # name → (api, module)
+        self._commands: Dict[str, Tuple[PluginAPI, Callable]] = {}    # cmd  → (api, handler)
+        self._hooks: Dict[str, List[Tuple[PluginAPI, Callable]]] = {} # event → [(api, handler)]
+
+    def load(self, path: str, tui: "TUI") -> Tuple[bool, str]:
+        """Load a plugin from *path*.  Returns (success, message)."""
+        name = os.path.splitext(os.path.basename(path))[0]
+        if name in self._plugins:
+            return False, f"Plugin '{name}' already loaded — use /reloadplugin {name} to reload"
+        try:
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                return False, f"Cannot load '{path}': not a valid Python file"
+            module = importlib.util.module_from_spec(spec)
+            api = PluginAPI(name, tui)
+            spec.loader.exec_module(module)  # type: ignore[union-attr]
+            if not hasattr(module, "setup"):
+                return False, f"'{path}' has no setup(api) function"
+            module.setup(api)
+            self._plugins[name] = (api, module)
+            for cmd_name, handler in api._commands.items():
+                self._commands[cmd_name] = (api, handler)
+            for event, handlers in api._hooks.items():
+                for h in handlers:
+                    self._hooks.setdefault(event, []).append((api, h))
+            cmds = " ".join(f"/{c}" for c in api._commands) if api._commands else "(no commands)"
+            return True, f"Loaded plugin '{name}'  {cmds}"
+        except Exception as exc:
+            return False, f"Failed to load '{path}': {exc}"
+
+    def unload(self, name: str) -> Tuple[bool, str]:
+        """Unload plugin *name*.  Returns (success, message)."""
+        if name not in self._plugins:
+            return False, f"No plugin named '{name}' is loaded"
+        api, module = self._plugins.pop(name)
+        if hasattr(module, "teardown"):
+            try:
+                result = module.teardown(api)
+                if asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
+            except Exception:
+                pass
+        for cmd_name in list(api._commands):
+            self._commands.pop(cmd_name, None)
+        for event in list(self._hooks):
+            self._hooks[event] = [(a, h) for a, h in self._hooks[event] if a is not api]
+            if not self._hooks[event]:
+                del self._hooks[event]
+        return True, f"Unloaded plugin '{name}'"
+
+    def reload(self, name: str, tui: "TUI") -> Tuple[bool, str]:
+        """Unload then re-load plugin *name* from its original file."""
+        if name not in self._plugins:
+            return False, f"No plugin named '{name}' is loaded"
+        _, module = self._plugins[name]
+        path = getattr(module, "__file__", None)
+        if not path:
+            return False, f"Cannot determine source file for plugin '{name}'"
+        ok, msg = self.unload(name)
+        if not ok:
+            return ok, msg
+        return self.load(path, tui)
+
+    def get_command(self, cmd: str) -> Optional[Tuple[PluginAPI, Callable]]:
+        return self._commands.get(cmd)
+
+    def list_plugins(self) -> List[Tuple[str, List[str]]]:
+        return [
+            (name, list(api._commands.keys()))
+            for name, (api, _) in self._plugins.items()
+        ]
+
+    async def dispatch(self, event: str, **kwargs) -> None:
+        """Dispatch *event* to all registered plugin hooks."""
+        handlers = self._hooks.get(event)
+        if not handlers:
+            return
+        for api, handler in handlers:
+            try:
+                result = handler(api, **kwargs)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
+
+
+class ServerContext:
+    """Holds all state that is scoped to a single IRC server connection."""
+    __slots__ = ("server_id", "client", "channel_users", "user_scores",
+                 "user_ai_scores", "_suspect_nicks", "_sorted_users",
+                 "channel_user_modes")
+
+    def __init__(self, server_id: str, client: "IRCClient") -> None:
+        self.server_id       = server_id
+        self.client          = client
+        self.channel_users:  Dict[str, set]      = {}
+        self.user_scores:    Dict[str, int]       = {}
+        self.user_ai_scores: Dict[str, int]       = {}
+        self._suspect_nicks: set                  = set()
+        self._sorted_users:  Dict[str, List[str]] = {}
+        self.channel_user_modes: Dict[str, Dict[str, str]] = {}
+
+# =========================
+# TUI - Enhanced Dashboard
+# =========================
+class TUI:
+    def __init__(self, stdscr, ui_queue: asyncio.Queue, client: IRCClient):
+        self.stdscr = stdscr
+        self.ui_queue = ui_queue
+        self.client = client
+        self.height, self.width = stdscr.getmaxyx()
+        self.chat_height = max(1, self.height - 4)  # 1 extra row for tab bar
+        self._content_height = max(1, self.chat_height - 1)  # row 0 is always the title bar
+        self.userlist_width = 30
+        self._show_userlist = True
+
+        try:
+            self.chat_win  = curses.newwin(self.chat_height, max(1, self.width - self.userlist_width), 0, 0)
+            self.user_win  = curses.newwin(self.chat_height, self.userlist_width, 0, max(0, self.width - self.userlist_width))
+            self.input_win = curses.newwin(4, max(1, self.width), max(0, self.height - 4), 0)
+        except curses.error as e:
+            raise SystemExit(f"Terminal too small to initialise windows: {e}")
+
+        # Multi-server state: primary server is client passed to __init__
+        self._primary_server_id: str = client.server_id
+        _primary_ctx = ServerContext(self._primary_server_id, client)
+        self.servers: Dict[str, ServerContext] = {self._primary_server_id: _primary_ctx}
+        # _active_server_id is set during event dispatch; points at the server
+        # whose dicts (channel_users etc.) are currently aliased to self.*
+        self._active_server_id: str = self._primary_server_id
+
+        self.windows: List[ChatWindow] = []
+        self.window_by_name: Dict[str, ChatWindow] = {}
+        _psid = self._primary_server_id
+        for name in ("*status*", "*dashboard*"):
+            win = ChatWindow(name, is_channel=False, server_id=_psid)
+            # *dashboard* is a synthetic view that's rebuilt by clearing
+            # in-memory lines and re-adding everything; persisting it would
+            # accumulate identical rebuild dumps in chat_logs/ for no value.
+            if name == "*dashboard*":
+                win._persist = False
+            self.windows.append(win)
+            self.window_by_name[name] = win
+
+        # Pre-create the default channel window so its tab is always visible and
+        # join errors / join success messages land there immediately.
+        if DEFAULT_CHANNEL:
+            _dcw = ChatWindow(DEFAULT_CHANNEL, is_channel=True, server_id=_psid)
+            _primary_ctx.channel_users[DEFAULT_CHANNEL] = set()
+            # Load persisted chat history before the new-session marker so
+            # previous messages appear above it in chronological order.
+            _hist = load_chat_history(DEFAULT_CHANNEL)
+            for _hl in _hist:
+                _dcw.lines.append(_hl)
+                _dcw._line_msgids.append("")
+            if _hist:
+                _dcw._wrap_dirty = True
+            _dcw.add_line(f"log channel {DEFAULT_CHANNEL} enabled", timestamp=True)
+            self.windows.append(_dcw)
+            self.window_by_name[DEFAULT_CHANNEL] = _dcw
+
+        # Alias primary ctx dicts directly onto self so all existing code continues
+        # to work without changes.  _sync_ctx() swaps these aliases when a
+        # different server's event needs processing.
+        self.channel_users  = _primary_ctx.channel_users
+        self.user_scores    = _primary_ctx.user_scores
+        self.user_ai_scores = _primary_ctx.user_ai_scores
+        self._suspect_nicks     = _primary_ctx._suspect_nicks
+        self._sorted_users      = _primary_ctx._sorted_users
+        self.channel_user_modes = _primary_ctx.channel_user_modes
+
+        self.current_window_index = 0
+        self.current_channel: Optional[str] = DEFAULT_CHANNEL
+        self.ai_suspect_threshold = AI_SUSPECT_THRESHOLD
+
+        self.input_buffer = ""
+        self.input_cursor  = 0
+        self.input_history: deque = deque(load_input_history(), maxlen=500)
+        self.history_index  = -1
+        self._history_draft = ""
+        self.completion_state = None
+        self.dirty = True
+        self.last_redraw = 0.0
+        self.ignored_nicks: set = set(load_irc_config().get("ignored_nicks", []))
+        self._aliases: Dict[str, str] = dict(load_irc_config().get("aliases", {}))
+        self.mention_beep_muted: bool = False
+        self._msg_hours: Dict[str, List[int]] = {}
+        self._last_speaker: Dict[str, str] = {}
+        self._adjacency: Dict[str, Counter] = {}
+        self._targets: Dict[str, Counter] = {}
+        self._ch_activity: Dict[str, Counter] = {}
+
+        # Performance caches — maintained incrementally to avoid per-frame rebuilds
+        # NOTE: _suspect_nicks and _sorted_users are now aliased from the active
+        # ServerContext; see _sync_ctx().
+        self._suspect_re: Optional[re.Pattern] = None   # compiled regex, rebuilt on change
+        self._suspect_re_nicks: frozenset = frozenset() # snapshot used to build _suspect_re
+        self._mention_re: Optional[re.Pattern] = None   # matches our nick in message body
+        self._mention_re_nick: str = ""                  # nick the regex was compiled for
+        self._dashboard_dirty = False             # needs rebuild?
+        self._dashboard_last_update = 0.0         # last rebuild timestamp
+        self._dashboard_ota_interval = 5.0        # auto-refresh interval while dashboard is visible
+        # "suspects" = normal auto-refreshing suspects view
+        # "profile"  = /ai output; suppresses auto-refresh until user navigates away and back
+        self._dashboard_mode = "suspects"
+        self._prev_on_dashboard = False           # edge-detect navigate-back-to-dashboard
+        self._dashboard_profile_locked = False    # one-shot: skip reset on same-tick navigate
+
+        # IRCv3 +typing client tag
+        # Incoming: {target_lower: {nick_lower: [orig_nick, state, expiry_monotonic]}}
+        #   state "active" expires in 6 s, "paused" in 30 s; "done" removes immediately
+        self._typing_peers: dict = {}
+        # Outgoing
+        self._typing_out_target: str = ""   # target we are currently reporting typing for
+        self._typing_out_last:   float = 0.0  # monotonic time of last +typing=active sent
+        self._typing_out_state:  str = ""   # "active" | "paused" | ""
+        self._typing_last_key:   float = 0.0  # monotonic time of last buffer-modifying key
+
+        # Claude API state
+        self.ai_chat_model: str = CLAUDE_DEFAULT_MODEL   # key into CLAUDE_MODELS
+        self._askai_pending: bool = False                # prevent concurrent calls
+        self._anthropic_client = None                    # reuse HTTP connection pool
+        self._openai_client    = None
+        self._deepseek_client  = None
+        self._copilot_client   = None
+
+        # Pre-compute curses attributes (avoids repeated function calls every frame)
+        try:
+            self._A_ITALIC = curses.A_ITALIC
+        except AttributeError:
+            self._A_ITALIC = curses.A_DIM
+        self._attr_normal     = curses.A_NORMAL
+        self._attr_bold       = curses.A_BOLD
+        self._attr_action     = curses.color_pair(8) | self._A_ITALIC
+        self._attr_title      = curses.A_REVERSE | curses.color_pair(1)
+        self._attr_userheader = curses.A_REVERSE | curses.color_pair(2)
+        self._attr_suspect    = curses.A_BOLD | curses.color_pair(3)
+        self._attr_mention    = curses.A_BOLD | curses.A_REVERSE
+        self._attr_url        = curses.A_BOLD | curses.A_UNDERLINE | curses.color_pair(6)
+
+        # Theme — starts at 1 (Classic); apply_theme reinitialises color pairs
+        self.current_theme: int = 1
+        self.apply_theme(1, announce=False)
+
+        # Mouse: capture clicks so left-click can open URL lines.
+        # Shift+Click still reaches the terminal for text selection in most emulators.
+        try:
+            curses.mouseinterval(0)  # 0 → no click-interval; only PRESSED events fire
+            _mouse_extra = getattr(curses, 'REPORT_MOUSE_POSITION', 0)
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | _mouse_extra)
+        except curses.error:
+            pass
+
+        # Per-pane dirty flags — skip drawing panes that haven't changed
+        self._chat_dirty    = True
+        self._userlist_dirty = True
+        self._input_dirty   = True
+
+        # Cached window dimensions (updated only on resize)
+        # Compute _tw from the logical expected width, not getmaxyx(), so that a
+        # silently-failed chat_win.resize() can't leave _tw at the old oversized
+        # value and cause text/erase to bleed into the userlist area.
+        self._tw     = max(1, max(1, self.width - self.userlist_width) - 1)
+        self._uw     = max(1, self.userlist_width - 2)            # userlist interior cols
+        self._input_w = max(1, self.input_win.getmaxyx()[1] - 4) # input text cols
+
+        # Unread tracking: window names that have received messages while inactive
+        self._unread_windows: set = set()
+
+        self._event_handlers: dict = {}
+        self._slash_handlers: dict = {}
+        self._build_event_handlers()
+        self._build_slash_handlers()
+
+        self.plugin_manager = PluginManager()
+
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
+
+        # Auto-translate CJK (Chinese/Japanese/…) messages to English
+        self.auto_translate: bool = True
+        # Auto-fetch link metadata (title, image info, domain warnings)
+        self.link_preview_enabled: bool = True
+
+    # ── Multi-server helpers ─────────────────────────────────────────────────
+
+    def _wk(self, server_id: str, name: str) -> str:
+        """Compute the window_by_name key for (server_id, window_name).
+
+        Primary server windows keep their bare name so legacy code that
+        hard-codes self.window_by_name["*status*"] still works.
+        """
+        return name if server_id == self._primary_server_id else f"{server_id}/{name}"
+
+    def _sync_ctx(self, server_id: str) -> None:
+        """Alias self.channel_users / user_scores / … to the given server's dicts.
+
+        Must be called before every event-handler invocation so that existing
+        handler code (which writes to self.channel_users etc.) mutates the
+        correct per-server dict.
+        """
+        self._active_server_id = server_id
+        ctx = self.servers.get(server_id)
+        if ctx is None:
+            return
+        self.channel_users  = ctx.channel_users
+        self.user_scores    = ctx.user_scores
+        self.user_ai_scores = ctx.user_ai_scores
+        self._suspect_nicks = ctx._suspect_nicks
+        self._sorted_users      = ctx._sorted_users
+        self.channel_user_modes = ctx.channel_user_modes
+
+    def _sync_draw_ctx(self) -> None:
+        """Sync self.* aliases to the server that owns the currently visible window.
+
+        Called at the top of redraw() so drawing methods always read from the
+        right server's data regardless of which server last dispatched an event.
+        """
+        win = self.get_current_window()
+        sid = win.server_id or self._primary_server_id
+        self._sync_ctx(sid)
+
+    def _status_win(self) -> ChatWindow:
+        """Return the status window for the currently active server."""
+        wk = self._wk(self._active_server_id, "*status*")
+        return self.window_by_name.get(wk) or self.window_by_name["*status*"]
+
+    def _active_client(self) -> IRCClient:
+        """Return the IRCClient for the currently active server."""
+        ctx = self.servers.get(self._active_server_id)
+        return ctx.client if ctx else self.client
+
+    def ensure_window(self, name: str, is_channel: bool = True) -> ChatWindow:
+        sid = self._active_server_id
+        wk  = self._wk(sid, name)
+        if wk not in self.window_by_name:
+            win = ChatWindow(name, is_channel=is_channel, server_id=sid)
+            # Restore persisted chat history before first use so the window
+            # shows previous messages immediately on creation.
+            hist = load_chat_history(name)
+            for hl in hist:
+                win.lines.append(hl)
+                win._line_msgids.append("")
+            if hist:
+                win._wrap_dirty = True
+            self.windows.append(win)
+            self.window_by_name[wk] = win
+            if is_channel and name not in self.channel_users:
+                self.channel_users[name] = set()
+        return self.window_by_name[wk]
+
+    def _chat_text_width(self) -> int:
+        """Usable text columns in the chat window (leaves 1-col right margin)."""
+        return self._tw  # always consistent with the value used for rendering
+
+    def _wrap_window(self, win: ChatWindow) -> None:
+        max_width = self._chat_text_width()
+        if not win._wrap_dirty and win._last_wrap_width == max_width:
+            return
+        wrapped: List[str] = []
+        url_map: Dict[int, str] = {}
+
+        def _wrap_raw(raw: str) -> None:
+            """Wrap a single raw fragment (no \\n) into wrapped[], word-wrapping if wide."""
+            if not raw:
+                return
+            s = irc_strip_formatting(raw)
+            while _str_visual_width(s) > max_width:
+                rm = _irc_visual_pos(raw, max_width)
+                sp = raw.rfind(" ", 0, rm)
+                if sp == -1:
+                    sp = rm if rm > 0 else 1
+                wrapped.append(raw[:sp])
+                raw = raw[sp:].lstrip()
+                s   = irc_strip_formatting(raw)
+            wrapped.append(raw)
+
+        def _wrap_one_line(raw_line: str) -> None:
+            """Wrap one logical line (no embedded \\n): URL-split then word-wrap."""
+            if not raw_line:
+                wrapped.append("")
+                return
+            stripped = irc_strip_formatting(raw_line)
+            url_matches = list(_URL_RE.finditer(stripped))
+            if url_matches:
+                # Extract each URL as its own display line so long URLs never split.
+                # Use stripped text for URL position tracking (IRC codes in raw_line
+                # would shift offsets); pre/post segments fed through _wrap_raw.
+                remaining = stripped
+                for um in url_matches:
+                    url_str   = um.group(0)
+                    url_clean = url_str.rstrip('.,;:!?)"\'>')
+                    pos = remaining.find(url_str)
+                    if pos < 0:
+                        continue
+                    _wrap_raw(remaining[:pos].rstrip())
+                    display = (url_clean
+                               if _str_visual_width(url_clean) <= max_width
+                               else _truncate_to_width(url_clean, max_width - 1) + "…")
+                    url_map[len(wrapped)] = url_clean
+                    wrapped.append(display)
+                    remaining = remaining[pos + len(url_str):].lstrip()
+                _wrap_raw(remaining)
+            else:
+                r = raw_line
+                s = stripped
+                while _str_visual_width(s) > max_width:
+                    rm = _irc_visual_pos(r, max_width)
+                    sp = r.rfind(" ", 0, rm)
+                    if sp == -1:
+                        sp = rm if rm > 0 else 1
+                    wrapped.append(r[:sp])
+                    r = r[sp:].lstrip()
+                    s = irc_strip_formatting(r)
+                wrapped.append(r)
+
+        _msgids      = win._line_msgids
+        _unread_from = win._unread_from
+
+        for _src_i, line in enumerate(win.lines):
+            _src_msgid = _msgids[_src_i] if _src_i < len(_msgids) else ""
+
+            # read-marker: inject separator before the first unread line
+            if _unread_from >= 0 and _src_i == _unread_from:
+                _sep_inner = "  unread  "
+                _sep_dash  = "─" * max(0, (max_width - len(_sep_inner)) // 2)
+                wrapped.append(_sep_dash + _sep_inner + _sep_dash)
+
+            if not line:
+                wrapped.append("")
+                continue
+
+            # draft/multiline: messages with embedded \n from a multiline batch
+            if "\n" in line:
+                parts = line.split("\n")
+                _wrap_one_line(parts[0])
+                for _sp in parts[1:]:
+                    _wrap_one_line("    " + _sp if _sp else "")
+            else:
+                _wrap_one_line(line)
+
+            # Inject a reactions summary line immediately after this message
+            if _src_msgid and _src_msgid in win._reactions:
+                _reacts = win._reactions[_src_msgid]
+                _rparts = []
+                for _emoji, _nicks in _reacts.items():
+                    _cnt = len(_nicks)
+                    _rparts.append(f"{_emoji}×{_cnt}" if _cnt > 1 else _emoji)
+                if _rparts:
+                    wrapped.append("  [" + "  ".join(_rparts) + "]")
+
+        win.wrapped_cache    = wrapped
+        win.url_map          = url_map
+        win._wrap_dirty      = False
+        win._last_wrap_width = max_width
+
+    async def update_dashboard(self):
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        A = lambda t: dash.add_line(t, timestamp=False)
+
+        A("=== AI Suspects — current session (≥ {}%) ===".format(self.ai_suspect_threshold))
+        A("")
+
+        suspects = []
+        for nick, state in self.client.users.items():
+            ai = int(state.rolling_ai_likelihood())
+            if ai >= self.ai_suspect_threshold:
+                suspects.append((nick, ai, state))
+
+        if not suspects:
+            A("  No high-AI users detected in this session.")
+        else:
+            for nick, ai_pct, state in sorted(suspects, key=lambda x: x[1], reverse=True):
+                now = time.monotonic()
+                join_ago = int((now - state.join_time) // 60)
+                last_ago = int((now - state.last_msg_time) // 60) if state.last_msg_time else 0
+                avg_len  = state.avg_msg_length()
+                mpm      = state.messages_per_minute()
+                bars = "▁▂▃▄▅▆▇█"
+                spark = "".join(bars[min(7, s * 8 // 101)]
+                                for s in list(state.ai_scores)[-16:])
+                A(f"  {nick:<14} [{ai_pct:2d}%]  msgs:{state.total_msgs:3d}  "
+                  f"avg:{avg_len:4.0f}  mpm:{mpm:4.1f}  "
+                  f"join:{join_ago:2d}m  last:{last_ago:2d}m")
+                if spark:
+                    A(f"    {spark}")
+
+        # ── Historical suspects from log ─────────────────────────────────
+        A("")
+        A("── Historical suspects (all sessions, from log) ──")
+        A("")
+        current_nicks = {n.lower() for n in self.client.users}
+        try:
+            loop = asyncio.get_running_loop()
+            past = await loop.run_in_executor(
+                None, load_historical_suspects, self.ai_suspect_threshold)
+        except Exception:
+            past = []
+        if not past:
+            A("  No historical data yet.")
+        else:
+            shown = 0
+            for nick, avg_score, total_msgs, first_ts in past[:20]:
+                marker = " *" if nick.lower() in current_nicks else "  "
+                first_str = time.strftime("%Y-%m-%d", time.localtime(first_ts)) if first_ts else "?"
+                A(f"{marker}{nick:<14} avg {avg_score:2d}%  {total_msgs:4d} msgs  "
+                  f"first:{first_str}")
+                shown += 1
+            if shown == 0:
+                A("  No historical data yet.")
+            A("")
+            A("  (* = currently active in this session)")
+
+    async def show_user_ai_profile(self, nick: str) -> None:
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+        bars = "▁▂▃▄▅▆▇█"
+
+        # Load log history concurrently with building in-memory stats
+        loop = asyncio.get_running_loop()
+        hist_task = loop.run_in_executor(None, load_nick_history, nick)
+
+        state = self.client.users.get(nick)
+        now   = time.monotonic()
+
+        # ── In-memory (current session) ─────────────────────────────────────
+        if state:
+            scores   = list(state.ai_scores)
+            rolling  = int(state.rolling_ai_likelihood())
+            s_peak   = max(scores) if scores else 0
+            s_low    = min(scores) if scores else 0
+            join_ago = int((now - state.join_time) // 60)
+            last_ago = int((now - state.last_msg_time) // 60) if state.last_msg_time else None
+            avg_len  = state.avg_msg_length()
+            mpm      = state.messages_per_minute()
+            s_std    = 0.0
+            if len(scores) >= 2:
+                mean  = sum(scores) / len(scores)
+                s_std = (sum((s - mean) ** 2 for s in scores) / len(scores)) ** 0.5
+            trend_str = ""
+            if len(scores) >= 20:
+                delta = sum(scores[-10:]) / 10 - sum(scores[-20:-10]) / 10
+                arrow = "▲" if delta > 2 else ("▼" if delta < -2 else "►")
+                trend_str = f"{arrow} {abs(delta):.0f}% vs prior 10 msgs"
+            spark = "".join(bars[min(7, s * 8 // 101)] for s in scores[-48:]) if scores else ""
+        else:
+            scores = []
+
+        # ── Await historical data ────────────────────────────────────────────
+        hist = await hist_task
+        hs   = hist["all_scores"]
+        hl   = hist["all_lengths"]
+        all_ts    = hist["all_ts"]
+        h_total   = hist["total_msgs"]
+        h_first   = hist["first_ts"]
+        h_last    = hist["last_ts"]
+        h_avg     = int(sum(hs) / len(hs)) if hs else 0
+        h_peak    = max(hs) if hs else 0
+        h_low     = min(hs) if hs else 0
+        h_avg_len = int(sum(hl) / len(hl)) if hl else 0
+        h_std     = 0.0
+        if len(hs) >= 2:
+            hm    = sum(hs) / len(hs)
+            h_std = (sum((s - hm) ** 2 for s in hs) / len(hs)) ** 0.5
+        # All-time trend: compare most recent half to older half
+        h_trend_str = ""
+        if len(hs) >= 20:
+            mid   = len(hs) // 2
+            delta = sum(hs[mid:]) / (len(hs) - mid) - sum(hs[:mid]) / mid
+            arrow = "▲" if delta > 2 else ("▼" if delta < -2 else "►")
+            h_trend_str = f"{arrow} {abs(delta):.0f}% newer vs older half"
+        active_sessions = [(sid, sd) for sid, sd in hist["sessions"].items() if sd["msgs"] > 0]
+
+        # ── Verdict ──────────────────────────────────────────────────────────
+        combined_avg  = h_avg if h_total > 0 else (int(sum(scores) / len(scores)) if scores else 0)
+        n_sessions    = len(active_sessions)
+        is_consistent = h_std < 10 if h_total > 0 else (s_std < 10 if scores else True)
+        is_bot        = (state and state.is_confirmed_bot) or (
+            nick in self._active_client().scoring.confirmed_bot_nicks)
+        fp            = self._active_client().scoring.bot_fingerprints.get(nick)
+        if is_bot:
+            verdict = "CONFIRMED BOT/AI — manually identified"
+        elif combined_avg >= 80 and n_sessions >= 3 and is_consistent:
+            verdict = "HIGH RISK — persistent, consistent AI pattern across multiple sessions"
+        elif combined_avg >= 70:
+            verdict = "SUSPECT — elevated AI score"
+        elif combined_avg >= 50:
+            verdict = "MODERATE — borderline, watch for pattern"
+        else:
+            verdict = "LOW — no strong AI signal"
+
+        # ── Render ───────────────────────────────────────────────────────────
+        bot_badge = "  *** CONFIRMED BOT/AI ***" if is_bot else ""
+        L(f"=== AI Profile: {nick}{bot_badge} ===")
+        if is_bot and fp:
+            L(f"  Fingerprint: {fp.msg_count} msgs  {len(fp.bigrams)} bigrams  "
+              f"{len(fp.trigrams)} trigrams  {len(fp.word_vocab)} unique words")
+        L("")
+
+        if state:
+            L("  ── This session ──────────────────────────────")
+            L(f"  Rolling AI likelihood  : {rolling}%")
+            L(f"  Peak / Low             : {s_peak}% / {s_low}%")
+            L(f"  Std deviation          : {s_std:.1f}%  ({'consistent' if s_std < 10 else 'variable'})")
+            if trend_str:
+                L(f"  Recent trend           : {trend_str}")
+            L(f"  Messages this session  : {state.total_msgs}")
+            L(f"  Avg message length     : {avg_len:.0f} chars")
+            L(f"  Messages / minute      : {mpm:.2f}")
+            # Burst analysis: suspiciously short inter-message gaps suggest automation
+            if state.msg_times:
+                _gaps = list(state.msg_times)
+                _min_gap  = min(_gaps)
+                _burst_n  = sum(1 for g in _gaps if g < 2.0)
+                _burst_pct = 100 * _burst_n // len(_gaps)
+                _gap_tag  = "suspicious" if _min_gap < 0.5 else ("fast" if _min_gap < 1.5 else "normal")
+                L(f"  Min msg interval       : {_min_gap:.1f}s  ({_gap_tag})")
+                L(f"  Burst rate (<2s gap)   : {_burst_pct}%  ({_burst_n}/{len(_gaps)} msgs)")
+            # Message length uniformity: low CoV suggests templated / AI text
+            if len(state.msg_lengths) >= 4:
+                _lens  = list(state.msg_lengths)
+                _m_len = sum(_lens) / len(_lens)
+                _std_l = (sum((l - _m_len) ** 2 for l in _lens) / len(_lens)) ** 0.5
+                _cov   = _std_l / _m_len if _m_len > 0 else 0
+                _utag  = "very uniform" if _cov < 0.15 else ("uniform" if _cov < 0.30 else "variable")
+                L(f"  Msg length uniformity  : CoV {_cov:.2f}  ({_utag})")
+            L(f"  Joined                 : {join_ago}m ago")
+            if last_ago is not None:
+                L(f"  Last message           : {last_ago}m ago")
+            # Current channel presence
+            _in_chans = sorted(ch for ch, users in self.channel_users.items() if nick in users)
+            if _in_chans:
+                L(f"  Currently in           : {' '.join(_in_chans)}")
+            if nick.lower() in self.ignored_nicks:
+                L("  Status                 : IGNORED")
+            if spark:
+                L(f"  Score history          : {spark}")
+            # Per-signal breakdown (Area 6) — averages over recent scored messages
+            _signals = list(state._recent_signals)
+            if len(_signals) >= 3:
+                _avg = lambda k: sum(d.get(k, 0) for d in _signals) / len(_signals)
+                L("  ── Signal breakdown ─────────────────────────")
+                L(f"  Binoculars (bino)      : {_avg('bino'):.2f}")
+                L(f"  Classifier  (cls)      : {_avg('cls'):.2f}")
+                L(f"  Heuristics  (heu)      : {_avg('heu'):.2f}")
+                L(f"  Llama-patt  (llama)    : {_avg('llama'):.2f}")
+                L(f"  Adversarial (adv)      : {_avg('adv'):.2f}")
+                L(f"  Embed-drift (embed)    : {_avg('embed'):.2f}")
+                L(f"  Watermark   (wm)       : {_avg('watermark'):.2f}")
+            L("")
+        else:
+            L("  (not seen in current session)")
+            L("")
+
+        L("  ── All sessions (from log) ───────────────────")
+        if h_total == 0:
+            L("  No log entries found for this nick.")
+        else:
+            first_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(h_first)) if h_first else "?"
+            last_str  = time.strftime("%Y-%m-%d %H:%M", time.localtime(h_last))  if h_last  else "?"
+            sess_this = state.total_msgs if state else 0
+            L(f"  All-time messages      : {h_total}  ({sess_this} this session)")
+            L(f"  All-time avg AI        : {h_avg}%  (peak {h_peak}%  low {h_low}%)")
+            L(f"  All-time std deviation : {h_std:.1f}%  ({'consistent' if h_std < 10 else 'variable'})")
+            if h_trend_str:
+                L(f"  All-time trend         : {h_trend_str}")
+            L(f"  Avg message length     : {h_avg_len} chars")
+            L(f"  Sessions               : {n_sessions}")
+            L(f"  First ever seen        : {first_str}")
+            L(f"  Last seen in log       : {last_str}")
+            if hist["channels"]:
+                L(f"  Channels               : {' '.join(hist['channels'][:6])}")
+            # Hour-of-day activity distribution (local time)
+            if len(all_ts) >= 5:
+                _hbkt = [0] * 24
+                for _t in all_ts:
+                    _hbkt[time.localtime(_t).tm_hour] += 1
+                _hpeak = max(_hbkt)
+                _hbar  = "▁▂▃▄▅▆▇█"
+                _hspark = "".join(_hbar[min(7, b * 8 // (_hpeak + 1))] for b in _hbkt)
+                _peak_h = _hbkt.index(_hpeak)
+                L(f"  Active hours (0–23h)   : {_hspark}  peak:{_peak_h:02d}h")
+            # All-time burst rate from inter-message gaps in log
+            if len(all_ts) >= 4:
+                _sts = sorted(all_ts)
+                _hgaps = [_sts[i+1] - _sts[i] for i in range(len(_sts)-1)
+                          if _sts[i+1] - _sts[i] < 3600]
+                if _hgaps:
+                    _h_min_gap   = min(_hgaps)
+                    _h_burst_n   = sum(1 for g in _hgaps if g < 2.0)
+                    _h_burst_pct = 100 * _h_burst_n // len(_hgaps)
+                    _h_gap_tag   = "suspicious" if _h_min_gap < 0.5 else ("fast" if _h_min_gap < 1.5 else "normal")
+                    L(f"  All-time min gap       : {_h_min_gap:.1f}s  ({_h_gap_tag})")
+                    L(f"  All-time burst rate    : {_h_burst_pct}%  ({_h_burst_n}/{len(_hgaps)} inter-msg gaps)")
+
+            if active_sessions:
+                L("")
+                L(f"  ── Per-session breakdown ({n_sessions} sessions) ──")
+                for sid, sd in active_sessions[-8:]:
+                    s_avg  = int(sum(sd["scores"]) / len(sd["scores"])) if sd["scores"] else 0
+                    s_abar = bars[min(7, s_avg * 8 // 101)]
+                    s_alen = int(sum(sd["lengths"]) / len(sd["lengths"])) if sd.get("lengths") else 0
+                    chs    = " ".join(sorted(sd.get("channels", set()))[:3])
+                    L(f"    [{sid}] {sd['dt'][:16]}  {sd['msgs']:3d} msgs  "
+                      f"avg {s_avg:2d}% {s_abar}  len {s_alen}  {chs}")
+
+            if n_sessions >= 2:
+                h_spark = "".join(
+                    bars[min(7, int(sum(sd["scores"]) / len(sd["scores"])) * 8 // 101)]
+                    for _, sd in active_sessions if sd["scores"]
+                )
+                L("")
+                L(f"  Session trend          : {h_spark}")
+
+            if hist["top_messages"]:
+                L("")
+                L("  ── Top scored messages ──────────────────────")
+                for tm in hist["top_messages"]:
+                    preview = tm["msg"][:60].replace("\n", " ")
+                    if len(tm["msg"]) > 60:
+                        preview += "…"
+                    L(f"  [{tm['a']:2d}%] {tm['dt'][:16]}  \"{preview}\"")
+
+            if hist["gaps"]:
+                L("")
+                L(f"  [!] {len(hist['gaps'])} sequence gap(s) — log may be incomplete")
+
+        L("")
+        L("  ── Verdict ──────────────────────────────────")
+        L(f"  {verdict}")
+
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self.current_window_index      = 1
+        self._chat_dirty               = True
+        self.dirty                     = True
+
+    async def _call_ai(self, prompt: str, model_key: str,
+                       max_tokens: int = 1024) -> Tuple[str, str]:
+        """Send *prompt* to the AI provider for *model_key*.
+
+        Returns (answer_text, tokens_str).  On any error the answer starts
+        with "[error]" so the caller can display it as-is.
+
+        model_key may be:
+          • a key from AI_MODELS ("gemma", "sonnet", "gpt4o", …)
+          • "ollama:<model-id>" for any Ollama model not pre-registered
+        """
+        if model_key.startswith("ollama:"):
+            provider = "ollama"
+            model_id = model_key[len("ollama:"):]
+        else:
+            spec = AI_MODELS.get(model_key)
+            if not spec:
+                return f"[error] unknown model key '{model_key}'", "?"
+            provider = spec["provider"]
+            model_id = spec["id"]
+
+        if provider == "claude":
+            if not ANTHROPIC_AVAILABLE:
+                return ("[error] anthropic package not installed — "
+                        "run: pip install anthropic"), "?"
+            if not ANTHROPIC_API_KEY:
+                return ("[error] ANTHROPIC_API_KEY not set — "
+                        "set the environment variable and restart"), "?"
+            try:
+                if self._anthropic_client is None:
+                    self._anthropic_client = _anthropic_mod.AsyncAnthropic(
+                        api_key=ANTHROPIC_API_KEY)
+                msg = await self._anthropic_client.messages.create(
+                    model=model_id, max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                answer = msg.content[0].text if msg.content else "(empty response)"
+                usage  = getattr(msg, "usage", None)
+                tokens = str(usage.input_tokens + usage.output_tokens) if usage else "?"
+                return answer, tokens
+            except Exception as exc:
+                self._anthropic_client = None   # discard on error; recreate next call
+                return f"[error] {exc}", "?"
+
+        if provider == "openai":
+            if not OPENAI_AVAILABLE:
+                return ("[error] openai package not installed — "
+                        "run: pip install openai"), "?"
+            if not OPENAI_API_KEY:
+                return ("[error] OPENAI_API_KEY not set — "
+                        "set the environment variable and restart"), "?"
+            try:
+                if self._openai_client is None:
+                    self._openai_client = _openai_mod.AsyncOpenAI(
+                        api_key=OPENAI_API_KEY)
+                resp = await self._openai_client.chat.completions.create(
+                    model=model_id, max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                answer = (resp.choices[0].message.content
+                          if resp.choices else "(empty response)")
+                usage  = getattr(resp, "usage", None)
+                tokens = str(usage.total_tokens) if usage else "?"
+                return answer, tokens
+            except Exception as exc:
+                self._openai_client = None      # discard on error; recreate next call
+                return f"[error] {exc}", "?"
+
+        if provider == "deepseek":
+            if not OPENAI_AVAILABLE:
+                return ("[error] openai package not installed — "
+                        "run: pip install openai"), "?"
+            if not DEEPSEEK_API_KEY:
+                return ("[error] DEEPSEEK_API_KEY not set — "
+                        "set the environment variable and restart"), "?"
+            try:
+                if self._deepseek_client is None:
+                    self._deepseek_client = _openai_mod.AsyncOpenAI(
+                        api_key=DEEPSEEK_API_KEY,
+                        base_url="https://api.deepseek.com")
+                resp = await self._deepseek_client.chat.completions.create(
+                    model=model_id, max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                answer = (resp.choices[0].message.content
+                          if resp.choices else "(empty response)")
+                usage  = getattr(resp, "usage", None)
+                tokens = str(usage.total_tokens) if usage else "?"
+                return answer, tokens
+            except Exception as exc:
+                self._deepseek_client = None
+                return f"[error] {exc}", "?"
+
+        if provider == "copilot":
+            if not OPENAI_AVAILABLE:
+                return ("[error] openai package not installed — "
+                        "run: pip install openai"), "?"
+            if not GITHUB_TOKEN:
+                return ("[error] GITHUB_TOKEN not set — "
+                        "set the environment variable and restart"), "?"
+            try:
+                if self._copilot_client is None:
+                    self._copilot_client = _openai_mod.AsyncOpenAI(
+                        api_key=GITHUB_TOKEN,
+                        base_url="https://api.githubcopilot.com",
+                        default_headers={
+                            "editor-version":        "eyearesee/1.0",
+                            "editor-plugin-version": "eyearesee/1.0",
+                            "copilot-integration-id": "eyearesee",
+                        })
+                resp = await self._copilot_client.chat.completions.create(
+                    model=model_id, max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                answer = (resp.choices[0].message.content
+                          if resp.choices else "(empty response)")
+                usage  = getattr(resp, "usage", None)
+                tokens = str(usage.total_tokens) if usage else "?"
+                return answer, tokens
+            except Exception as exc:
+                self._copilot_client = None
+                return f"[error] {exc}", "?"
+
+        if provider == "ollama":
+            loop = asyncio.get_running_loop()
+            answer, tokens = await loop.run_in_executor(
+                _IO_EXECUTOR, _ollama_blocking_call, model_id, prompt, max_tokens)
+            return answer, tokens
+
+        if provider == "llamacpp":
+            loop = asyncio.get_running_loop()
+            answer, tokens = await loop.run_in_executor(
+                _IO_EXECUTOR, _llamacpp_blocking_call, model_id, prompt, max_tokens)
+            return answer, tokens
+
+        return f"[error] unknown provider '{provider}'", "?"
+
+    async def _do_askai(self, question: str, model_key: str) -> None:
+        """Call the configured AI and post the Q+A to the *dashboard* window."""
+        if self._askai_pending:
+            await self.ui_queue.put(("status", "/askai already in progress, please wait…"))
+            return
+
+        if model_key.startswith("ollama:"):
+            model_id = model_key[len("ollama:"):]
+            label    = f"Ollama/{model_id}"
+        else:
+            spec     = AI_MODELS.get(model_key) or AI_MODELS[CLAUDE_DEFAULT_MODEL]
+            model_id = spec["id"]
+            label    = spec["label"]
+        self._askai_pending = True
+        await self.ui_queue.put(("status",
+            f"[askai] querying {model_key} ({model_id})…"))
+
+        answer, tokens = "", "?"
+        try:
+            answer, tokens = await asyncio.wait_for(
+                self._call_ai(question, model_key, max_tokens=1024), timeout=120.0)
+        except asyncio.TimeoutError:
+            answer, tokens = "[error] AI request timed out after 120 s", "?"
+        except Exception as exc:
+            answer, tokens = f"[error] {exc}", "?"
+        finally:
+            self._askai_pending = False
+
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+
+        L(f"=== /askai [{model_key}  {label}] ===")
+        L("")
+        L(f"Q: {question}")
+        L("")
+        L("A:")
+        for raw_line in answer.splitlines():
+            L(f"  {raw_line}" if raw_line.strip() else "")
+        L("")
+        L(f"  model: {model_id}  tokens used: {tokens}")
+
+        self.current_window_index      = 1   # switch to *dashboard*
+        self._chat_dirty               = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self.dirty                     = True
+
+    async def _post_translation(self, win: ChatWindow, text: str) -> None:
+        """Translate *text* and append the result as an indented line in *win*.
+
+        Runs as a fire-and-forget asyncio task; any exception is caught here
+        so it never propagates to the task's unhandled-exception handler."""
+        try:
+            translated = await _translate_to_english(text)
+            if not translated:
+                return
+            win.add_line(f"  \u21b3 [EN] {translated}", timestamp=False)
+            self._chat_dirty = True
+            self.dirty = True
+        except Exception:
+            pass
+
+    async def _post_link_info(self, win: ChatWindow, nick: str, msg: str, win_name: str) -> None:
+        """Fetch metadata for URLs in *msg* and append results as indented lines."""
+        try:
+            cleaned = irc_strip_formatting(msg)
+            urls = list(_URL_RE.finditer(cleaned))
+            if not urls:
+                return
+            for um in urls:
+                url = um.group(0).rstrip('.,;:!?)"\'>')
+                if not url:
+                    continue
+                info = await _fetch_link_info(url)
+                if info["domain_warn"]:
+                    win.add_line(f"  \u26a0 {info['domain_warn']}", timestamp=False)
+                if info["title"]:
+                    win.add_line(f"  \u21b7 {info['title']}", timestamp=False)
+                if info["image"]:
+                    win.add_line(f"  {info['image']}", timestamp=False)
+                _append_link_log(win_name, nick, url,
+                                 info["title"] or "",
+                                 urllib.parse.urlparse(url).netloc)
+            if urls:
+                self._chat_dirty = True
+                self.dirty = True
+        except Exception:
+            pass
+
+    def apply_theme(self, n: int, announce: bool = True) -> None:
+        """Switch to theme n (1-based). Re-initialises the four key color pairs
+        and forces a full redraw.  Color pair integers are live — no need to
+        recompute _attr_* fields; the terminal picks up the new palette instantly."""
+        idx = max(0, min(n - 1, len(THEMES) - 1))
+        name, p1f, p1b, p2f, p2b, p3f, p3b, p8f, p8b = THEMES[idx]
+        curses.init_pair(1, p1f, p1b)
+        curses.init_pair(2, p2f, p2b)
+        curses.init_pair(3, p3f, p3b)
+        curses.init_pair(8, p8f, p8b)
+        # Recompute attrs that bake in color_pair values so the change propagates
+        self._attr_action     = curses.color_pair(8) | self._A_ITALIC
+        self._attr_title      = curses.A_REVERSE | curses.color_pair(1)
+        self._attr_userheader = curses.A_REVERSE | curses.color_pair(2)
+        self._attr_suspect    = curses.A_BOLD    | curses.color_pair(3)
+        self.current_theme = idx + 1
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self.dirty = True
+        if announce:
+            theme_list = "  ".join(
+                f"[{i+1}] {t[0]}" for i, t in enumerate(THEMES))
+            self.window_by_name["*status*"].add_line(
+                f"Theme → {name} ({self.current_theme}/{len(THEMES)})  {theme_list}")
+
+    def _resize_windows(self) -> None:
+        """Resize/reposition subwindows and refresh cached dimensions."""
+        if self._show_userlist:
+            chat_w = max(1, self.width - self.userlist_width)
+        else:
+            chat_w = max(1, self.width)
+        user_x = self.width - self.userlist_width
+        try:
+            self.chat_win.resize(self.chat_height, chat_w)
+        except curses.error:
+            pass
+        try:
+            self.user_win.resize(self.chat_height, self.userlist_width)
+            self.user_win.mvwin(0, user_x)
+        except curses.error:
+            pass
+        try:
+            self.input_win.resize(4, self.width)
+            self.input_win.mvwin(self.height - 4, 0)
+        except curses.error:
+            pass
+        # Refresh cached dimension values and force full repaint.
+        # Use the expected logical width (not getmaxyx) so a silently-failed
+        # resize can't leave _tw pointing at the old oversized chat window.
+        self._tw             = max(1, chat_w - 1)
+        self._uw             = max(1, self.userlist_width - 2)
+        self._input_w        = max(1, self.input_win.getmaxyx()[1] - 4)
+        self._content_height = max(1, self.chat_height - 1)
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+
+    def _render_irc_line(self, row: int, line: str, base_attr: int, tw: int) -> None:
+        """Write *line* to chat_win at *row*, applying IRC inline formatting.
+        *col* tracks terminal columns, not character count, so wide (CJK) chars
+        advance by 2 and are never truncated mid-character."""
+        segments = irc_parse_formatting(line)
+        col = 0
+        for text, fmt_attr in segments:
+            if col >= tw:
+                break
+            chunk = _truncate_to_width(text, tw - col)
+            if not chunk:
+                continue
+            try:
+                self.chat_win.addstr(row, col, chunk, base_attr | fmt_attr)
+            except curses.error:
+                pass
+            col += _str_visual_width(chunk)
+
+    def _draw_chat(self) -> None:
+        tw = self._tw
+        current_win = self.get_current_window()
+        self.chat_win.erase()
+        self._wrap_window(current_win)
+        wrapped = current_win.wrapped_cache
+        total = len(wrapped)
+
+        # Row 0 is permanently the title bar; content occupies rows 1..chat_height-1.
+        content_height = self._content_height
+
+        # IRCv3 typing: expire stale entries then check if any peers are typing here.
+        _now_m = time.monotonic()
+        _tgt_key = current_win.name.lower()
+        _peers = self._typing_peers.get(_tgt_key)
+        if _peers:
+            _stale = [_n for _n, _e in _peers.items() if _now_m > _e[2]]
+            for _n in _stale:
+                del _peers[_n]
+        _typing_names = [_e[0] for _e in _peers.values()] if _peers else []
+        if _typing_names:
+            content_height = max(1, content_height - 1)  # reserve bottom row for indicator
+
+        max_offset = max(0, total - content_height)
+        current_win.scroll_offset = min(current_win.scroll_offset, max_offset)
+        offset = current_win.scroll_offset
+
+        end_idx   = total - offset
+        start_idx = max(0, end_idx - content_height)
+        visible   = wrapped[start_idx:end_idx]
+
+        suspect_nicks = self._suspect_nicks
+        attr_bold    = self._attr_bold
+        attr_normal  = self._attr_normal
+        attr_action  = self._attr_action
+        attr_mention = self._attr_mention
+        attr_url     = self._attr_url
+        url_map      = current_win.url_map
+        # Rebuild suspect regex only when the set has changed (not every frame)
+        if suspect_nicks != self._suspect_re_nicks:
+            self._suspect_re = (
+                re.compile("|".join(re.escape(n) for n in suspect_nicks))
+                if suspect_nicks else None
+            )
+            self._suspect_re_nicks = frozenset(suspect_nicks)
+        _suspect_re = self._suspect_re
+        # Rebuild mention regex only when our nick changes
+        _our_nick = self._active_client().nick
+        if _our_nick != self._mention_re_nick:
+            self._mention_re = (
+                re.compile(
+                    r'\[\d{2}:\d{2}\] (?:<[^>]+>|\* \S+) .*\b'
+                    + re.escape(_our_nick) + r'\b',
+                    re.IGNORECASE,
+                )
+                if _our_nick else None
+            )
+            self._mention_re_nick = _our_nick
+
+        # Bind hot callables to locals — avoids repeated global/attr lookups
+        # inside the per-line render loop (called up to ~60 times per frame).
+        _action_match    = _ACTION_LINE_RE.match
+        _render          = self._render_irc_line
+        _suspect_search  = _suspect_re.search if _suspect_re else None
+        _mention_search  = self._mention_re.search if self._mention_re else None
+        _content_height  = content_height
+
+        for i, line in enumerate(visible):
+            if i >= _content_height: break
+            if (start_idx + i) in url_map:
+                base = attr_url
+            elif _action_match(line):
+                base = attr_action
+            elif _mention_search and _mention_search(line):
+                base = attr_mention
+            elif _suspect_search and _suspect_search(line):
+                base = attr_bold
+            else:
+                base = attr_normal
+            _render(i + 1, line, base, tw)  # +1: row 0 is reserved for the title bar
+
+        # Typing indicator — drawn on the row just below the last message row.
+        if _typing_names:
+            if len(_typing_names) == 1:
+                _typ_text = f" ✎ {_typing_names[0]} is typing…"
+            elif len(_typing_names) == 2:
+                _typ_text = f" ✎ {_typing_names[0]} and {_typing_names[1]} are typing…"
+            else:
+                _typ_text = f" ✎ {len(_typing_names)} people are typing…"
+            try:
+                self.chat_win.addstr(content_height + 1, 1,
+                                     _typ_text[:tw], curses.A_DIM)
+            except curses.error:
+                pass
+
+        title = (f" {current_win.name} [↑ {offset} line{'s' if offset != 1 else ''}] "
+                 if offset > 0 else f" {current_win.name} ")
+        try:
+            self.chat_win.addstr(0, 0, title.center(tw)[:tw], self._attr_title)
+        except curses.error:
+            pass
+
+    def _draw_userlist(self) -> None:
+        uw = self._uw
+        self.user_win.erase()
+        self.user_win.border()
+
+        # Prefer the current window's channel; fall back to current_channel for
+        # non-channel windows (status/dashboard) so the userlist stays populated
+        # while browsing those windows.  DM windows (no leading #) are excluded.
+        cur_win = self.get_current_window()
+        if cur_win.is_channel and cur_win.name in self.channel_users:
+            display_ch = cur_win.name
+        elif self.current_channel and self.current_channel in self.channel_users:
+            display_ch = self.current_channel
+        else:
+            display_ch = None
+
+        header = f" Users ({display_ch or 'None'}) "
+        try:
+            self.user_win.addstr(0, 1, header[:uw], self._attr_userheader)
+        except curses.error:
+            pass
+
+        if display_ch:
+            ch = display_ch
+            if ch not in self._sorted_users:
+                self._sorted_users[ch] = self._sort_users_by_mode(ch)
+            users = self._sorted_users[ch]
+            modes = self.channel_user_modes.get(ch, {})
+            thresh      = self.ai_suspect_threshold
+            attr_sus    = self._attr_suspect
+            attr_normal = self._attr_normal
+            for i, nick in enumerate(users[:self.chat_height - 2]):
+                ai_pct = self.user_ai_scores.get(nick, 0)
+                mode_char = self._highest_prefix(modes.get(nick, set()))
+                display_nick = (mode_char + nick) if mode_char else nick
+                nick_vis = _str_visual_width(display_nick)
+                padded   = display_nick + " " * max(0, 18 - nick_vis)
+                line     = _truncate_to_width(f"{padded} [{ai_pct:2d}%]", uw)
+                try:
+                    self.user_win.addstr(i + 1, 1, line,
+                        attr_sus if ai_pct >= thresh else attr_normal)
+                except curses.error:
+                    break
+
+    def _draw_tabs(self) -> None:
+        """Draw the window tab strip on row 1 of input_win.
+
+        Format: [1:status] [*2:##chat] [3:##anime]
+        Active tab uses A_REVERSE|A_BOLD; windows with unread messages get A_BOLD
+        and a '*' prefix; inactive read windows are dimmed.  The strip scrolls so
+        the active tab is always visible.
+        """
+        _, w = self.input_win.getmaxyx()
+        usable = w - 2  # columns between left and right borders
+
+        # Build label strings for every window
+        multi_server = len(self.servers) > 1
+        labels: List[str] = []
+        for i, win in enumerate(self.windows):
+            name = win.name
+            if name == "*status*":
+                short = "status"
+            elif name == "*dashboard*":
+                short = "dash"
+            elif name.startswith("#"):
+                short = name[:14]
+            else:
+                short = f">{name[:10]}"   # DM: ">nick"
+            # Prepend a short server tag when multiple servers are connected
+            if multi_server and win.server_id and win.server_id != self._primary_server_id:
+                host = win.server_id.split(":")[0]
+                short = f"{host[:8]}:{short}"
+            is_active = (i == self.current_window_index)
+            has_unread = (name in self._unread_windows and not is_active)
+            labels.append(f"[{'*' if has_unread else ''}{i + 1}:{short}]")
+
+        # Find the leftmost visible index so the active tab is always on screen
+        widths = [len(l) + 1 for l in labels]   # +1 for the space separator
+        active = self.current_window_index
+        start = 0
+        if sum(widths) > usable:
+            # Walk forward until the slice [start..active] fits
+            for j in range(active + 1):
+                if sum(widths[j:active + 1]) <= usable:
+                    start = j
+                    break
+
+        col = 1
+        for i in range(start, len(labels)):
+            label = labels[i]
+            lw = len(label)
+            if col + lw + 1 > usable:
+                break
+            is_active = (i == self.current_window_index)
+            has_unread = (self.windows[i].name in self._unread_windows and not is_active)
+            if is_active:
+                attr = curses.A_REVERSE | curses.A_BOLD
+            elif has_unread:
+                attr = curses.A_BOLD
+            else:
+                attr = curses.A_DIM
+            try:
+                self.input_win.addstr(1, col, label, attr)
+            except curses.error:
+                pass
+            col += lw + 1   # +1 space between tabs
+
+    def _draw_input(self) -> None:
+        self.input_win.erase()
+        self.input_win.border()
+
+        self._draw_tabs()
+
+        # Show current send-target in the prompt so the user always knows where
+        # text will go.  Status/dashboard windows have no chat target.
+        cur_win = self.get_current_window()
+        _cur_nick = self._active_client().nick
+        if cur_win.name not in ("*status*", "*dashboard*"):
+            prompt = f"[{cur_win.name}] {_cur_nick}> "
+        else:
+            prompt = f"{_cur_nick}> "
+        iw     = self._input_w
+
+        # All width calculations use visual column counts (not character counts)
+        # so that IRC control codes (zero-width) and CJK/wide chars (2 columns)
+        # both position the cursor and viewport correctly.
+        vis_prompt = prompt                        # prompt is ASCII-only
+        vis_buf    = irc_strip_formatting(self.input_buffer)
+        vis_before = irc_strip_formatting(self.input_buffer[:self.input_cursor]) \
+                     if self.input_cursor else ""
+        cursor_abs  = _str_visual_width(vis_prompt) + _str_visual_width(vis_before)
+
+        full_vis    = vis_prompt + vis_buf
+        full_vis_w  = _str_visual_width(full_vis)
+        view_start  = max(0, cursor_abs - iw + 1) if cursor_abs >= iw else 0
+        if full_vis_w > iw:
+            view_start = min(view_start, full_vis_w - iw)
+
+        display    = _truncate_to_width(_skip_visual_cols(full_vis, view_start), iw)
+        cursor_col = 1 + (cursor_abs - view_start)
+        try:
+            self.input_win.addstr(2, 1, display)
+            self.input_win.move(2, max(1, min(cursor_col, iw)))
+        except curses.error:
+            pass
+
+    def redraw(self) -> bool:
+        if time.monotonic() - self.last_redraw < 0.033:
+            return False
+        self.last_redraw = time.monotonic()
+
+        new_h, new_w = self.stdscr.getmaxyx()
+        if new_h != self.height or new_w != self.width:
+            self.height, self.width = new_h, new_w
+            self.chat_height = max(1, self.height - 4)
+            self._resize_windows()  # sets all three pane-dirty flags + updates _tw/_uw/_input_w
+
+        # Sync aliases to the server that owns the currently visible window.
+        self._sync_draw_ctx()
+
+        refreshed = []
+        _chat_refreshed = False
+        if self._chat_dirty:
+            self._draw_chat()
+            self._chat_dirty = False
+            refreshed.append(self.chat_win)
+            _chat_refreshed = True
+        if self._userlist_dirty:
+            if self._show_userlist:
+                self._draw_userlist()
+                refreshed.append(self.user_win)
+            self._userlist_dirty = False
+        elif self._show_userlist and _chat_refreshed:
+            # Re-assert the userlist after every chat refresh even when the
+            # userlist itself hasn't changed.  chat_win.noutrefresh() writes the
+            # full chat buffer (including the blank right-margin column) to the
+            # virtual screen.  If the window was ever the wrong size (e.g. a
+            # silently-failed resize) those writes can land on top of the |
+            # border.  Calling user_win.noutrefresh() second means the userlist
+            # always wins that region, keeping the border and nicks intact.
+            refreshed.append(self.user_win)
+        if self._input_dirty:
+            self._draw_input()
+            self._input_dirty = False
+            refreshed.append(self.input_win)
+
+        for w in refreshed:
+            w.noutrefresh()
+        if refreshed:
+            curses.doupdate()
+        return True
+
+    def get_current_window(self) -> ChatWindow:
+        return self.windows[self.current_window_index]
+
+    def _mark_window_read(self, win: "ChatWindow") -> None:
+        """Send MARKREAD for *win* and clear its unread marker."""
+        if win.name in ("*status*", "*dashboard*") or not win.is_channel:
+            return
+        client = self._active_client()
+        if "read-marker" not in client._active_caps:
+            return
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        client.send_raw(f"MARKREAD {win.name} timestamp={ts}")
+        win._unread_from = -1
+        win._wrap_dirty = True
+
+    def switch_to_next_window(self):
+        prev_win = self.get_current_window()
+        self._mark_window_read(prev_win)
+        self.current_window_index = (self.current_window_index + 1) % len(self.windows)
+        win = self.get_current_window()
+        if win.name not in ("*status*", "*dashboard*"):
+            self.current_channel = win.name
+        if win.name in self._unread_windows:
+            win.scroll_offset = 0  # jump to bottom so the new messages are visible
+        self._unread_windows.discard(win.name)
+        win._unread_from = -1
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self.dirty = True
+
+    @staticmethod
+    def _prefix_rank(mode_char: str) -> int:
+        return {"~": 5, "&": 4, "@": 3, "%": 2, "+": 1}.get(mode_char, 0)
+
+    def _sort_users_by_mode(self, ch: str) -> List[str]:
+        modes = self.channel_user_modes.get(ch, {})
+        users = self.channel_users.get(ch, set())
+        return sorted(users, key=lambda n: (-self._prefix_rank(self._highest_prefix(modes.get(n, set()))), n.lower()))
+
+    def do_nick_complete(self, reverse: bool = False) -> None:
+        if not self.current_channel or self.current_channel not in self.channel_users:
+            return
+        ch = self.current_channel
+        if ch not in self._sorted_users:
+            self._sorted_users[ch] = self._sort_users_by_mode(ch)
+        users = self._sorted_users[ch]
+        if not users:
+            return
+        buf    = self.input_buffer
+        cursor = min(self.input_cursor, len(buf))
+        word_start = cursor
+        while word_start > 0 and buf[word_start - 1] not in (" ", "\t"):
+            word_start -= 1
+        prefix = buf[word_start:cursor].lower()
+        if not prefix:
+            return
+        matches = [u for u in users if u.lower().startswith(prefix)]
+        if not matches:
+            return
+        if self.completion_state and self.completion_state[0] == prefix:
+            if reverse:
+                idx = (self.completion_state[2] - 1) % len(self.completion_state[1])
+            else:
+                idx = (self.completion_state[2] + 1) % len(self.completion_state[1])
+            match = self.completion_state[1][idx]
+        else:
+            idx = len(matches) - 1 if reverse else 0
+            match = matches[idx]
+        self.completion_state = (prefix, matches, idx)
+        suffix = ": " if word_start == 0 else " "
+        replacement = match + suffix
+        self.input_buffer = buf[:word_start] + replacement + buf[cursor:]
+        self.input_cursor = word_start + len(replacement)
+        self._input_dirty = True
+        self.dirty = True
+
+    def _build_event_handlers(self) -> None:
+        h = self._event_handlers
+        h["msg"]         = self._ev_msg
+        h["ai_score"]    = self._ev_ai_score
+        h["notice"]      = self._ev_notice
+        h["nick_change"] = self._ev_nick_change
+        h["names"]       = self._ev_names
+        h["clear_users"] = self._ev_clear_users
+        h["topic"]       = self._ev_topic
+        h["join"]        = self._ev_join
+        h["self_join"]   = self._ev_self_join
+        h["join_error"]  = self._ev_join_error
+        h["part"]        = self._ev_part
+        h["quit"]        = self._ev_quit
+        h["typing"]      = self._ev_typing
+        h["react"]       = self._ev_react
+        h["redact"]      = self._ev_redact
+        h["markread"]    = self._ev_markread
+        h["mode"]        = self._ev_mode
+        h["kick"]        = self._ev_kick
+        h["list_results"] = self._ev_list_results
+        h["chanmode"]     = self._ev_chanmode
+        for k in ("whois", "status"):
+            h[k] = self._ev_status_line
+
+    async def handle_event(self, event: tuple) -> None:
+        if not event:
+            return
+        # "_srv" events arrive from secondary servers via _mux_server_events.
+        # Unwrap, sync aliases to that server's dicts, dispatch, then restore.
+        if event[0] == "_srv":
+            _, server_id, inner = event
+            prev = self._active_server_id
+            self._sync_ctx(server_id)
+            try:
+                await self.handle_event(inner)
+            finally:
+                self._sync_ctx(prev)
+            return
+        # Untagged events come from the primary server; ensure aliases are correct.
+        self._sync_ctx(self._primary_server_id)
+        handler = self._event_handlers.get(event[0])
+        if handler:
+            await handler(event)
+
+    # ── TUI event handlers ────────────────────────────────────────────────────
+
+    async def _ev_msg(self, event):
+        # Unpack with defaults for the optional tail fields added for IRCv3
+        (_, nick, target, msg, u_score, m_score, a_score, rolling_ai,
+         is_action, *_extra) = event
+        ts_str    = _extra[0] if len(_extra) > 0 else None
+        account   = _extra[1] if len(_extra) > 1 else ""
+        is_replay = _extra[2] if len(_extra) > 2 else False
+        msgid     = _extra[3] if len(_extra) > 3 else ""
+        reply_to  = _extra[4] if len(_extra) > 4 else ""
+        if nick.lower() in self.ignored_nicks:
+            return
+        if target.startswith("#"):
+            win_name = target
+            is_chan   = True
+        elif nick == self._active_client().nick:
+            win_name = target
+            is_chan   = False
+        else:
+            win_name = nick
+            is_chan   = False
+        win = self.ensure_window(win_name, is_channel=is_chan)
+        # read-marker: mark the first unread line when this window is not active
+        if not is_replay and win is not self.get_current_window() and win._unread_from < 0:
+            win._unread_from = len(win.lines)  # points to the line about to be added
+        # +reply: show a quoted preview of the referenced message
+        if reply_to:
+            ref = win._msg_store.get(reply_to)
+            if ref:
+                ref_nick, ref_prev = ref
+                p = ref_prev[:50] + "…" if len(ref_prev) > 50 else ref_prev
+                win.add_line(f"  ↩ {ref_nick}: {p}", timestamp=False)
+        prefix_str = f"* {nick} " if is_action else f"<{nick}> "
+        # Replay lines get a visual marker; account shown if account-tag active
+        replay_mark = "[↑] " if is_replay else ""
+        acc_mark    = f"[{account}]" if account else ""
+        win.add_line(f"{replay_mark}{prefix_str}{acc_mark}{msg}", ts_str=ts_str, msgid=msgid)
+        # Store msgid for reply/react lookups; prune if over limit
+        if msgid:
+            if len(win._msg_store) >= 500:
+                del win._msg_store[next(iter(win._msg_store))]
+            preview = f"* {nick} {msg}" if is_action else msg
+            win._msg_store[msgid] = (nick, preview)
+            win._last_msgid = msgid
+        our_nick = self._active_client().nick
+        if (our_nick and nick.lower() != our_nick.lower()
+                and not self.mention_beep_muted
+                and re.search(r'\b' + re.escape(our_nick) + r'\b', msg, re.IGNORECASE)):
+            try:
+                curses.beep()
+            except Exception:
+                pass
+        if self.auto_translate and _has_cjk(irc_strip_formatting(msg)):
+            asyncio.create_task(self._post_translation(win, msg))
+        if self.link_preview_enabled and _URL_RE.search(irc_strip_formatting(msg)):
+            asyncio.create_task(self._post_link_info(win, nick, msg, win_name))
+        # Investigative tracking
+        hour = time.localtime().tm_hour
+        self._msg_hours.setdefault(nick, []).append(hour)
+        if target.startswith("#"):
+            prev = self._last_speaker.get(target)
+            if prev and prev != nick:
+                self._adjacency.setdefault(nick, Counter())[prev] += 1
+                self._adjacency.setdefault(prev, Counter())[nick] += 1
+            self._last_speaker[target] = nick
+            self._ch_activity.setdefault(nick, Counter())[target] += 1
+        # Targeting: detect "nick:" or "nick," at message start
+        clean = msg.lstrip()
+        if clean:
+            comma = clean.find(",")
+            colon = clean.find(":")
+            end = min(comma, colon) if comma >= 0 and colon >= 0 else max(comma, colon)
+            if end > 0:
+                maybe = clean[:end].lower()
+                if maybe and maybe != nick.lower():
+                    self._targets.setdefault(nick, Counter())[maybe] += 1
+        self.user_scores[nick] = u_score
+        self.user_ai_scores[nick] = rolling_ai
+        if win is not self.get_current_window():
+            self._unread_windows.add(win_name)
+            self._input_dirty = True
+            if not target.startswith("#") and nick != self._active_client().nick:
+                preview = (msg[:40] + "...") if len(msg) > 40 else msg
+                self.get_current_window().add_line(
+                    f"-!- PM from {nick}: {preview}  [/win {self.windows.index(win) + 1}]")
+        if rolling_ai >= self.ai_suspect_threshold:
+            self._suspect_nicks.add(nick)
+            self._dashboard_dirty = True
+        else:
+            self._suspect_nicks.discard(nick)
+        if win_name in self.channel_users and nick not in self.channel_users[win_name]:
+            self.channel_users[win_name].add(nick)
+            self._sorted_users.pop(win_name, None)
+            self._userlist_dirty = True
+        # A sent message implicitly clears any typing indicator for that nick.
+        tgt_peers = self._typing_peers.get(win_name.lower(), {})
+        if tgt_peers.pop(nick.lower(), None) is not None:
+            pass  # _chat_dirty already set below
+        self._chat_dirty = True
+        self.dirty = True
+        await self.plugin_manager.dispatch("on_message", nick=nick, target=target,
+                                           msg=msg, is_action=is_action, is_replay=is_replay)
+
+    async def _ev_typing(self, event):
+        _, nick, target, state = event
+        tgt = target.lower()
+        nick_l = nick.lower()
+        peers = self._typing_peers.setdefault(tgt, {})
+        if state == "done":
+            peers.pop(nick_l, None)
+        else:
+            expiry = time.monotonic() + (6.0 if state == "active" else 30.0)
+            peers[nick_l] = [nick, state, expiry]
+        if tgt == self.get_current_window().name.lower():
+            self._chat_dirty = True
+            self.dirty = True
+
+    async def _ev_react(self, event):
+        _, nick, target, msgid, emoji = event
+        win_name = target if target.startswith("#") else nick
+        wk = self._wk(self._active_server_id, win_name)
+        win = self.window_by_name.get(wk)
+        if win is None:
+            return
+        nicks = win._reactions.setdefault(msgid, {}).setdefault(emoji, [])
+        if nick not in nicks:
+            nicks.append(nick)
+        win._wrap_dirty = True
+        if win is self.get_current_window():
+            self._chat_dirty = True
+            self.dirty = True
+
+    async def _ev_redact(self, event):
+        _, nick, target, msgid, reason = event
+        win_name = target if target.startswith("#") else nick
+        wk = self._wk(self._active_server_id, win_name)
+        win = self.window_by_name.get(wk)
+        if win is None:
+            return
+        for i, mid in enumerate(win._line_msgids):
+            if mid == msgid:
+                old_line = win.lines[i]
+                ts_prefix = old_line[:8] if old_line.startswith("[") and len(old_line) >= 8 else ""
+                reason_str = f": {reason}" if reason else ""
+                win.lines[i] = f"{ts_prefix} [redacted by {nick}{reason_str}]"
+                win._wrap_dirty = True
+                break
+        if win is self.get_current_window():
+            self._chat_dirty = True
+            self.dirty = True
+
+    async def _ev_markread(self, event):
+        _, target, ts_arg = event
+        wk = self._wk(self._active_server_id, target)
+        win = self.window_by_name.get(wk)
+        if win is None:
+            return
+        if not ts_arg.startswith("timestamp="):
+            return
+        ts_iso = ts_arg[len("timestamp="):]
+        marker_time = _parse_server_time(ts_iso)  # returns "[HH:MM]" or None
+        if not marker_time:
+            return
+        # Find index of the first line whose timestamp is after the marker
+        unread_from = -1
+        for i, line in enumerate(win.lines):
+            if line.startswith("[") and len(line) >= 7 and line[6] == "]":
+                if line[:7] > marker_time:
+                    unread_from = i
+                    break
+        win._unread_from = unread_from
+        win._wrap_dirty = True
+        if win is self.get_current_window():
+            self._chat_dirty = True
+            self.dirty = True
+
+    async def _ev_ai_score(self, event):
+        _, nick, rolling_ai = event
+        old_score = self.user_ai_scores.get(nick)
+        self.user_ai_scores[nick] = rolling_ai
+        was_suspect = nick in self._suspect_nicks
+        if rolling_ai >= self.ai_suspect_threshold:
+            self._suspect_nicks.add(nick)
+            self._dashboard_dirty = True
+        else:
+            self._suspect_nicks.discard(nick)
+        is_suspect = nick in self._suspect_nicks
+        if old_score != rolling_ai or was_suspect != is_suspect:
+            self._userlist_dirty = True
+            self.dirty = True
+        if was_suspect != is_suspect:
+            # Suspect set changed — chat must repaint to apply/remove bold highlighting
+            self._chat_dirty = True
+            self.dirty = True
+
+    async def _ev_notice(self, event):
+        _, sender, target, text = event
+        if sender.lower() in self.ignored_nicks:
+            return
+        win = self.ensure_window(target, is_channel=target.startswith("#"))
+        win.add_line(f"-{sender}- {text}")
+        if win is not self.get_current_window():
+            self._unread_windows.add(target)
+            self._input_dirty = True
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _ev_nick_change(self, event):
+        _, old_nick, new_nick = event
+        for ch, users in self.channel_users.items():
+            if old_nick in users:
+                users.discard(old_nick)
+                users.add(new_nick)
+                mode_set = self.channel_user_modes.get(ch, {}).pop(old_nick, None)
+                if mode_set is not None:
+                    self.channel_user_modes[ch][new_nick] = mode_set
+        # Migrate investigative data
+        for d in (self._msg_hours, self._adjacency, self._targets, self._ch_activity):
+            if old_nick in d:
+                d[new_nick] = d.pop(old_nick)
+                self._sorted_users.pop(ch, None)
+        if old_nick in self.user_scores:
+            self.user_scores[new_nick] = self.user_scores.pop(old_nick)
+        if old_nick in self.user_ai_scores:
+            score = self.user_ai_scores.pop(old_nick)
+            self.user_ai_scores[new_nick] = score
+            self._suspect_nicks.discard(old_nick)
+            if score >= self.ai_suspect_threshold:
+                self._suspect_nicks.add(new_nick)
+        self._status_win().add_line(f"* {old_nick} is now known as {new_nick}")
+        self._chat_dirty = self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_names(self, event):
+        _, channel, names_raw = event
+        if channel not in self.channel_users:
+            self.channel_users[channel] = set()
+            self.channel_user_modes[channel] = {}
+        modes = self.channel_user_modes.setdefault(channel, {})
+        _letter_by_prefix = {"~": "q", "&": "a", "@": "o", "%": "h", "+": "v"}
+        for n in names_raw.split():
+            mode_char = n[0] if n and n[0] in "~&@%+" else ""
+            clean = n.lstrip("~&@%+")
+            if clean:
+                self.channel_users[channel].add(clean)
+                modes[clean] = {_letter_by_prefix[mode_char]} if mode_char else set()
+        self._sorted_users.pop(channel, None)
+        self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_clear_users(self, event):
+        for users in self.channel_users.values():
+            users.clear()
+        for modes in self.channel_user_modes.values():
+            modes.clear()
+        self._sorted_users.clear()
+        self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_topic(self, event):
+        _, channel, topic_text = event
+        text = (f"* Topic for {channel}: {topic_text}"
+                if topic_text else f"* No topic set for {channel}")
+        wk = self._wk(self._active_server_id, channel)
+        target_win = self.window_by_name.get(wk) or self._status_win()
+        target_win.add_line(text)
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _ev_join(self, event):
+        _, nick, channel = event
+        win = self.ensure_window(channel)
+        if nick == self._active_client().nick:
+            self.channel_users[channel] = set()
+            self.channel_user_modes[channel] = {}
+            self._sorted_users.pop(channel, None)
+        else:
+            if channel in self.channel_users:
+                self.channel_users[channel].add(nick)
+                self.channel_user_modes.setdefault(channel, {})[nick] = set()
+                self._sorted_users.pop(channel, None)
+            win.add_line(f"* {nick} has joined {channel}")
+        self._chat_dirty = self._userlist_dirty = True
+        self.dirty = True
+        await self.plugin_manager.dispatch("on_join", nick=nick, channel=channel)
+
+    async def _ev_self_join(self, event):
+        _, channel = event
+        self.channel_user_modes.setdefault(channel, {})
+        win = self.ensure_window(channel)
+        win.add_line(f"* You have joined {channel}")
+        self.current_channel = channel
+        self.current_window_index = self.windows.index(win)
+        self._unread_windows.discard(channel)
+        # Fetch stored read marker from server if supported
+        client = self._active_client()
+        if "read-marker" in client._active_caps:
+            client.send_raw(f"MARKREAD {channel} *")
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self.dirty = True
+
+    async def _ev_join_error(self, event):
+        _, channel, msg = event
+        if channel:
+            win = self.ensure_window(channel)
+            win.add_line(msg)
+            self.current_channel = channel
+            self.current_window_index = self.windows.index(win)
+            self._unread_windows.discard(channel)
+        else:
+            self._status_win().add_line(msg)
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self.dirty = True
+
+    async def _ev_part(self, event):
+        _, nick, channel = event
+        if channel in self.channel_users:
+            self.channel_users[channel].discard(nick)
+            self.channel_user_modes.get(channel, {}).pop(nick, None)
+            self._sorted_users.pop(channel, None)
+        self._suspect_nicks.discard(nick)
+        ch_win = self.window_by_name.get(self._wk(self._active_server_id, channel))
+        if ch_win:
+            ch_win.add_line(f"* {nick} has left {channel}")
+            if ch_win is not self.get_current_window():
+                self._unread_windows.add(ch_win.name)
+                self._input_dirty = True
+        self._chat_dirty = self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_quit(self, event):
+        _, nick, reason = event
+        quit_msg = f"* {nick} has quit" + (f" ({reason})" if reason else "")
+        for ch, users in self.channel_users.items():
+            if nick in users:
+                users.discard(nick)
+                self.channel_user_modes.get(ch, {}).pop(nick, None)
+                self._sorted_users.pop(ch, None)
+                ch_win = self.window_by_name.get(self._wk(self._active_server_id, ch))
+                if ch_win:
+                    ch_win.add_line(quit_msg)
+                    if ch_win is not self.get_current_window():
+                        self._unread_windows.add(ch_win.name)
+                        self._input_dirty = True
+        self._suspect_nicks.discard(nick)
+        self.user_scores.pop(nick, None)
+        self.user_ai_scores.pop(nick, None)
+        self._chat_dirty = self._userlist_dirty = True
+        self.dirty = True
+
+    _PREFIX_BY_LETTER = {"q": "~", "a": "&", "o": "@", "h": "%", "v": "+"}
+    _MODE_ARGS_CHARS: set = set("qaohvbeIkl")
+
+    @staticmethod
+    def _highest_prefix(mode_set: set) -> str:
+        for letter in ("q", "a", "o", "h", "v"):
+            if letter in mode_set:
+                return TUI._PREFIX_BY_LETTER[letter]
+        return ""
+
+    async def _ev_mode(self, event):
+        _, nick, params = event
+        if len(params) < 2:
+            return
+        target = params[0]
+        if not target.startswith("#"):
+            return
+        modestr = params[1]
+        mode_args = params[2:]
+        modes = self.channel_user_modes.get(target)
+        if modes is None:
+            return
+        adding = True
+        arg_idx = 0
+        for ch in modestr:
+            if ch == "+":
+                adding = True
+            elif ch == "-":
+                adding = False
+            elif ch in self._PREFIX_BY_LETTER and arg_idx < len(mode_args):
+                user = mode_args[arg_idx]
+                uset = modes.setdefault(user, set())
+                if adding:
+                    uset.add(ch)
+                else:
+                    uset.discard(ch)
+                arg_idx += 1
+            elif ch in self._MODE_ARGS_CHARS:
+                arg_idx += 1
+        self._sorted_users.pop(target, None)
+        self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_kick(self, event):
+        _, nick, channel, kicked, reason = event
+        if channel in self.channel_users:
+            self.channel_users[channel].discard(kicked)
+            self.channel_user_modes.get(channel, {}).pop(kicked, None)
+            self._sorted_users.pop(channel, None)
+        self._suspect_nicks.discard(kicked)
+        ch_win = self.window_by_name.get(self._wk(self._active_server_id, channel))
+        if ch_win:
+            msg = f"* {kicked} was kicked from {channel} by {nick}" + (f" ({reason})" if reason else "")
+            ch_win.add_line(msg)
+            if ch_win is not self.get_current_window():
+                self._unread_windows.add(ch_win.name)
+                self._input_dirty = True
+        self._chat_dirty = self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_list_results(self, event):
+        _, results = event
+        ch_count = len(results)
+        sw = self._status_win()
+        sw.add_line(f"── Channel list ({ch_count} channels) ──")
+        if ch_count <= 200:
+            for ch, users, topic in results:
+                short_topic = topic[:60] + "…" if len(topic) > 60 else topic
+                sw.add_line(f"  {ch:<20} {users:>4}  {short_topic}")
+        else:
+            sw.add_line(f"  ({ch_count} channels — too many to display, try /list <pattern>)")
+        sw.add_line(f"── End of channel list ──")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _ev_status_line(self, event):
+        msg = str(event[1]) if len(event) > 1 else str(event)
+        self._status_win().add_line(msg)
+        self._chat_dirty = True
+        self.dirty = True
+
+    def _build_slash_handlers(self) -> None:
+        h = self._slash_handlers
+        h["me"] = h["action"] = self._slash_me
+        h["ctcp"]       = self._slash_ctcp
+        h["whois"]      = self._slash_whois
+        h["mode"]       = self._slash_mode
+        h["topic"]      = self._slash_topic
+        h["kick"]       = self._slash_kick
+        h["ns"] = h["nickserv"] = self._slash_ns
+        h["cs"] = h["chanserv"] = self._slash_cs
+        h["ai"]         = self._slash_ai
+        h["bot"]        = self._slash_bot
+        h["unbot"]      = self._slash_unbot
+        h["learn_tell"] = h["ltell"] = self._slash_learn_tell
+        h["forget_tell"] = h["ftell"] = self._slash_forget_tell
+        h["scan_watermark"] = h["watermark"] = self._slash_scan_watermark
+        h["topai"]      = self._slash_topai
+        h["aitoggle"]   = self._slash_aitoggle
+        h["logtoggle"]  = self._slash_logtoggle
+        h["join"]       = self._slash_join
+        h["part"]       = self._slash_part
+        h["nick"]       = self._slash_nick
+        h["msg"] = h["m"] = self._slash_msg
+        h["query"]      = self._slash_query
+        h["notice"]     = self._slash_notice
+        h["away"]       = self._slash_away
+        h["back"]       = self._slash_back
+        h["invite"]     = self._slash_invite
+        h["op"]         = self._slash_op
+        h["deop"]       = self._slash_deop
+        h["voice"]      = self._slash_voice
+        h["devoice"]    = self._slash_devoice
+        h["hop"]        = self._slash_hop
+        h["dehop"]      = self._slash_dehop
+        h["ban"]        = self._slash_ban
+        h["unban"]      = self._slash_unban
+        h["who"]        = self._slash_who
+        h["whowas"]     = self._slash_whowas
+        h["names"]      = self._slash_names
+        h["ignore"]     = self._slash_ignore
+        h["unignore"]   = self._slash_unignore
+        h["clear"]      = self._slash_clear
+        h["close"] = h["wc"] = self._slash_close
+        h["win"] = h["window"] = self._slash_win
+        h["quit"] = h["exit"] = self._slash_quit
+        h["server"]     = self._slash_server
+        h["reconnect"]  = self._slash_reconnect
+        h["theme"]      = self._slash_theme
+        h["askai"]      = self._slash_askai
+        h["summarize"] = h["summarise"] = h["summerize"] = self._slash_summarize
+        h["model"]      = self._slash_model
+        h["api"]        = self._slash_api
+        h["autotranslate"] = self._slash_autotranslate
+        h["linkpreview"]  = self._slash_linkpreview
+        h["autojoin"]     = self._slash_autojoin
+        h["commands"]   = self._slash_commands
+        h["help"]       = self._slash_help
+        h["loadplugin"]   = self._slash_loadplugin
+        h["unloadplugin"] = self._slash_unloadplugin
+        h["reloadplugin"] = self._slash_reloadplugin
+        h["plugins"]      = self._slash_plugins
+        h["redraw"]       = self._slash_redraw
+        h["links"]        = self._slash_links
+        h["list"]         = self._slash_list
+        h["userlist"]     = self._slash_userlist
+        h["znc"]          = self._slash_znc
+        h["jitsi"]        = self._slash_jitsi
+        h["chain"]        = self._slash_chain
+        h["idle"]         = self._slash_idle
+        h["together"]     = self._slash_together
+        h["adjacent"]     = self._slash_adjacent
+        h["targets"]      = self._slash_targets
+        h["alias"]        = self._slash_alias
+        h["mute"]         = self._slash_mute
+        h["replay"]       = self._slash_replay
+        h["monitor"]      = self._slash_monitor
+        h["whox"]         = self._slash_whox
+        h["tagmsg"]       = self._slash_tagmsg
+        h["reply"]        = self._slash_reply
+        h["react"]        = self._slash_react
+        h["ml"] = h["multiline"] = self._slash_multiline
+        h["redact"]       = self._slash_redact
+        h["register"]     = self._slash_register
+        h["pem"]          = self._slash_pem
+        h["vibe"]         = self._slash_vibe
+        h["explain"]      = self._slash_explain
+        h["fingerprint"]  = self._slash_fingerprint
+        h["cluster"]      = self._slash_cluster
+        h["x0"]           = self._slash_x0
+
+    async def handle_input_line(self, line: str) -> None:
+        if not line.strip():
+            return
+        # Sync context to the server owning the current window so slash commands
+        # and plain text go to the right server.
+        self._sync_draw_ctx()
+        if line.startswith("/"):
+            parts = line[1:].split(maxsplit=2)
+            cmd   = parts[0].lower()
+            args  = parts[1] if len(parts) > 1 else ""
+            extra = parts[2] if len(parts) > 2 else ""
+            # User-defined alias expansion — only expand once (no recursion)
+            if cmd in self._aliases and cmd not in self._slash_handlers:
+                expanded = self._aliases[cmd]
+                new_line = "/" + expanded + (" " + " ".join(filter(None, [args, extra]))).rstrip()
+                await self.handle_input_line(new_line)
+                return
+            handler = self._slash_handlers.get(cmd)
+            if handler:
+                await handler(args, extra, line)
+            else:
+                plugin_entry = self.plugin_manager.get_command(cmd)
+                if plugin_entry:
+                    plug_api, plug_handler = plugin_entry
+                    plug_args = line[1 + len(cmd):].lstrip()
+                    try:
+                        result = plug_handler(plug_api, plug_args)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as plug_exc:
+                        await self.ui_queue.put(
+                            ("status", f"[plugin:{plug_api.name}] error: {plug_exc}"))
+                else:
+                    self._active_client().send_raw(line[1:])
+        else:
+            stripped_line = line.strip()
+            ext = os.path.splitext(stripped_line)[1].lower()
+            if ext in _IMAGE_EXTENSIONS and os.path.isfile(stripped_line):
+                await self.ui_queue.put(("status", f"Auto-uploading {stripped_line} to x0.at\u2026"))
+                loop = asyncio.get_event_loop()
+                url = await loop.run_in_executor(_IO_EXECUTOR, _upload_to_x0, stripped_line)
+                if url:
+                    line = url
+                else:
+                    await self.ui_queue.put(("status", "x0.at auto-upload failed, sending as text."))
+            await self._send_plain_text(line)
+        self._chat_dirty = True
+        self._input_dirty = True
+        self.dirty = True
+        self.completion_state = None
+
+    async def _send_plain_text(self, line: str) -> None:
+        cur_win = self.get_current_window()
+        if cur_win.name not in ("*status*", "*dashboard*"):
+            target = cur_win.name
+        else:
+            target = self.current_channel or DEFAULT_CHANNEL
+            if target:
+                dest = self.ensure_window(target, is_channel=target.startswith("#"))
+                self.current_channel = target
+                self.current_window_index = self.windows.index(dest)
+                self._unread_windows.discard(target)
+        result = self._active_client().cmd_msg(target, line)
+        if result:
+            await self.ui_queue.put(result)
+
+    async def _slash_me(self, args, extra, line):
+        slash_end = line.index(" ") + 1 if " " in line else len(line)
+        action_text = line[slash_end:].strip()
+        if not action_text:
+            return
+        cur_win = self.get_current_window()
+        target = (cur_win.name if cur_win.name not in ("*status*", "*dashboard*")
+                  else self.current_channel or DEFAULT_CHANNEL)
+        result = self._active_client().cmd_msg(target, action_text, is_action=True)
+        if result:
+            await self.ui_queue.put(result)
+
+    async def _slash_ctcp(self, args, extra, line):
+        if args and extra:
+            self._active_client().cmd_ctcp(args, extra.upper())
+            await self.ui_queue.put(("status", f"CTCP {extra.upper()} sent to {args}"))
+        else:
+            await self.ui_queue.put(("status", "Usage: /ctcp <nick> <command> [args]"))
+
+    async def _slash_whois(self, args, extra, line):
+        if args:
+            self._active_client().cmd_whois(args)
+
+    async def _ev_chanmode(self, event):
+        _, channel, modestr, mode_args = event
+        wk = self._wk(self._active_server_id, channel)
+        win = self.window_by_name.get(wk) or self._status_win()
+        if mode_args:
+            win.add_line(f"* Channel modes for {channel}: +{modestr} {' '.join(mode_args)}")
+        else:
+            win.add_line(f"* Channel modes for {channel}: +{modestr}" if modestr
+                         else f"* No channel modes set for {channel}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_mode(self, args, extra, line):
+        # Reconstruct from the raw line to avoid maxsplit=2 truncation
+        space = line.find(" ")
+        if space == -1:
+            ch = self.current_channel or self.get_current_window().name
+            if ch and ch.startswith("#"):
+                self._active_client().cmd_mode(ch)
+            else:
+                await self.ui_queue.put(("status", "Usage: /mode [<#channel>] [modes]"))
+            return
+        rest = line[space + 1:].strip()
+        parts = rest.split(maxsplit=1)
+        target = parts[0]
+        modestr = parts[1] if len(parts) > 1 else ""
+        if target.startswith("#") or target.startswith("&"):
+            self._active_client().cmd_mode(target, modestr)
+        else:
+            await self.ui_queue.put(("status", "Usage: /mode <#channel> [modes]"))
+
+    async def _slash_topic(self, args, extra, line):
+        if not args and not extra:
+            ch = self.current_channel or self.get_current_window().name
+            if ch and ch.startswith("#"):
+                self._active_client().cmd_topic(ch)
+            else:
+                await self.ui_queue.put(("status", "Usage: /topic [<#channel>] [<new topic>]"))
+            return
+        first = args.strip()
+        rest = extra.strip()
+        if first.startswith("#"):
+            # /topic <#channel> [new topic]
+            if rest:
+                self._active_client().cmd_topic(first, rest)
+            else:
+                self._active_client().cmd_topic(first)
+        else:
+            # /topic <new topic>  (current channel)
+            ch = self.current_channel or self.get_current_window().name
+            if ch and ch.startswith("#"):
+                text = first + (" " + rest if rest else "")
+                self._active_client().cmd_topic(ch, text)
+            else:
+                await self.ui_queue.put(("status", "Usage: /topic [<#channel>] [<new topic>]"))
+
+    async def _slash_kick(self, args, extra, line):
+        if args:
+            p = args.split(maxsplit=2)
+            if len(p) >= 2:
+                self._active_client().cmd_kick(p[0], p[1], p[2] if len(p) > 2 else "")
+
+    async def _slash_ns(self, args, extra, line):
+        if args:
+            self._active_client().cmd_service("NickServ", args)
+
+    async def _slash_cs(self, args, extra, line):
+        if args:
+            self._active_client().cmd_service("ChanServ", args)
+
+    async def _slash_ai(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[ai] disabled by --no-ai")); return
+        if args:
+            await self.show_user_ai_profile(args)
+        else:
+            await self.ui_queue.put(("status", "Usage: /ai <nick>"))
+
+    # ── /bot and /unbot ──────────────────────────────────────────────────────
+
+    _MSG_LINE_RE = re.compile(r'^\[\d{2}:\d{2}\] <(\S+?)> (.+)$')
+    _ACT_LINE_RE = re.compile(r'^\[\d{2}:\d{2}\] \* (\S+) (.+)$')
+
+    async def _slash_bot(self, args, extra, line):
+        """Mark a nick as a confirmed bot/AI and build a fingerprint from history."""
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[bot] disabled by --no-ai")); return
+        nick = args.strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /bot <nick>  —  mark as confirmed bot/AI"))
+            return
+
+        client  = self._active_client()
+        scoring = client.scoring
+
+        # Mark UserState if the nick is seen this session.
+        u_state = client.users.get(nick)
+        if u_state:
+            u_state.is_confirmed_bot = True
+
+        # Extract messages by this nick from all visible chat windows to seed the
+        # fingerprint with as much context as possible.
+        raw_msgs: List[str] = []
+        for win in self.windows:
+            for ln in win.lines:
+                m = self._MSG_LINE_RE.match(ln)
+                if m and m.group(1) == nick:
+                    raw_msgs.append(m.group(2))
+                    continue
+                a = self._ACT_LINE_RE.match(ln)
+                if a and a.group(1) == nick:
+                    raw_msgs.append(a.group(2))
+
+        fp = scoring.confirm_bot(nick, raw_msgs)
+
+        msg_count = u_state.total_msgs if u_state else 0
+        await self.ui_queue.put(("status",
+            f"[bot] {nick} marked as confirmed bot/AI — "
+            f"fingerprint built from {fp.msg_count} msgs "
+            f"({len(fp.bigrams)} bigrams, {len(fp.trigrams)} trigrams)  "
+            f"session msgs: {msg_count}"))
+
+        # ── Asynchronously train LoRA adapter on this bot's messages ────────
+        if _PEFT_AVAILABLE and raw_msgs:
+            _neg_msgs: List[str] = []
+            for _win in self.windows:
+                for _ln in list(_win.lines)[-100:]:
+                    _m = self._MSG_LINE_RE.match(_ln)
+                    if _m and _m.group(1) != nick and len(_m.group(2).split()) >= 3:
+                        _neg_msgs.append(_m.group(2))
+            if len(_neg_msgs) > len(raw_msgs) * 3:
+                _neg_msgs = random.sample(_neg_msgs, min(len(raw_msgs) * 3, 60))
+            _adapter_dir = os.path.join(_SCRIPT_DIR, f"lora_{nick}")
+            _detector = scoring.ai_detector
+            loop = asyncio.get_running_loop()
+            _lora_result = await loop.run_in_executor(
+                None, _detector._train_lora_adapter,
+                raw_msgs, _neg_msgs, _adapter_dir)
+            if _lora_result and os.path.isdir(_lora_result):
+                await self.ui_queue.put(("status",
+                    f"[bot] LoRA adapter saved to {_lora_result}  "
+                    f"(use /bot to confirm another user, or restart to reload)"))
+            elif _lora_result:
+                await self.ui_queue.put(("status",
+                    f"[bot] LoRA: {_lora_result}"))
+
+    async def _slash_unbot(self, args, extra, line):
+        """Remove confirmed-bot status from a nick."""
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[unbot] disabled by --no-ai")); return
+        nick = args.strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /unbot <nick>"))
+            return
+
+        client  = self._active_client()
+        scoring = client.scoring
+
+        u_state = client.users.get(nick)
+        if u_state:
+            u_state.is_confirmed_bot = False
+
+        scoring.unconfirm_bot(nick)
+        await self.ui_queue.put(("status", f"[bot] {nick} removed from confirmed-bot list"))
+
+    # ── /learn_tell  —  collaborative n-gram blocklist  (Area 3) ──────────
+
+    async def _slash_learn_tell(self, args, extra, line):
+        """Add n-grams from a phrase to the shared blocklist.
+
+        Usage: /learn_tell <phrase>
+          The phrase is tokenised into words, bigrams, and trigrams and added
+          to the persistent blocklist.  Future messages containing these n-grams
+          receive a score boost.
+        """
+        phrase = (args + " " + extra).strip()
+        if not phrase:
+            await self.ui_queue.put(("status", "Usage: /learn_tell <phrase>"))
+            return
+        scoring = self._active_client().scoring
+        n_added = scoring.add_tell(phrase)
+        await self.ui_queue.put(("status",
+            f"[learn_tell] added {n_added} n-gram(s) from \"{phrase[:60]}\"  "
+            f"(total: {len(scoring.blocklisted_ngrams)})"))
+
+    async def _slash_forget_tell(self, args, extra, line):
+        """Remove n-grams of a phrase from the shared blocklist.
+
+        Usage: /forget_tell <phrase>
+        """
+        phrase = (args + " " + extra).strip()
+        if not phrase:
+            await self.ui_queue.put(("status", "Usage: /forget_tell <phrase>"))
+            return
+        scoring = self._active_client().scoring
+        n_removed = scoring.remove_tell(phrase)
+        await self.ui_queue.put(("status",
+            f"[forget_tell] removed {n_removed} n-gram(s) for \"{phrase[:60]}\"  "
+            f"(total: {len(scoring.blocklisted_ngrams)})"))
+
+    # ── /scan_watermark  —  LLM watermark detection  (Area 5) ─────────────
+
+    async def _slash_scan_watermark(self, args, extra, line):
+        """Scan recent messages or provided text for LLM watermark patterns.
+
+        Usage: /scan_watermark [text]
+          If text is provided, analyse it directly.  Otherwise scan the last
+          10 messages in the current window.
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[watermark] disabled by --no-ai")); return
+        msg_text = (args + " " + extra).strip()
+        detector = self._active_client().scoring.ai_detector
+        if not detector.enabled:
+            await self.ui_queue.put(("status", "[watermark] AI detector is disabled")); return
+
+        results: List[Tuple[str, float]] = []
+        if msg_text:
+            wm = detector.watermark_score(msg_text)
+            results.append((msg_text[:80], wm))
+        else:
+            cur_win = self.get_current_window()
+            _TS_RE = re.compile(r'^\[\d{2}:\d{2}\]\s*')
+            _SPEAKER_RE = re.compile(r'^<(\S+?)>\s*(.*)')
+            count = 0
+            for ln in reversed(list(cur_win.lines)):
+                stripped = _TS_RE.sub("", ln)
+                m = _SPEAKER_RE.match(stripped)
+                if m:
+                    wm = detector.watermark_score(m.group(2))
+                    results.append((f"<{m.group(1)}> {m.group(2)[:60]}", wm))
+                    count += 1
+                    if count >= 10:
+                        break
+
+        if not results:
+            await self.ui_queue.put(("status", "[watermark] no messages to scan"))
+            return
+
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+        L("=== Watermark Scan ===")
+        L("")
+        bars = "▁▂▃▄▅▆▇█"
+        for preview, wm_score in results:
+            bar = bars[min(7, int(wm_score * 8))]
+            flag = "  *** WATERMARK ***" if wm_score >= 0.35 else ""
+            L(f"  [{wm_score:.2f} {bar}] {preview}{flag}")
+        L("")
+        L("  ── Legend ──────────────────────────────────────")
+        L("  Score ≥ 0.35  — likely watermarked (LLM-generated)")
+        L("  Score 0.15–0.34 — weak watermark signal")
+        L("  Score < 0.15  — natural/unwatermarked text")
+
+        self._dashboard_mode = "profile"
+        self._dashboard_dirty = False
+        self._dashboard_last_update = time.monotonic()
+        self.current_window_index = 1
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_topai(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[topai] disabled by --no-ai")); return
+        cur_win = self.get_current_window()
+        channel = cur_win.name if cur_win.name.startswith("#") else self.current_channel or ""
+        if not channel or channel not in self.channel_users:
+            await self.ui_queue.put(("status", "/topai: switch to a channel window first"))
+            return
+
+        client    = self._active_client()
+        chan_nicks = self.channel_users.get(channel, set())
+        bars      = "▁▂▃▄▅▆▇█"
+        now       = time.monotonic()
+
+        confirmed = client.scoring.confirmed_bot_nicks
+
+        rows = []
+        for nick in chan_nicks:
+            state = client.users.get(nick)
+            is_bot = nick in confirmed
+            if state is None or state.total_msgs == 0:
+                # Include confirmed bots even with 0 session messages
+                if not is_bot:
+                    continue
+            ai_pct = int(state.rolling_ai_likelihood()) if state else 100
+            if ai_pct == 0 and not is_bot:
+                continue
+            rows.append((nick, ai_pct, state, is_bot))
+        # Confirmed bots always sort first, then by descending AI%
+        rows.sort(key=lambda x: (not x[3], -x[1], x[0].lower()))
+
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+
+        L(f"=== /topai — {channel}  ({len(rows)} scored users) ===")
+        L("")
+
+        if not rows:
+            L("  No users with scored messages in this channel yet.")
+        else:
+            L(f"  {'Nick':<16} {'AI%':>4}  {'Msgs':>4}  {'AvgLen':>6}  {'mpm':>5}  {'Last':>5}  History")
+            L("  " + "─" * 66)
+            thresh = self.ai_suspect_threshold
+            for nick, ai_pct, state, is_bot in rows:
+                last_ago = (int((now - state.last_msg_time) // 60)
+                            if state and state.last_msg_time else 0)
+                spark    = ("".join(bars[min(7, s * 8 // 101)]
+                                    for s in list(state.ai_scores)[-12:])
+                            if state else "")
+                msgs     = state.total_msgs if state else 0
+                avg_len  = state.avg_msg_length() if state else 0.0
+                mpm      = state.messages_per_minute() if state else 0.0
+                if is_bot:
+                    flag = "B"
+                elif ai_pct >= thresh:
+                    flag = "*"
+                else:
+                    flag = " "
+                L(f"  {flag}{nick:<15} {ai_pct:3d}%  {msgs:4d}  "
+                  f"{avg_len:6.0f}  {mpm:5.1f}"
+                  f"  {last_ago:3d}m  {spark}")
+
+        L("")
+        L(f"  B = confirmed bot/AI  * = at or above suspect threshold ({self.ai_suspect_threshold}%)")
+
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self.current_window_index      = 1
+        self._chat_dirty               = True
+        self.dirty                     = True
+
+    async def _slash_aitoggle(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[aitoggle] disabled by --no-ai")); return
+        detector = self._active_client().scoring.ai_detector
+        detector.enabled = not detector.enabled
+        det_state = "ENABLED" if detector.enabled else "DISABLED"
+        log_state = "log:ON" if _ai_logging_enabled else "log:OFF"
+        await self.ui_queue.put(("status", f"AI detection {det_state}  ({log_state})"))
+
+    async def _slash_logtoggle(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[logtoggle] disabled by --no-ai")); return
+        global _ai_logging_enabled
+        # Write a final "disabled" record before we stop writing, or a "enabled" record
+        # immediately after we start — so the log gap is bounded and auditable.
+        if _ai_logging_enabled:
+            log_toggle_event(enabled=False, nick=self._active_client().nick)
+        _ai_logging_enabled = not _ai_logging_enabled
+        if _ai_logging_enabled:
+            log_toggle_event(enabled=True, nick=self._active_client().nick)
+        state = "ENABLED" if _ai_logging_enabled else "DISABLED"
+        await self.ui_queue.put(("status", f"AI detection logging {state}  (file: {AI_LOG_PATH})"))
+
+    async def _slash_join(self, args, extra, line):
+        if args:
+            self._active_client().cmd_join(args)
+
+    async def _slash_part(self, args, extra, line):
+        ch = args or self.current_channel or ""
+        if ch:
+            self._active_client().cmd_part(ch, extra or None)
+
+    async def _slash_nick(self, args, extra, line):
+        if args:
+            self._active_client().cmd_nick(args)
+
+    async def _slash_msg(self, args, extra, line):
+        if args and extra:
+            self._active_client().cmd_msg(args, extra)
+            win = self.ensure_window(args, is_channel=False)
+            win.add_line(f"<{self._active_client().nick}> {extra}")
+            self.current_window_index = self.windows.index(win)
+            self.current_channel = args
+            self._unread_windows.discard(args)
+            self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+            self.dirty = True
+        else:
+            await self.ui_queue.put(("status", "Usage: /msg <nick> <text>"))
+
+    async def _slash_query(self, args, extra, line):
+        if args:
+            wk = self._wk(self._active_server_id, args)
+            is_new = wk not in self.window_by_name
+            win = self.ensure_window(args, is_channel=False)
+            self.current_window_index = self.windows.index(win)
+            self.current_channel = args
+            self._unread_windows.discard(args)
+            self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+            if is_new:
+                win.add_line(f"** Query with {args} opened **", timestamp=False)
+            if extra:
+                self._active_client().cmd_msg(args, extra)
+                win.add_line(f"<{self._active_client().nick}> {extra}")
+        else:
+            await self.ui_queue.put(("status", "Usage: /query <nick> [message]"))
+
+    async def _slash_notice(self, args, extra, line):
+        if args and extra:
+            self._active_client().cmd_notice(args, extra)
+            await self.ui_queue.put(("status", f"-> NOTICE to {args}: {extra}"))
+        else:
+            await self.ui_queue.put(("status", "Usage: /notice <nick> <text>"))
+
+    async def _slash_away(self, args, extra, line):
+        self._active_client().cmd_away(args)
+        await self.ui_queue.put(("status", f"You are now away: {args}" if args else "You are now away"))
+
+    async def _slash_back(self, args, extra, line):
+        self._active_client().cmd_away()
+        await self.ui_queue.put(("status", "You are no longer away"))
+
+    async def _slash_invite(self, args, extra, line):
+        if args:
+            channel = extra or self.current_channel or ""
+            if channel:
+                self._active_client().cmd_invite(args, channel)
+                await self.ui_queue.put(("status", f"Inviting {args} to {channel}"))
+            else:
+                await self.ui_queue.put(("status", "Usage: /invite <nick> [channel]"))
+
+    async def _slash_op(self, args, extra, line):
+        if args and self.current_channel:
+            self._active_client().cmd_mode(self.current_channel, f"+o {args}")
+
+    async def _slash_deop(self, args, extra, line):
+        if args and self.current_channel:
+            self._active_client().cmd_mode(self.current_channel, f"-o {args}")
+
+    async def _slash_voice(self, args, extra, line):
+        if args and self.current_channel:
+            self._active_client().cmd_mode(self.current_channel, f"+v {args}")
+
+    async def _slash_devoice(self, args, extra, line):
+        if args and self.current_channel:
+            self._active_client().cmd_mode(self.current_channel, f"-v {args}")
+
+    async def _slash_hop(self, args, extra, line):
+        if args and self.current_channel:
+            self._active_client().cmd_mode(self.current_channel, f"+h {args}")
+
+    async def _slash_dehop(self, args, extra, line):
+        if args and self.current_channel:
+            self._active_client().cmd_mode(self.current_channel, f"-h {args}")
+
+    async def _slash_ban(self, args, extra, line):
+        if args and self.current_channel:
+            mask = args if "!" in args or "@" in args else f"{args}!*@*"
+            self._active_client().cmd_mode(self.current_channel, f"+b {mask}")
+
+    async def _slash_unban(self, args, extra, line):
+        if args and self.current_channel:
+            self._active_client().cmd_mode(self.current_channel, f"-b {args}")
+
+    async def _slash_who(self, args, extra, line):
+        if args:
+            c = self._active_client()
+            # Use WHOX when server supports it; falls back to plain WHO automatically
+            c.cmd_whox(args)
+
+    async def _slash_whowas(self, args, extra, line):
+        if args:
+            self._active_client().cmd_whowas(args)
+
+    async def _slash_names(self, args, extra, line):
+        self._active_client().cmd_names(args or self.current_channel or "")
+
+    def _save_ignored(self) -> None:
+        cfg = load_irc_config()
+        cfg["ignored_nicks"] = sorted(self.ignored_nicks)
+        save_irc_config(cfg)
+
+    def _save_aliases(self) -> None:
+        cfg = load_irc_config()
+        cfg["aliases"] = dict(self._aliases)
+        save_irc_config(cfg)
+
+    async def _slash_ignore(self, args, extra, line):
+        if args:
+            self.ignored_nicks.add(args.lower())
+            self._save_ignored()
+            await self.ui_queue.put(("status", f"Now ignoring {args}"))
+
+    async def _slash_unignore(self, args, extra, line):
+        if args:
+            self.ignored_nicks.discard(args.lower())
+            self._save_ignored()
+            await self.ui_queue.put(("status", f"No longer ignoring {args}"))
+
+    async def _slash_clear(self, args, extra, line):
+        win = self.get_current_window()
+        win.lines.clear()
+        win._line_msgids.clear()
+        win._msg_store.clear()
+        win._reactions.clear()
+        win._last_msgid = ""
+        win._unread_from = -1
+        win._wrap_dirty = True
+
+    async def _slash_close(self, args, extra, line):
+        win = self.get_current_window()
+        if win.name not in ("*status*", "*dashboard*"):
+            self._unread_windows.discard(win.name)
+            self.windows.remove(win)
+            wk = self._wk(win.server_id or self._primary_server_id, win.name)
+            self.window_by_name.pop(wk, None)
+            self.current_window_index = max(0, self.current_window_index - 1)
+            new_win = self.get_current_window()
+            if new_win.name not in ("*status*", "*dashboard*"):
+                self.current_channel = new_win.name
+            self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+            self.dirty = True
+
+    async def _slash_win(self, args, extra, line):
+        if args.isdigit():
+            idx = int(args) - 1
+            if 0 <= idx < len(self.windows):
+                self._mark_window_read(self.get_current_window())
+                self.current_window_index = idx
+                win = self.windows[idx]
+                if win.name not in ("*status*", "*dashboard*"):
+                    self.current_channel = win.name
+                if win.name in self._unread_windows:
+                    win.scroll_offset = 0
+                self._unread_windows.discard(win.name)
+                win._unread_from = -1
+                self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                self.dirty = True
+
+    async def _slash_quit(self, args, extra, line):
+        msg = (args + " " + extra).strip() if args else ""
+        quit_line = (
+            (f"QUIT :{msg}" if msg else "QUIT :Client exiting")
+            .encode("utf-8", "replace")[:510] + b"\r\n"
+        )
+        for ctx in self.servers.values():
+            c = ctx.client
+            c.running = False          # prevent the reconnect loop from restarting
+            if c.writer and not c.writer.is_closing():
+                try:
+                    # Write directly to the transport — bypasses _send_queue so the
+                    # QUIT is guaranteed to go out before we tear down the event loop.
+                    c.writer.write(quit_line)
+                    await asyncio.wait_for(c.writer.drain(), timeout=1.0)
+                    c.writer.close()   # sends TCP FIN → reader in run_connection gets
+                                       # EOF and exits naturally, no cancel needed
+                except Exception:
+                    pass
+        raise SystemExit
+
+    async def _slash_server(self, args, extra, line):
+        """Connect to an additional IRC server (runs in parallel with existing connections).
+
+        Usage: /server [-ssl] <host> [port]
+        """
+        if not args:
+            await self.ui_queue.put(("status",
+                "Usage: /server [-ssl] <host> [port]  "
+                "(omit -ssl for plain, default ports: 6697 SSL / 6667 plain)"))
+            return
+        parts   = args.split()
+        use_ssl = False
+        if parts and parts[0] == "-ssl":
+            use_ssl = True
+            parts   = parts[1:]
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /server [-ssl] <host> [port]"))
+            return
+        new_host = parts[0]
+        default_port = 6697 if use_ssl else 6667
+        new_port = default_port
+        if len(parts) >= 2:
+            if parts[1].isdigit():
+                new_port = int(parts[1])
+            else:
+                await self.ui_queue.put(("status",
+                    f"/server: invalid port '{parts[1]}', using {default_port}"))
+        new_sid = f"{new_host}:{new_port}"
+
+        if new_sid in self.servers:
+            # Already connected — switch status window into view
+            sw_wk = self._wk(new_sid, "*status*")
+            sw    = self.window_by_name.get(sw_wk)
+            if sw and sw in self.windows:
+                self.current_window_index = self.windows.index(sw)
+                self._sync_draw_ctx()
+                self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                self.dirty = True
+            await self.ui_queue.put(("status",
+                f"Already connected to {new_host}:{new_port} — switched to its window"))
+            return
+
+        nick = self._active_client().nick
+        # Each extra server gets its own raw queue; a mux task wraps events
+        # with the server_id and forwards them to the shared ui_queue.
+        srv_raw_queue: asyncio.Queue = asyncio.Queue()
+        new_scoring   = ScoringEngine(self.client.scoring.ai_detector)
+        new_client    = IRCClient(new_host, new_port, nick, srv_raw_queue,
+                                  new_scoring, use_ssl=use_ssl)
+        new_ctx = ServerContext(new_sid, new_client)
+        self.servers[new_sid] = new_ctx
+
+        # Create a dedicated status window for this server.
+        sw_wk = self._wk(new_sid, "*status*")
+        sw    = ChatWindow("*status*", is_channel=False, server_id=new_sid)
+        # Persist to a per-server filename so secondary servers' status
+        # streams aren't collapsed into the primary's _status_.log.
+        sw._log_name = f"*status*-{new_sid}"
+        self.windows.append(sw)
+        self.window_by_name[sw_wk] = sw
+        self.current_window_index = self.windows.index(sw)
+        self._sync_draw_ctx()
+
+        proto = "SSL" if use_ssl else "plain"
+        sw.add_line(f"*** Connecting to {new_host}:{new_port} ({proto}) as {nick}", timestamp=False)
+
+        asyncio.create_task(self._mux_server_events(srv_raw_queue, new_sid),
+                            name=f"mux-{new_sid}")
+        asyncio.create_task(new_client.run_connection(), name=f"irc-{new_sid}")
+
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self.dirty = True
+
+    async def _mux_server_events(self, src: asyncio.Queue, server_id: str) -> None:
+        """Forward events from a secondary server's queue to the TUI's ui_queue.
+
+        Each event is wrapped as ("_srv", server_id, original_event) so that
+        handle_event can route it to the right ServerContext.
+        """
+        while True:
+            event = await src.get()
+            await self.ui_queue.put(("_srv", server_id, event))
+
+    async def _slash_reconnect(self, args, extra, line):
+        cur = self._active_client()
+        await self.ui_queue.put(("status", f"Forcing reconnect to {cur.server}:{cur.port}..."))
+        if cur.writer:
+            try:
+                cur.writer.close()
+            except Exception:
+                pass
+
+    async def _slash_theme(self, args, extra, line):
+        if args.isdigit() and 1 <= int(args) <= len(THEMES):
+            self.apply_theme(int(args))
+        else:
+            names = "  ".join(f"[{i+1}] {t[0]}" for i, t in enumerate(THEMES))
+            await self.ui_queue.put(("status",
+                f"Usage: /theme <1-{len(THEMES)}>  {names}  (current: {self.current_theme})"))
+
+    async def _slash_askai(self, args, extra, line):
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[askai] disabled by --no-ai")); return
+        rest = line[len("/askai"):].strip()
+        if not rest:
+            keys = " | ".join(AI_MODELS)
+            await self.ui_queue.put(("status",
+                f"Usage: /askai [model] <question>   models: {keys}"))
+            return
+        first_word, *remainder = rest.split(maxsplit=1)
+        fw = first_word.lower()
+        if fw in AI_MODELS or fw.startswith("ollama:"):
+            model_key = fw
+            question  = remainder[0] if remainder else ""
+        else:
+            model_key = self.ai_chat_model
+            question  = rest
+        if question:
+            t = asyncio.create_task(self._do_askai(question, model_key))
+            t.add_done_callback(self._ai_task_done)
+        else:
+            keys = " | ".join(AI_MODELS)
+            await self.ui_queue.put(("status",
+                f"Usage: /askai [model] <question>   models: {keys}"
+                f"   or ollama:<model-name> for any local Ollama model"))
+
+    async def _slash_summarize(self, args, extra, line) -> None:
+        """Summarize recent messages in the current window using any configured AI.
+
+        Usage: /summarize [n] [model]
+          n      – number of most-recent messages to include (default 50, max 200)
+          model  – any key from /model  (e.g. sonnet, gpt4o)
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[summarize] disabled by --no-ai")); return
+        if self._askai_pending:
+            await self.ui_queue.put(("status", "/summarize already in progress, please wait…"))
+            return
+
+        # Parse positional args: integer → n, known model key or ollama:* → model
+        n_msgs    = 50
+        model_key = self.ai_chat_model
+        for token in args.split():
+            if token.isdigit():
+                n_msgs = max(5, min(200, int(token)))
+            elif token.lower() in AI_MODELS or token.lower().startswith("ollama:"):
+                model_key = token.lower()
+
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status",
+                "/summarize: switch to a channel or DM window first"))
+            return
+
+        raw_lines = list(win.lines)[-n_msgs:]
+        if not raw_lines:
+            await self.ui_queue.put(("status", "/summarize: no messages in this window"))
+            return
+
+        _TS_RE      = re.compile(r'^\[\d{2}:\d{2}\]\s*')
+        _SPEAKER_RE = re.compile(r'^<(\S+?)>')
+        cleaned     = [irc_strip_formatting(_TS_RE.sub("", ln)) for ln in raw_lines]
+        transcript  = "\n".join(cleaned)
+
+        speakers = sorted({m.group(1) for ln in cleaned for m in [_SPEAKER_RE.match(ln)] if m})
+        speaker_hint = (f"Active speakers: {', '.join(speakers)}\n\n" if speakers else "")
+
+        if model_key.startswith("ollama:"):
+            model_id = model_key[len("ollama:"):]
+            label    = f"Ollama/{model_id}"
+        elif model_key.startswith("llamacpp:"):
+            model_id = model_key[len("llamacpp:"):]
+            label    = f"llama.cpp/{model_id}"
+        else:
+            spec     = AI_MODELS.get(model_key) or AI_MODELS[CLAUDE_DEFAULT_MODEL]
+            model_id = spec["id"]
+            label    = spec["label"]
+
+        prompt = (
+            f"The following is a transcript of an IRC chat in \"{win.name}\" "
+            f"({len(raw_lines)} messages).\n"
+            f"{speaker_hint}"
+            f"Write a structured analysis covering:\n"
+            f"1. Main topics — what the conversation was about (2-3 sentences).\n"
+            f"2. Per-user contributions — for each active speaker, one or two sentences "
+            f"on what they said or argued.\n"
+            f"3. User interactions — who replied to whom, any debates, agreements, "
+            f"disagreements, jokes, or notable exchanges between specific users.\n"
+            f"4. Conclusions or open threads — any decisions reached or questions left unanswered.\n\n"
+            f"Be specific: name the users involved in each point. "
+            f"Keep the total under 400 words.\n\n"
+            f"Transcript:\n{transcript}"
+        )
+
+        # Mark pending synchronously before creating the task so a second
+        # /summarize issued in the same event-loop tick is rejected.
+        self._askai_pending = True
+        await self.ui_queue.put(("status",
+            f"[summarize] {len(raw_lines)} msgs from {win.name} via "
+            f"{model_key} ({label})…"))
+        task = asyncio.create_task(
+            self._do_summarize(prompt, model_key, model_id, label,
+                               win.name, len(raw_lines), speakers))
+        task.add_done_callback(self._ai_task_done)
+
+    def _ai_task_done(self, task: asyncio.Task) -> None:
+        """Done-callback for fire-and-forget AI tasks.  Logs unhandled exceptions
+        to the status window instead of letting them vanish silently."""
+        exc = task.exception() if not task.cancelled() else None
+        if exc:
+            try:
+                self.window_by_name["*status*"].add_line(f"[ai error] {exc}")
+                self._chat_dirty = self.dirty = True
+            except Exception:
+                pass
+
+    async def _do_summarize(self, prompt: str, model_key: str, model_id: str,
+                             label: str, win_name: str, n_msgs: int,
+                             speakers: list) -> None:
+        answer, tokens = "", "?"
+        try:
+            # 2000 output tokens fits the 4-section structured summary even on
+            # busy channels (200 msgs, many speakers); 800 was getting truncated
+            # mid-sentence and dropping the "Conclusions" section.  Timeout
+            # bumped to 180s to give slower local models headroom for the
+            # larger response.
+            answer, tokens = await asyncio.wait_for(
+                self._call_ai(prompt, model_key, max_tokens=2000), timeout=180.0)
+        except asyncio.TimeoutError:
+            answer, tokens = "[error] AI request timed out after 180 s", "?"
+        except Exception as exc:
+            answer, tokens = f"[error] {exc}", "?"
+        finally:
+            self._askai_pending = False
+
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+        L(f"=== /summarize  [{win_name}]  last {n_msgs} msgs  [{model_key}  {label}] ===")
+        if speakers:
+            L(f"  Speakers: {', '.join(speakers)}")
+        L("")
+        for raw_line in answer.splitlines():
+            L(f"  {raw_line}" if raw_line.strip() else "")
+        L("")
+        L(f"  model: {model_id}  tokens used: {tokens}")
+        self.current_window_index      = 1
+        self._chat_dirty               = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self.dirty                     = True
+
+    async def _slash_vibe(self, args, extra, line) -> None:
+        """Analyze channel culture using AI.
+
+        Usage: /vibe <channel> [n] [model]
+          n      – number of most-recent messages to include (default 100, max 500)
+          model  – any key from /model  (e.g. sonnet, gpt4o)
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[vibe] disabled by --no-ai")); return
+        if self._askai_pending:
+            await self.ui_queue.put(("status", "/vibe already in progress, please wait\u2026"))
+            return
+
+        tokens = args.split()
+        if not tokens:
+            await self.ui_queue.put(("status", "Usage: /vibe <channel> [n] [model]"))
+            return
+
+        chan_name = tokens[0]
+        n_msgs    = 100
+        model_key = self.ai_chat_model
+        for token in tokens[1:]:
+            if token.isdigit():
+                n_msgs = max(10, min(500, int(token)))
+            elif token.lower() in AI_MODELS or token.lower().startswith("ollama:"):
+                model_key = token.lower()
+
+        # Find window by name (case-insensitive)
+        win = None
+        for w in self.window_by_name.values():
+            if w.name.lower() == chan_name.lower():
+                win = w
+                break
+        if not win or win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", f"/vibe: channel '{chan_name}' not found"))
+            return
+
+        raw_lines = list(win.lines)[-n_msgs:]
+        if not raw_lines:
+            await self.ui_queue.put(("status", f"/vibe: no messages in {chan_name}"))
+            return
+
+        _TS_RE      = re.compile(r'^\[\d{2}:\d{2}\]\s*')
+        _SPEAKER_RE = re.compile(r'^<(\S+?)>')
+        cleaned     = [irc_strip_formatting(_TS_RE.sub("", ln)) for ln in raw_lines]
+        transcript  = "\n".join(cleaned)
+
+        speakers = sorted({m.group(1) for ln in cleaned for m in [_SPEAKER_RE.match(ln)] if m})
+        speaker_hint = (f"Active speakers: {', '.join(speakers)}\n\n" if speakers else "")
+
+        if model_key.startswith("ollama:"):
+            model_id = model_key[len("ollama:"):]
+            label    = f"Ollama/{model_id}"
+        elif model_key.startswith("llamacpp:"):
+            model_id = model_key[len("llamacpp:"):]
+            label    = f"llama.cpp/{model_id}"
+        else:
+            spec     = AI_MODELS.get(model_key) or AI_MODELS[CLAUDE_DEFAULT_MODEL]
+            model_id = spec["id"]
+            label    = spec["label"]
+
+        prompt = (
+            f"The following is a transcript of an IRC channel \"{win.name}\" "
+            f"({len(raw_lines)} messages).\n"
+            f"{speaker_hint}"
+            f"Analyze the channel's culture and vibe based on this transcript. Cover:\n"
+            f"1. Overall atmosphere \u2014 is it friendly, technical, chaotic, quiet, etc.\n"
+            f"2. Recurring topics and interests of the community.\n"
+            f"3. Social dynamics \u2014 inside jokes, recurring bits, how people interact.\n"
+            f"4. Individual personalities \u2014 for active speakers, describe their role/style.\n"
+            f"5. Any notable norms, rituals, or unwritten rules.\n\n"
+            f"Be specific, name users, and keep the total under 400 words.\n\n"
+            f"Transcript:\n{transcript}"
+        )
+
+        self._askai_pending = True
+        await self.ui_queue.put(("status",
+            f"[vibe] {len(raw_lines)} msgs from {win.name} via "
+            f"{model_key} ({label})\u2026"))
+        task = asyncio.create_task(
+            self._do_vibe(prompt, model_key, model_id, label,
+                          win.name, len(raw_lines), speakers))
+        task.add_done_callback(self._ai_task_done)
+
+    async def _do_vibe(self, prompt: str, model_key: str, model_id: str,
+                        label: str, win_name: str, n_msgs: int,
+                        speakers: list) -> None:
+        answer, tokens = "", "?"
+        try:
+            answer, tokens = await asyncio.wait_for(
+                self._call_ai(prompt, model_key, max_tokens=2000), timeout=180.0)
+        except asyncio.TimeoutError:
+            answer, tokens = "[error] AI request timed out after 180 s", "?"
+        except Exception as exc:
+            answer, tokens = f"[error] {exc}", "?"
+        finally:
+            self._askai_pending = False
+
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+        L(f"=== /vibe  [{win_name}]  last {n_msgs} msgs  [{model_key}  {label}] ===")
+        if speakers:
+            L(f"  Speakers: {', '.join(speakers)}")
+        L("")
+        for raw_line in answer.splitlines():
+            L(f"  {raw_line}" if raw_line.strip() else "")
+        L("")
+        L(f"  model: {model_id}  tokens used: {tokens}")
+        self.current_window_index      = 1
+        self._chat_dirty               = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self.dirty                     = True
+
+    async def _slash_explain(self, args, extra, line) -> None:
+        """Analyze a user's behavior using AI.
+
+        Usage: /explain <nick> [model]
+          model  – any key from /model  (e.g. sonnet, gpt4o)
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[explain] disabled by --no-ai")); return
+        if self._askai_pending:
+            await self.ui_queue.put(("status", "/explain already in progress, please wait\u2026"))
+            return
+
+        tokens = (args + " " + extra).strip().split()
+        if not tokens:
+            await self.ui_queue.put(("status", "Usage: /explain <nick> [model]"))
+            return
+
+        target    = tokens[0].lower()
+        model_key = self.ai_chat_model
+        for token in tokens[1:]:
+            if token.lower() in AI_MODELS or token.lower().startswith("ollama:"):
+                model_key = token.lower()
+
+        # Collect all messages from this nick across all windows
+        _TS_RE      = re.compile(r'^\[\d{2}:\d{2}\]\s*')
+        _SPEAKER_RE = re.compile(r'^<(\S+?)>')
+        found       = []  # (window_name, cleaned_line)
+        for win in self.window_by_name.values():
+            if win.name in ("*status*", "*dashboard*"):
+                continue
+            for ln in win.lines:
+                stripped = _TS_RE.sub("", ln)
+                m = _SPEAKER_RE.match(stripped)
+                if m and m.group(1).lower() == target:
+                    found.append((win.name, irc_strip_formatting(stripped)))
+
+        if not found:
+            await self.ui_queue.put(("status", f"/explain: no messages found for '{target}'"))
+            return
+
+        # Group by window, limit per-window to 100
+        by_win = {}
+        for wname, line_text in found:
+            by_win.setdefault(wname, []).append(line_text)
+        parts = []
+        for wname, lines in by_win.items():
+            if len(lines) > 100:
+                lines = lines[-100:]
+            parts.append(f"--- {wname} ({len(lines)} messages) ---")
+            parts.extend(lines)
+        transcript = "\n".join(parts)
+
+        if model_key.startswith("ollama:"):
+            model_id = model_key[len("ollama:"):]
+            label    = f"Ollama/{model_id}"
+        elif model_key.startswith("llamacpp:"):
+            model_id = model_key[len("llamacpp:"):]
+            label    = f"llama.cpp/{model_id}"
+        else:
+            spec     = AI_MODELS.get(model_key) or AI_MODELS[CLAUDE_DEFAULT_MODEL]
+            model_id = spec["id"]
+            label    = spec["label"]
+
+        prompt = (
+            f"The following are messages from a user '{target}' across IRC channels "
+            f"({len(found)} total messages).\n\n"
+            f"Analyze this user's behavior and personality based on their messages. Cover:\n"
+            f"1. Communication style \u2014 tone, formality, verbosity.\n"
+            f"2. Expertise and interests \u2014 what topics they engage with.\n"
+            f"3. Social role \u2014 helpful, argumentative, humorous, lurker, etc.\n"
+            f"4. Interaction patterns \u2014 who they talk to, how they respond.\n"
+            f"5. Overall impression \u2014 what kind of community member they are.\n\n"
+            f"Be specific, cite examples, and keep the total under 400 words.\n\n"
+            f"Messages:\n{transcript}"
+        )
+
+        self._askai_pending = True
+        await self.ui_queue.put(("status",
+            f"[explain] {len(found)} msgs from {target} via "
+            f"{model_key} ({label})\u2026"))
+        task = asyncio.create_task(
+            self._do_explain(prompt, model_key, model_id, label,
+                            target, len(found)))
+        task.add_done_callback(self._ai_task_done)
+
+    async def _do_explain(self, prompt: str, model_key: str, model_id: str,
+                           label: str, target: str, n_msgs: int) -> None:
+        answer, tokens = "", "?"
+        try:
+            answer, tokens = await asyncio.wait_for(
+                self._call_ai(prompt, model_key, max_tokens=2000), timeout=180.0)
+        except asyncio.TimeoutError:
+            answer, tokens = "[error] AI request timed out after 180 s", "?"
+        except Exception as exc:
+            answer, tokens = f"[error] {exc}", "?"
+        finally:
+            self._askai_pending = False
+
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+        L(f"=== /explain  [{target}]  {n_msgs} msgs  [{model_key}  {label}] ===")
+        L("")
+        for raw_line in answer.splitlines():
+            L(f"  {raw_line}" if raw_line.strip() else "")
+        L("")
+        L(f"  model: {model_id}  tokens used: {tokens}")
+        self.current_window_index      = 1
+        self._chat_dirty               = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self.dirty                     = True
+
+    async def _slash_model(self, args, extra, line):
+        key = args.strip().lower()
+        detector = self._active_client().scoring.ai_detector
+        if not key:
+            # List every available model with its provider
+            sw = self._status_win()
+            sw.add_line("Available AI models for /askai, /summarize, and AI detection:")
+            for k, spec in AI_MODELS.items():
+                chat_mark = ">" if k == self.ai_chat_model else " "
+                det_mark  = "D" if k == detector.active_detect_model else " "
+                avail  = ""
+                if spec["provider"] == "claude" and not ANTHROPIC_API_KEY:
+                    avail = "  (ANTHROPIC_API_KEY not set)"
+                elif spec["provider"] == "openai" and not OPENAI_API_KEY:
+                    avail = "  (OPENAI_API_KEY not set)"
+                elif spec["provider"] == "deepseek" and not DEEPSEEK_API_KEY:
+                    avail = "  (DEEPSEEK_API_KEY not set)"
+                elif spec["provider"] == "copilot" and not GITHUB_TOKEN:
+                    avail = "  (GITHUB_TOKEN not set)"
+                sw.add_line(f"  {chat_mark}{det_mark} {k:<8} {spec['label']:<22} [{spec['provider']}]{avail}")
+            sw.add_line("  > = chat model   D = also used for AI detection")
+            sw.add_line(f"  Usage: /model <key>   current: {self.ai_chat_model}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+        if key in AI_MODELS:
+            self.ai_chat_model = key
+            detector.active_detect_model = key
+            spec = AI_MODELS[key]
+            await self.ui_queue.put(("status",
+                f"AI model set to {key}  ({spec['label']}  {spec['id']})  [{spec['provider']}]"
+                f"  — also active for AI detection"))
+        else:
+            keys = "  ".join(AI_MODELS)
+            await self.ui_queue.put(("status",
+                f"Unknown model '{key}'. Available: {keys}  (current: {self.ai_chat_model})"))
+
+    async def _slash_api(self, args, extra, line):
+        global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GITHUB_TOKEN, OLLAMA_URL, LLAMACPP_URL
+        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "GITHUB_TOKEN", "OLLAMA_URL", "LLAMACPP_URL"}
+
+        if not args:
+            sw = self._status_win()
+            sw.add_line("")
+            sw.add_line("  ── AI Provider Keys " + "─" * 44)
+
+            def _mask(val: str) -> str:
+                if not val:
+                    return "NOT SET"
+                if len(val) <= 8:
+                    return val[:2] + "****"
+                return val[:8] + "\u2026" + val[-4:]
+
+            rows = [
+                ("Claude",    "ANTHROPIC_API_KEY", ANTHROPIC_API_KEY, "console.anthropic.com"),
+                ("OpenAI",    "OPENAI_API_KEY",    OPENAI_API_KEY,    "platform.openai.com"),
+                ("DeepSeek",  "DEEPSEEK_API_KEY",  DEEPSEEK_API_KEY,  "platform.deepseek.com"),
+                ("Copilot",   "GITHUB_TOKEN",       GITHUB_TOKEN,      "github.com/settings/tokens"),
+                ("Ollama",    "OLLAMA_URL",         OLLAMA_URL,        "local server — no key needed"),
+                ("llama.cpp", "LLAMACPP_URL",       LLAMACPP_URL,      "local server — no key needed"),
+            ]
+            for provider, varname, val, note in rows:
+                sw.add_line(f"  {provider:<10}  {varname:<22}  {_mask(val):<32}  ({note})")
+
+            sw.add_line("")
+            sw.add_line("  Set a key:  /api <VAR_NAME> <value>")
+            sw.add_line("    /api ANTHROPIC_API_KEY  sk-ant-api03-...")
+            sw.add_line("    /api OPENAI_API_KEY     sk-proj-...")
+            sw.add_line("    /api OLLAMA_URL         http://192.168.1.10:11434")
+            sw.add_line("    /api LLAMACPP_URL       http://192.168.1.10:8033")
+            sw.add_line("")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if args.upper() in _KNOWN:
+            var_name = args.upper()
+            value = extra.strip()
+            if not value:
+                await self.ui_queue.put(("status", f"Usage: /api {var_name} <value>"))
+                return
+            os.environ[var_name] = value
+            if var_name == "ANTHROPIC_API_KEY":
+                ANTHROPIC_API_KEY = value
+            elif var_name == "OPENAI_API_KEY":
+                OPENAI_API_KEY = value
+                if _openai_mod is not None:
+                    _openai_mod.api_key = value
+            elif var_name == "DEEPSEEK_API_KEY":
+                DEEPSEEK_API_KEY = value
+                self._deepseek_client = None   # force reconnect with new key
+            elif var_name == "GITHUB_TOKEN":
+                GITHUB_TOKEN = value
+                self._copilot_client = None    # force reconnect with new key
+            elif var_name == "OLLAMA_URL":
+                OLLAMA_URL = value
+            elif var_name == "LLAMACPP_URL":
+                LLAMACPP_URL = value
+            masked = (value[:8] + "\u2026" + value[-4:]) if len(value) > 12 else (value[:4] + "****")
+            await self.ui_queue.put(("status",
+                f"Set {var_name} = {masked}  (active immediately)"))
+            return
+
+        await self.ui_queue.put(("status",
+            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  DEEPSEEK_API_KEY  GITHUB_TOKEN  OLLAMA_URL  LLAMACPP_URL"))
+
+    async def _slash_znc(self, args, extra, line):
+        text = (args + " " + extra).strip()
+        if not text:
+            await self.ui_queue.put(("status", "Usage: /znc <command>  —  sends command to ZNC *status"))
+            return
+        client = self._active_client()
+        client.send_raw(f"PRIVMSG *status :{text}")
+        await self.ui_queue.put(("status", f">>> *status: {text}"))
+
+    async def _slash_jitsi(self, args, extra, line):
+        win = self.get_current_window()
+        if win.is_channel or win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/jitsi: switch to a PM window first"))
+            return
+        target = win.name
+        room = uuid.uuid4().hex[:12]
+        url = f"https://meet.jit.si/{room}"
+        client = self._active_client()
+        client.send_raw(f"PRIVMSG {target} :\x01ACTION suggests a Jitsi call: {url}\x01")
+        win.add_line(f"* You suggest a Jitsi call: {url}")
+        webbrowser.open(url)
+        await self.ui_queue.put(("status", f"Jitsi link sent and opened in browser"))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_chain(self, args, extra, line):
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/chain: switch to a channel or PM window"))
+            return
+        nick_filter = (args + " " + extra).strip().lower() or None
+        msgs = []
+        for line_text in win.lines:
+            parts = line_text.split(None, 2)
+            if len(parts) >= 2:
+                ts = parts[0]
+                rest = parts[1] if len(parts) > 1 else ""
+                sender = ""
+                text = ""
+                if rest.startswith("<") and ">" in rest:
+                    sender = rest[1:].split(">", 1)[0].lower()
+                    text = rest.split(">", 1)[1] if ">" in rest else ""
+                elif rest.startswith("*"):
+                    sender = rest[2:].split()[0].lower() if len(rest) > 2 else ""
+                    text = rest
+                if sender and (not nick_filter or sender == nick_filter):
+                    msgs.append((ts, sender, text.strip()))
+        if not msgs:
+            await self.ui_queue.put(("status", "/chain: no messages found" + (f" from {nick_filter}" if nick_filter else "")))
+            return
+        sw = self._status_win()
+        sw.add_line(f"── Message chain ({win.name})" + (f" — {nick_filter}" if nick_filter else "") + " ──")
+        for ts, sender, text in msgs[-30:]:
+            preview = text[:60] + "…" if len(text) > 60 else text
+            sw.add_line(f"  {ts} <{sender}> {preview}")
+        sw.add_line(f"── {len(msgs)} messages, showing last 30 ──")
+        self._chat_dirty = True
+        self.dirty = True
+
+    def _make_sparkline(self, hours: List[int]) -> str:
+        if not hours:
+            return ""
+        buckets = [0] * 24
+        for h in hours:
+            if 0 <= h <= 23:
+                buckets[h] += 1
+        mx = max(buckets)
+        if mx == 0:
+            return "·" * 24
+        bars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+        return "".join(bars[min(7, int(b / mx * 7))] for b in buckets)
+
+    async def _slash_idle(self, args, extra, line):
+        nick = (args + " " + extra).strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /idle <nick>"))
+            return
+        nl = nick.lower()
+        hours = self._msg_hours.get(nl)
+        if not hours:
+            await self.ui_queue.put(("status", f"No message data for {nick}"))
+            return
+        total = len(hours)
+        spark = self._make_sparkline(hours)
+        sw = self._status_win()
+        sw.add_line(f"── Activity pattern: {nick} ({total} messages) ──")
+        sw.add_line(f"   0         6        12        18       24")
+        sw.add_line(f"   {spark}")
+        sw.add_line(f"   └{'─'*23}┘ hour (UTC)")
+        chs = self._ch_activity.get(nl, {})
+        if chs:
+            top = sorted(chs.items(), key=lambda x: -x[1])[:5]
+            sw.add_line(f"  Top channels: " + ", ".join(f"{ch}({n})" for ch, n in top))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_together(self, args, extra, line):
+        parts = (args + " " + extra).strip().split()
+        if len(parts) < 2:
+            await self.ui_queue.put(("status", "Usage: /together <nick1> <nick2>"))
+            return
+        n1, n2 = parts[0].lower(), parts[1].lower()
+        ac1 = self._ch_activity.get(n1, {})
+        ac2 = self._ch_activity.get(n2, {})
+        common = {}
+        for ch, c1 in ac1.items():
+            c2 = ac2.get(ch)
+            if c2:
+                common[ch] = (c1, c2)
+        sw = self._status_win()
+        sw.add_line(f"── Together: {parts[0]} & {parts[1]} ──")
+        if not common:
+            # Fall back to checking current channel membership overlap
+            cur = [ch for ch, us in self.channel_users.items()
+                   if parts[0].lower() in {u.lower() for u in us}
+                   and parts[1].lower() in {u.lower() for u in us}]
+            if cur:
+                sw.add_line(f"  Currently together in: {', '.join(cur)}")
+            else:
+                sw.add_line(f"  No common channels detected")
+        else:
+            sw.add_line(f"  {'Channel':<20} {parts[0]:<8} {parts[1]:<8}")
+            total1 = total2 = 0
+            for ch in sorted(common, key=lambda c: -common[c][0] - common[c][1]):
+                c1, c2 = common[ch]
+                sw.add_line(f"  {ch:<20} {c1:<8} {c2:<8}")
+                total1 += c1; total2 += c2
+            sw.add_line(f"  {'─'*20} {'─'*8} {'─'*8}")
+            sw.add_line(f"  {'Total':<20} {total1:<8} {total2:<8}")
+            # Also check current membership
+            cur = [ch for ch, us in self.channel_users.items()
+                   if parts[0].lower() in {u.lower() for u in us}
+                   and parts[1].lower() in {u.lower() for u in us}
+                   and ch not in common]
+            if cur:
+                sw.add_line(f"  Also currently in: {', '.join(cur)}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_adjacent(self, args, extra, line):
+        nick = (args + " " + extra).strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /adjacent <nick>"))
+            return
+        nl = nick.lower()
+        adj = self._adjacency.get(nl)
+        if not adj:
+            await self.ui_queue.put(("status", f"No adjacency data for {nick}"))
+            return
+        sw = self._status_win()
+        total = sum(adj.values())
+        sw.add_line(f"── Conversation adjacency: {nick} ({total} pairs) ──")
+        for other, count in adj.most_common(20):
+            pct = count / total * 100
+            bar = "█" * int(pct / 5) + "▏" * (1 if pct % 5 >= 3 else 0)
+            sw.add_line(f"  {other:<20} {count:>4} ({pct:4.0f}%) {bar}")
+        sw.add_line("  (messages spoken immediately before or after)")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_targets(self, args, extra, line):
+        nick = (args + " " + extra).strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /targets <nick>"))
+            return
+        nl = nick.lower()
+        tgt = self._targets.get(nl)
+        if not tgt:
+            await self.ui_queue.put(("status", f"No targeting data for {nick}"))
+            return
+        sw = self._status_win()
+        total = sum(tgt.values())
+        sw.add_line(f"── Targeting score: {nick} ({total} addresses) ──")
+        for other, count in tgt.most_common(20):
+            pct = count / total * 100
+            bar = "█" * int(pct / 5)
+            sw.add_line(f"  {other:<20} {count:>4} ({pct:4.0f}%) {bar}")
+        sw.add_line("  (messages starting with '<nick>:' or '<nick>,' )")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_fingerprint(self, args, extra, line) -> None:
+        """Cross-nick linguistic similarity check.
+
+        Builds a BotFingerprint for <nick> from their message history and
+        compares it against fingerprints built for every other user, ranking
+        them by Jaccard vocabulary + n-gram overlap.
+
+        Usage: /fingerprint <nick> [min_similarity]
+          min_similarity  – 0.0–1.0 threshold to show (default 0.0)
+        """
+        tokens = (args + " " + extra).strip().split()
+        if not tokens:
+            await self.ui_queue.put(("status",
+                "Usage: /fingerprint <nick> [min_similarity]"))
+            return
+
+        target    = tokens[0]
+        min_sim   = 0.0
+        if len(tokens) > 1:
+            try:
+                min_sim = max(0.0, min(1.0, float(tokens[1])))
+            except ValueError:
+                pass
+
+        _MSG_RE = re.compile(r'^\[\d{2}:\d{2}\] <(\S+?)> (.+)$')
+        _ACT_RE = re.compile(r'^\[\d{2}:\d{2}\] \* (\S+) (.+)$')
+
+        # One pass through all windows — collect message texts per nick
+        nicks_msgs: Dict[str, List[str]] = {}
+        for win in self.window_by_name.values():
+            if win.name in ("*status*", "*dashboard*"):
+                continue
+            for ln in win.lines:
+                m = _MSG_RE.match(ln)
+                if m:
+                    nicks_msgs.setdefault(m.group(1).lower(), []).append(m.group(2))
+                    continue
+                a = _ACT_RE.match(ln)
+                if a:
+                    nicks_msgs.setdefault(a.group(1).lower(), []).append(a.group(2))
+
+        target_l = target.lower()
+        if target_l not in nicks_msgs:
+            await self.ui_queue.put(("status",
+                f"/fingerprint: no messages found for '{target}'"))
+            return
+
+        target_msgs = nicks_msgs.pop(target_l)
+
+        # Build target fingerprint
+        target_fp = BotFingerprint(target)
+        for msg in target_msgs:
+            target_fp.ingest(msg)
+
+        if target_fp.msg_count < 3:
+            await self.ui_queue.put(("status",
+                f"/fingerprint: too few msgs ({target_fp.msg_count}) for '{target}' — need ≥3"))
+            return
+
+        def _fp_similarity(a: BotFingerprint, b: BotFingerprint) -> float:
+            if not a.word_vocab or not b.word_vocab:
+                return 0.0
+            vocab_j  = len(a.word_vocab & b.word_vocab) / len(a.word_vocab | b.word_vocab)
+            bi_score = 0.0
+            if a.bigrams and b.bigrams:
+                bi_score = len(a.bigrams & b.bigrams) / len(a.bigrams | b.bigrams)
+            tri_score = 0.0
+            if a.trigrams and b.trigrams:
+                tri_score = len(a.trigrams & b.trigrams) / len(a.trigrams | b.trigrams)
+            return min(1.0, 0.25 * vocab_j + 0.35 * bi_score + 0.40 * tri_score)
+
+        results = []
+        for nick_l, msgs in nicks_msgs.items():
+            if len(msgs) < 3:
+                continue
+            fp = BotFingerprint(nick_l)
+            for msg in msgs:
+                fp.ingest(msg)
+            sim = _fp_similarity(target_fp, fp)
+            if sim >= min_sim:
+                results.append((sim, nick_l, fp.msg_count))
+
+        results.sort(key=lambda x: -x[0])
+
+        sw = self._status_win()
+        sw.add_line(
+            f"\u2500\u2500 Linguistic fingerprint: {target} "
+            f"({target_fp.msg_count} msgs, {len(target_fp.word_vocab)} words, "
+            f"{len(target_fp.bigrams)} bigrams, {len(target_fp.trigrams)} trigrams) "
+            f"\u2500\u2500")
+        if not results:
+            sw.add_line("  No similar users found" +
+                        (f"  (min similarity: {min_sim:.2f})" if min_sim > 0 else ""))
+        else:
+            sw.add_line(f"  {'Nick':<20} {'Sim':>6}  {'Msgs':>5}")
+            sw.add_line(f"  {'\u2500'*20} {'\u2500'*6}  {'\u2500'*5}")
+            for sim, nick_l, msg_count in results[:20]:
+                sw.add_line(f"  {nick_l:<20} {sim*100:5.1f}%  {msg_count:>5}")
+        sw.add_line(f"\u2500\u2500 {len(results)} matches, showing top 20 \u2500\u2500")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_cluster(self, args, extra, line) -> None:
+        """Show a nick's social circle — who they talk to, who addresses them,
+        and what channels they share.
+
+        Combines adjacency, targeting, inverse-targeting, and channel activity
+        into a ranked list of connections.
+
+        Usage: /cluster <nick>
+        """
+        nick = (args + " " + extra).strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /cluster <nick>"))
+            return
+
+        nl = nick.lower()
+
+        adj = self._adjacency.get(nl, {})
+        adj_total = sum(adj.values()) if adj else 0
+
+        tgt = self._targets.get(nl, {})
+        tgt_total = sum(tgt.values()) if tgt else 0
+
+        ch_act = self._ch_activity.get(nl, {})
+
+        # Inverse targets — who addresses this nick
+        inverse_tgt: Counter = Counter()
+        for other_nick, targets in self._targets.items():
+            if other_nick == nl:
+                continue
+            if nl in targets:
+                inverse_tgt[other_nick] = targets[nl]
+        inv_total = sum(inverse_tgt.values()) if inverse_tgt else 0
+
+        all_connections = set(adj) | set(tgt) | set(inverse_tgt)
+        connections = []
+        for other in all_connections:
+            adj_score = adj.get(other, 0)
+            tgt_score = tgt.get(other, 0)
+            inv_score = inverse_tgt.get(other, 0)
+
+            adj_pct = (adj_score / adj_total * 100) if adj_total > 0 else 0
+            tgt_pct = (tgt_score / tgt_total * 100) if tgt_total > 0 else 0
+            inv_pct = (inv_score / inv_total * 100) if inv_total > 0 else 0
+
+            # Weighted strength: adjacency (40%), targeting (35%), being targeted (25%)
+            combined = adj_pct * 0.40 + tgt_pct * 0.35 + inv_pct * 0.25
+            connections.append((combined, other, adj_score, tgt_score, inv_score))
+
+        connections.sort(key=lambda x: -x[0])
+
+        sw = self._status_win()
+        ch_list = ", ".join(
+            sorted(ch_act, key=lambda c: -ch_act[c])[:8]) if ch_act else ""
+        sw.add_line(f"\u2500\u2500 Social cluster: {nick} \u2500\u2500")
+        if ch_list:
+            sw.add_line(f"  Channels: {ch_list}")
+        if not connections:
+            sw.add_line("  No social connections found.")
+        else:
+            sw.add_line(f"  {'Nick':<20} {'Str':>5}  {'Adj':>4} {'Tgt':>4} {'Inv':>4}")
+            sw.add_line(f"  {'\u2500'*20} {'\u2500'*5}  {'\u2500'*4} {'\u2500'*4} {'\u2500'*4}")
+            for combined, other, adj_score, tgt_score, inv_score in connections[:20]:
+                sw.add_line(
+                    f"  {other:<20} {combined:4.0f}%  "
+                    f"{adj_score:>4} {tgt_score:>4} {inv_score:>4}")
+        sw.add_line(f"\u2500\u2500 {len(connections)} connections, showing top 20 \u2500\u2500")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_alias(self, args, extra, line):
+        parts = (args + " " + extra).strip().split(maxsplit=1)
+        if not parts or not parts[0]:
+            if not self._aliases:
+                await self.ui_queue.put(("status", "No aliases defined. Usage: /alias <name> <expansion>"))
+                return
+            sw = self._status_win()
+            sw.add_line("── Aliases ──")
+            for name in sorted(self._aliases):
+                sw.add_line(f"  {name:<20} → {self._aliases[name]}")
+            sw.add_line(f"── {len(self._aliases)} aliases ──")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+        name = parts[0].lower()
+        if name.startswith("-"):
+            name = name[1:]
+            self._aliases.pop(name, None)
+            self._save_aliases()
+            await self.ui_queue.put(("status", f"Alias removed: {name}"))
+            return
+        if len(parts) < 2 or not parts[1]:
+            expansion = self._aliases.get(name)
+            if expansion:
+                await self.ui_queue.put(("status", f"Alias: {name} → {expansion}"))
+            else:
+                await self.ui_queue.put(("status", f"No alias defined for '{name}'"))
+            return
+        expansion = parts[1].strip()
+        self._aliases[name] = expansion
+        self._save_aliases()
+        await self.ui_queue.put(("status", f"Alias set: {name} → {expansion}"))
+
+    async def _slash_mute(self, args, extra, line):
+        self.mention_beep_muted = not self.mention_beep_muted
+        state = "muted" if self.mention_beep_muted else "unmuted"
+        await self.ui_queue.put(("status", f"Mention beep {state} (highlight still active)"))
+
+    async def _slash_autotranslate(self, args, extra, line):
+        self.auto_translate = not self.auto_translate
+        state = "ON" if self.auto_translate else "OFF"
+        await self.ui_queue.put(("status", f"Auto-translate CJK → English: {state}"))
+
+    async def _slash_linkpreview(self, args, extra, line):
+        self.link_preview_enabled = not self.link_preview_enabled
+        state = "ON" if self.link_preview_enabled else "OFF"
+        await self.ui_queue.put(("status", f"Link preview {state}"))
+
+    async def _slash_autojoin(self, args, extra, line):
+        global _AUTOJOIN_CHANNELS
+        p = args.strip().split(None, 1)
+        if not p or p[0] not in ("+", "-", "list", "clear"):
+            await self.ui_queue.put(("status", "Usage: /autojoin +<#chan> | -<#chan> | list | clear"))
+            return
+        sub = p[0]
+        if sub == "list":
+            if _AUTOJOIN_CHANNELS:
+                await self.ui_queue.put(("status", f"Auto-join channels: {' '.join(sorted(_AUTOJOIN_CHANNELS))}"))
+            else:
+                await self.ui_queue.put(("status", "No auto-join channels configured"))
+            return
+        if sub == "clear":
+            _AUTOJOIN_CHANNELS.clear()
+            _save_autojoin_config()
+            await self.ui_queue.put(("status", "Auto-join channel list cleared"))
+            return
+        chan = (p[1] if len(p) > 1 else "").strip()
+        if not chan:
+            await self.ui_queue.put(("status", f"Usage: /autojoin {sub} <#channel>"))
+            return
+        if not chan.startswith("#"):
+            chan = "#" + chan
+        if sub == "+":
+            _AUTOJOIN_CHANNELS.add(chan)
+            _save_autojoin_config()
+            await self.ui_queue.put(("status", f"Auto-join: added {chan}"))
+        elif sub == "-":
+            _AUTOJOIN_CHANNELS.discard(chan)
+            _save_autojoin_config()
+            await self.ui_queue.put(("status", f"Auto-join: removed {chan}"))
+
+    async def _slash_commands(self, args, extra, line):
+        sw = self.window_by_name["*status*"]
+        _C = lambda t: sw.add_line(t)
+        _H = lambda title: _C(f"  ── {title} " + "─" * max(0, 38 - len(title)))
+        _E = lambda c, d: _C(f"  {c:<34} {d}")
+        _C("")
+        _C("  ╔" + "═" * 44 + "╗")
+        _C("  ║          Available IRC Commands          ║")
+        _C("  ╚" + "═" * 44 + "╝")
+        _C("")
+        _H("Messaging")
+        _E("/msg <nick> <text>",            "Send a PM; opens and switches to the DM window")
+        _E("/query <nick> [message]",       "Open a DM window with nick; optionally send a first message")
+        _E("/jitsi",                        "Generate a Jitsi Meet link and send it in the current PM")
+        _E("/chain [nick]",                 "Show recent message chain for current window in status")
+        _E("/idle <nick>",                  "24h activity heatmap for a user")
+        _E("/together <n1> <n2>",           "Compare two users' channel overlap")
+        _E("/adjacent <nick>",              "Show who speaks before/after a user")
+        _E("/targets <nick>",               "Show who a user addresses most")
+        _E("/notice <nick> <text>",         "Send a notice (-nick- style, not shown in chat)")
+        _E("/me <text>",                    "Send an action line  (* nick waves)")
+        _E("/reply <text>",                 "Reply to last message with +reply tag (IRCv3 message-tags)")
+        _E("/react <emoji>",                "React to last message with +react TAGMSG (IRCv3 message-tags)")
+        _E("/ml <l1> | <l2> | ...",         "Send multiline message via draft/multiline batch")
+        _E("/redact [reason]",              "Redact last message in this window (message-redaction)")
+        _C("")
+        _H("Channels")
+        _E("/join <channel>",               "Join a channel (# is added automatically if omitted)")
+        _E("/part [channel] [message]",     "Leave a channel with an optional part message")
+        _E("/topic [channel] [text]",       "View or set the channel topic (uses current channel)")
+        _E("/names [channel]",              "List users currently in the channel")
+        _E("/kick <chan> <nick> [reason]",  "Kick a user from the channel")
+        _E("/invite <nick> [channel]",      "Invite a user to a channel")
+        _E("/mode [channel] [modes]",       "Get or set channel modes (no args = show current)")
+        _C("")
+        _H("Operator")
+        _E("/op <nick>",    "Grant operator status  (+o)")
+        _E("/deop <nick>",  "Remove operator status (-o)")
+        _E("/voice <nick>", "Grant voice  (+v)")
+        _E("/devoice <nick>","Remove voice (-v)")
+        _E("/hop <nick>",   "Grant half-op  (+h)")
+        _E("/dehop <nick>", "Remove half-op (-h)")
+        _E("/ban <nick|mask>","Ban user; bare nick expands to nick!*@*")
+        _E("/unban <mask>", "Remove a ban mask")
+        _C("")
+        _H("Users & Status")
+        _E("/nick <newnick>",               "Change your nickname")
+        _E("/whois <nick>",                 "Look up user info — shown formatted in *status*")
+        _E("/whowas <nick>",                "Info on a recently disconnected user")
+        _E("/who <target>",                 "List users matching a pattern")
+        _E("/ignore <nick>",                "Suppress all messages from nick")
+        _E("/unignore <nick>",              "Stop ignoring nick")
+        _E("/away [message]",               "Set away status with optional message")
+        _E("/back",                         "Remove away status")
+        _C("")
+        _H("Services & CTCP")
+        _E("/ns <command>",                 "Send command to NickServ  (e.g. /ns identify pw)")
+        _E("/cs <command>",                 "Send command to ChanServ")
+        _E("/ctcp <nick> <cmd> [args]",     "Send a CTCP request  (PING VERSION TIME …)")
+        _C("")
+        _H("AI Detection")
+        _E("/ai <nick>",                    "Full AI profile: score, idle, sparkline, verdict")
+        _E("/topai",                        "All scored users in current channel, ranked by AI%")
+        _E("/bot <nick>",                   "Mark nick as confirmed bot/AI; builds typing fingerprint")
+        _E("/unbot <nick>",                 "Remove confirmed-bot status and fingerprint for nick")
+        _E("/aitoggle",                     "Enable or disable AI scoring (detection)")
+        _E("/logtoggle",                    "Enable or disable AI detection logging to disk (default: on)")
+        _C("")
+        _H("AI Integration  (Claude + OpenAI + Ollama)")
+        _E("/askai [model] <question>",   "Ask AI a question; answer shown in dashboard")
+        _E("/summarize [n] [model]",      "Summarize last n msgs in current window (default 50)")
+        _E("/model [key]",                "Set/list AI models: opus sonnet haiku gpt4o gpt4 gpt35")
+        _E("/api",                        "Show AI provider key status (Claude/OpenAI/Ollama)")
+        _E("/api <VAR_NAME> <value>",     "Set an API key in environment: ANTHROPIC_API_KEY OPENAI_API_KEY OLLAMA_URL")
+        _spec = AI_MODELS.get(self.ai_chat_model, {})
+        _C(f"  Current model: {self.ai_chat_model}  ({_spec.get('label','?')}  [{_spec.get('provider','?')}])")
+        _C("")
+        _H("Translation")
+        _E("/autotranslate",               "Toggle auto CJK → English translation (on by default)")
+        _C("")
+        _H("Connection")
+        _E("/server [-ssl] <host> [port]", "Add a parallel server connection (SSL with -ssl, else plain)")
+        _E("/reconnect",                   "Drop and re-establish the current connection")
+        _C("")
+        _H("Windows & Navigation")
+        _C("  Tab bar (above input): [1:status] [2:dash] [*3:##chat]  * = unread")
+        _E("/win <n>",    "Switch to window n; clears its unread marker")
+        _E("/close  (or /wc)", "Close current window; focus moves to previous")
+        _E("/clear",     "Clear messages in the current window")
+        _E("/alias [name] [expansion]", "List, set or remove command alias (/alias -<name> to remove)")
+        _E("/links [n]", "Show last n links shared in this channel (default 20)")
+        _E("/list [pattern]","Fetch and display the server's channel list")
+        _E("/theme <1-5>","Switch colour theme: Classic Hacker Ocean Sunset Neon")
+        _E("/userlist",   "Toggle the user list panel on/off")
+        _E("/znc <cmd>",  "Send a command to ZNC's *status (e.g. /znc play *chan 60)")
+        _C("  Ctrl+N  next window    Tab/Shift+Tab  nick completion    PgUp/PgDn  scroll")
+        _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
+        _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
+        _C("")
+        _H("Plugins")
+        _E("/loadplugin <path>",   "Load a Python plugin file; its setup(api) is called")
+        _E("/unloadplugin <name>", "Unload a plugin and remove its commands")
+        _E("/reloadplugin <name>", "Reload a plugin from its original file (hot-swap)")
+        _E("/plugins",             "List loaded plugins and their registered commands")
+        _C("")
+        _H("General")
+        _E("/redraw [channel]",   "Force full screen repaint and reload userlist from server")
+        _E("/quit [message]", "Send quit message and exit")
+        _E("/help",           "Brief one-line command reference")
+        _E("/commands",       "This full command list")
+        _C("")
+        self.current_window_index = 0
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_help(self, args, extra, line):
+        for l in [
+            "── Messaging ──────────────────────────────────────────────",
+            "  /msg <nick> <text>       PM nick; opens & switches to DM window",
+            "  /query <nick> [message]  Open a DM window (optional first message)",
+            "  /jitsi                   Jitsi video call — sends link in current PM",
+            "  /notice <nick> <text>    Send a notice   /me <text>  Action line",
+            "── Channels ──────────────────────────────────────────────",
+            "  /join <chan>  /part [chan] [msg]  /topic [chan] [text]",
+            "  /kick <chan> <nick> [reason]  /invite <nick> [chan]",
+            "  /names [chan]  /mode [chan] [modes]",
+            "── Operator ──────────────────────────────────────────────",
+            "  /op /deop /voice /devoice /hop /dehop  /ban /unban",
+            "── Users ─────────────────────────────────────────────────",
+            "  /nick <new>  /whois <nick>  /whowas <nick>  /who <pat>",
+            "  /idle <nick>     24h activity heatmap",
+            "  /adjacent <nick>  who speaks before/after",
+            "  /targets <nick>   who they address most",
+            "  /together <n1> <n2>  channel overlap",
+            "  /ignore <nick>  /unignore <nick>  /away [msg]  /back",
+            "── Services ──────────────────────────────────────────────",
+            "  /ns <cmd>  /cs <cmd>  /ctcp <nick> <cmd> [args]",
+            "── AI Detection ──────────────────────────────────────────",
+            "  /ai <nick>  full profile    /topai  channel ranking by AI%",
+            "  /aitoggle  enable/disable scoring    /logtoggle  toggle log",
+            "── AI  (Claude / OpenAI) ─────────────────────────────────",
+            "  /askai [model] <question>  (answer in dashboard)",
+            "  /summarize [n] [model]  summarize last n msgs (default 50)",
+            "  /model [key]  set/list model  (opus sonnet haiku gpt4o gpt4 gpt35)",
+            "── Translation ───────────────────────────────────────────",
+            "  /autotranslate  toggle CJK → English (default: on)",
+            "── Connection ─────────────────────────────────────────────",
+            "  /server [-ssl] <host> [port]  (parallel; -ssl for TLS)  /reconnect",
+            "── Interface ──────────────────────────────────────────────",
+            "  /win <n>  /close (/wc)  /clear  /links  /list [pat]  /znc <cmd>",
+            "  /alias [name] [expansion]  list/set/remove command aliases",
+            "  /chain [nick]  message tree for current window  /jitsi  video call",
+            "  /theme <1-5>  /userlist  Ctrl+N next window",
+            "  Tab/Shift+Tab nick-complete  PgUp/Dn scroll",
+            "  Left-click a highlighted URL line to open it in the browser",
+            "  Tab bar: [1:status] [2:dash] [*3:##chat]  * = unread",
+            "  /quit [msg]  /commands  (full list)  /help  (this)",
+            "  /redraw [channel]  force repaint + reload userlist from server",
+            "── Plugins ────────────────────────────────────────────────",
+            "  /loadplugin <path>  load .py plugin    /plugins  list loaded",
+            "  /unloadplugin <name>    /reloadplugin <name>  hot-swap",
+        ]:
+            self.window_by_name["*status*"].add_line(l)
+        self.current_window_index = 0
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self.dirty = True
+
+    async def _slash_userlist(self, args, extra, line):
+        self._show_userlist = not self._show_userlist
+        self._resize_windows()
+        state = "shown" if self._show_userlist else "hidden"
+        await self.ui_queue.put(("status", f"Userlist {state}"))
+
+    async def _slash_list(self, args, extra, line):
+        """Fetch and display the server's channel list (RPL_LIST 322/323)."""
+        pattern = (args + " " + extra).strip()
+        client = self._active_client()
+        client._list_results = []
+        if pattern:
+            client.send_raw(f"LIST {pattern}")
+            await self.ui_queue.put(("status", f"Fetching channel list matching '{pattern}'…"))
+        else:
+            client.send_raw("LIST")
+            await self.ui_queue.put(("status", "Fetching channel list…"))
+
+    async def _slash_links(self, args, extra, line):
+        """Show recent links for the current channel window."""
+        parts = args.strip().split()
+        n = 20
+        filter_nick = ""
+        for p in parts:
+            if p.isdigit():
+                n = max(5, min(200, int(p)))
+            else:
+                filter_nick = p.lower()
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/links: switch to a channel or DM window first"))
+            return
+        entries = _load_link_history(win.name, limit=n)
+        if not entries:
+            await self.ui_queue.put(("status", f"No link history for {win.name}"))
+            return
+        if filter_nick:
+            entries = [e for e in entries if e.get("nick", "").lower() == filter_nick]
+        if not entries:
+            await self.ui_queue.put(("status", f"No matching links for {filter_nick} in {win.name}"))
+            return
+        sw = self._status_win()
+        sw.add_line(f"── Recent links in {win.name} ({len(entries)}) ──")
+        for e in reversed(entries):
+            nick = e.get("nick", "?")
+            url  = e.get("url", "")
+            dt   = e.get("dt", "")[5:16] if e.get("dt") else ""
+            title = e.get("title", "") or ""
+            preview = (title[:60] + "…") if len(title) > 60 else title
+            line = f"  [{dt}] <{nick}> {url[:80]}"
+            if preview:
+                line += f"  {preview}"
+            sw.add_line(line)
+        sw.add_line(f"── End of link history ──")
+        self.current_window_index = 0
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_replay(self, args, extra, line):
+        """Request chat history for the current channel via CHATHISTORY."""
+        a = args.strip().lower()
+        c = self._active_client()
+        if a in ("on", "enable"):
+            c._replay_enabled = True
+            await self.ui_queue.put(("status", "[replay] chat history replay enabled"))
+            return
+        if a in ("off", "disable"):
+            c._replay_enabled = False
+            await self.ui_queue.put(("status", "[replay] chat history replay disabled"))
+            return
+        if not c._replay_enabled:
+            await self.ui_queue.put(("status",
+                "[replay] disabled — use /replay on to enable, then /replay [n] to fetch"))
+            return
+        chan = self.current_channel or ""
+        if not chan.startswith("#"):
+            await self.ui_queue.put(("status", "[replay] must be in a channel"))
+            return
+        try:
+            count = int(a) if a.isdigit() else 50
+        except ValueError:
+            count = 50
+        count = max(1, min(count, 500))
+        c.cmd_chathistory(chan, count)
+        await self.ui_queue.put(("status", f"[replay] requesting last {count} messages for {chan}…"))
+
+    async def _slash_monitor(self, args, extra, line):
+        """MONITOR a nick for online/offline notifications."""
+        c = self._active_client()
+        parts = args.strip().split(None, 1)
+        subcmd = parts[0].lower() if parts else ""
+        nicks_raw = parts[1] if len(parts) > 1 else ""
+        nicks = [n.strip() for n in nicks_raw.split(",") if n.strip()]
+        if subcmd in ("+", "add", "watch") and nicks:
+            c.cmd_monitor_add(nicks)
+            await self.ui_queue.put(("status", f"[monitor] watching: {', '.join(nicks)}"))
+        elif subcmd in ("-", "del", "remove") and nicks:
+            c.cmd_monitor_remove(nicks)
+            await self.ui_queue.put(("status", f"[monitor] stopped watching: {', '.join(nicks)}"))
+        elif subcmd in ("c", "clear"):
+            c.cmd_monitor_clear()
+            await self.ui_queue.put(("status", "[monitor] cleared all"))
+        elif subcmd in ("l", "list"):
+            c.cmd_monitor_list()
+        elif subcmd in ("s", "status"):
+            c.cmd_monitor_status()
+        else:
+            await self.ui_queue.put(("status",
+                "Usage: /monitor + nick[,…] | - nick[,…] | list | clear | status"))
+
+    async def _slash_whox(self, args, extra, line):
+        """Send a WHOX query for the current channel or given target."""
+        c = self._active_client()
+        parts = args.strip().split(None, 1)
+        target = parts[0] if parts else (self.current_channel or "")
+        fields = parts[1].replace(" ", "") if len(parts) > 1 else "hnuraf"
+        if not target:
+            await self.ui_queue.put(("status", "Usage: /whox [target] [fields]"))
+            return
+        c.cmd_whox(target, fields)
+
+    async def _slash_tagmsg(self, args, extra, line):
+        """Send a TAGMSG with client-only tags to target."""
+        c = self._active_client()
+        parts = args.strip().split(None, 1)
+        if len(parts) < 2:
+            await self.ui_queue.put(("status",
+                "Usage: /tagmsg <target> key=value[;key2=value2]"))
+            return
+        target, tag_str = parts
+        tags: dict = {}
+        for part in tag_str.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                tags[k.strip()] = v.strip()
+            elif part.strip():
+                tags[part.strip()] = ""
+        c.cmd_tagmsg(target, tags)
+        await self.ui_queue.put(("status", f"[tagmsg] sent to {target}: {tag_str}"))
+
+    async def _slash_reply(self, args, extra, line):
+        """Send a PRIVMSG with +reply tag referencing the last message in this window."""
+        slash_end = line.index(" ") + 1 if " " in line else len(line)
+        text = line[slash_end:].strip()
+        if not text:
+            await self.ui_queue.put(("status", "Usage: /reply <text>"))
+            return
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/reply: not in a chat window"))
+            return
+        if not win._last_msgid:
+            await self.ui_queue.put(("status",
+                "/reply: no msgid — server may not support message-tags"))
+            return
+        client = self._active_client()
+        client.send_tagged({"+reply": win._last_msgid}, f"PRIVMSG {win.name} :{text}")
+        ref = win._msg_store.get(win._last_msgid)
+        if ref:
+            ref_nick, ref_prev = ref
+            p = ref_prev[:50] + "…" if len(ref_prev) > 50 else ref_prev
+            win.add_line(f"  ↩ {ref_nick}: {p}", timestamp=False)
+        win.add_line(f"<{client.nick}> {text}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_react(self, args, extra, line):
+        """Send a +react TAGMSG to the last message in this window."""
+        emoji = args.strip()
+        if not emoji:
+            await self.ui_queue.put(("status", "Usage: /react <emoji>"))
+            return
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/react: not in a chat window"))
+            return
+        if not win._last_msgid:
+            await self.ui_queue.put(("status",
+                "/react: no msgid — server may not support message-tags"))
+            return
+        client = self._active_client()
+        client.cmd_tagmsg(win.name, {"+react": emoji, "+reply": win._last_msgid})
+        nicks = win._reactions.setdefault(win._last_msgid, {}).setdefault(emoji, [])
+        if client.nick not in nicks:
+            nicks.append(client.nick)
+        win._wrap_dirty = True
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_multiline(self, args, extra, line):
+        """Send a multiline message using draft/multiline batch (| = line break)."""
+        slash_end = line.index(" ") + 1 if " " in line else len(line)
+        text_raw = line[slash_end:].strip()
+        if not text_raw:
+            await self.ui_queue.put(("status", "Usage: /ml <line1> | <line2> | ..."))
+            return
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/ml: not in a chat window"))
+            return
+        # Replace | separators with actual newlines
+        text = "\n".join(part.strip() for part in text_raw.split("|"))
+        client = self._active_client()
+        result = client.cmd_msg(win.name, text)
+        if result:
+            await self.ui_queue.put(result)
+
+    async def _slash_redact(self, args, extra, line):
+        """Redact the last message in this window (message-redaction CAP)."""
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status", "/redact: not in a chat window"))
+            return
+        if not win._last_msgid:
+            await self.ui_queue.put(("status",
+                "/redact: no msgid — server may not support message-tags"))
+            return
+        reason = (args + (" " + extra if extra else "")).strip()
+        client = self._active_client()
+        if reason:
+            client.send_raw(f"REDACT {win.name} {win._last_msgid} :{reason}")
+        else:
+            client.send_raw(f"REDACT {win.name} {win._last_msgid}")
+
+    async def _slash_register(self, args, extra, line):
+        """Register a new account via draft/account-registration.
+
+        Usage: /register <account|*> <email> <password>
+        Use * as account to register the current nick as the account name.
+        """
+        c = self._active_client()
+        if "draft/account-registration" not in c._active_caps:
+            await self.ui_queue.put(("status",
+                "[register] server does not support draft/account-registration"))
+            return
+        parts = args.strip().split(None, 2)
+        if len(parts) < 3:
+            await self.ui_queue.put(("status",
+                "Usage: /register <account|*> <email> <password>"))
+            return
+        account, email, password = parts
+        c.send_raw(f"REGISTER {account} {email} :{password}")
+
+    async def _slash_pem(self, args, extra, line):
+        """Generate a NIST P-256 key pair for SASL ECDSA-NIST256P-CHALLENGE.
+
+        Saves the private key to a PEM file, sends the public key to NickServ
+        with SET PUBKEY, and updates irc_config.json to use the new key.
+
+        Usage: /pem [/path/to/output.pem]
+        Default path: <script_dir>/<nick>_sasl.pem
+        """
+        if not CRYPTOGRAPHY_AVAILABLE:
+            await self.ui_queue.put(("status",
+                "[pem] requires the 'cryptography' package — pip install cryptography"))
+            return
+
+        c = self._active_client()
+        key_path = args.strip() if args.strip() else \
+            os.path.join(os.getcwd(), f"{c.nick}_sasl.pem")
+
+        # Generate ECDSA P-256 key pair.
+        try:
+            private_key = _ecdsa_ec.generate_private_key(_ecdsa_ec.SECP256R1())
+        except Exception as exc:
+            await self.ui_queue.put(("status", f"[pem] key generation failed: {exc}"))
+            return
+
+        # Persist private key as unencrypted PKCS8 PEM.
+        try:
+            from cryptography.hazmat.primitives.serialization import (
+                Encoding, PrivateFormat, PublicFormat, NoEncryption,
+            )
+            pem_bytes = private_key.private_bytes(
+                encoding=Encoding.PEM,
+                format=PrivateFormat.PKCS8,
+                encryption_algorithm=NoEncryption(),
+            )
+            with open(key_path, "wb") as _kf:
+                _kf.write(pem_bytes)
+        except Exception as exc:
+            await self.ui_queue.put(("status", f"[pem] failed to save private key: {exc}"))
+            return
+
+        # Encode public key as base64 of the uncompressed EC point (0x04 || X || Y).
+        # This is the format Atheme NickServ expects for SET PUBKEY.
+        try:
+            pub_bytes = private_key.public_key().public_bytes(
+                encoding=Encoding.X962,
+                format=PublicFormat.UncompressedPoint,
+            )
+            pub_b64 = base64.b64encode(pub_bytes).decode()
+        except Exception as exc:
+            await self.ui_queue.put(("status", f"[pem] failed to encode public key: {exc}"))
+            return
+
+        # Send public key to NickServ.
+        c.cmd_service("NickServ", f"SET PUBKEY {pub_b64}")
+
+        # Persist key path and mechanism to irc_config.json so the next launch
+        # automatically uses ECDSA without manual env-var setup.
+        try:
+            _cfg = load_irc_config()
+            _cfg["sasl_key"]       = key_path
+            _cfg["sasl_mechanism"] = "ECDSA-NIST256P-CHALLENGE"
+            save_irc_config(_cfg)
+        except Exception:
+            pass
+
+        await self.ui_queue.put(("status", f"[pem] private key saved → {key_path}"))
+        await self.ui_queue.put(("status", f"[pem] public key sent to NickServ (SET PUBKEY)"))
+        await self.ui_queue.put(("status",
+            "[pem] irc_config.json updated: sasl_mechanism=ECDSA-NIST256P-CHALLENGE"))
+
+    async def _slash_redraw(self, args, extra, line):
+        channel = args.strip() or self.current_channel or ""
+        # Clear all subwindows so the next noutrefresh repaints from scratch.
+        # This fixes display corruption without restarting curses.
+        for w in (self.chat_win, self.user_win, self.input_win):
+            try:
+                w.clearok(True)
+            except curses.error:
+                pass
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self.dirty = True
+        if channel and channel.startswith("#"):
+            # Flush the stale userlist so the NAMES reply replaces it entirely
+            # rather than merging on top of potentially outdated entries.
+            self.channel_users.setdefault(channel, set()).clear()
+            self._sorted_users.pop(channel, None)
+            self._active_client().cmd_names(channel)
+            await self.ui_queue.put(("status",
+                f"Redrawing and refreshing userlist for {channel}…"))
+        else:
+            await self.ui_queue.put(("status", "Redrawing screen…"))
+
+    # ── Plugin management commands ───────────────────────────────────────────
+
+    async def _slash_loadplugin(self, args, extra, line):
+        path = args.strip()
+        if not path:
+            await self.ui_queue.put(("status",
+                "Usage: /loadplugin <path/to/plugin.py>"))
+            return
+        ok, msg = self.plugin_manager.load(path, self)
+        prefix = "[plugin] " if ok else "[plugin:error] "
+        await self.ui_queue.put(("status", prefix + msg))
+
+    async def _slash_unloadplugin(self, args, extra, line):
+        name = args.strip()
+        if not name:
+            await self.ui_queue.put(("status", "Usage: /unloadplugin <name>"))
+            return
+        ok, msg = self.plugin_manager.unload(name)
+        prefix = "[plugin] " if ok else "[plugin:error] "
+        await self.ui_queue.put(("status", prefix + msg))
+
+    async def _slash_reloadplugin(self, args, extra, line):
+        name = args.strip()
+        if not name:
+            await self.ui_queue.put(("status", "Usage: /reloadplugin <name>"))
+            return
+        ok, msg = self.plugin_manager.reload(name, self)
+        prefix = "[plugin] " if ok else "[plugin:error] "
+        await self.ui_queue.put(("status", prefix + msg))
+
+    async def _slash_plugins(self, args, extra, line):
+        plugins = self.plugin_manager.list_plugins()
+        if not plugins:
+            await self.ui_queue.put(("status",
+                "[plugin] No plugins loaded — use /loadplugin <path>"))
+            return
+        for name, cmds in plugins:
+            cmds_str = "  ".join(f"/{c}" for c in cmds) if cmds else "(no commands)"
+            await self.ui_queue.put(("status", f"[plugin] {name}  {cmds_str}"))
+
+    async def _slash_x0(self, args, extra, line):
+        path = args.strip()
+        if not path:
+            await self.ui_queue.put(("status", "Usage: /x0 <path/to/image>"))
+            return
+        if not os.path.isfile(path):
+            await self.ui_queue.put(("status", f"File not found: {path}"))
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in _IMAGE_EXTENSIONS:
+            await self.ui_queue.put(("status",
+                f"Unsupported file type '{ext}'. Supported: {', '.join(sorted(_IMAGE_EXTENSIONS))}"))
+            return
+        await self.ui_queue.put(("status", f"Uploading {path} to x0.at\u2026"))
+        loop = asyncio.get_event_loop()
+        url = await loop.run_in_executor(_IO_EXECUTOR, _upload_to_x0, path)
+        if url:
+            await self.ui_queue.put(("status", f"Uploaded: {url}"))
+        else:
+            await self.ui_queue.put(("status", "x0.at upload failed."))
+
+    def _handle_key(self, ch: int) -> bool:
+        """Process a single keycode synchronously.  Returns True if the key was
+        Enter (so the caller can await handle_input_line and break the drain loop),
+        False for all other keys."""
+        if ch in (curses.KEY_ENTER, 10, 13):
+            return True   # caller handles asynchronously
+
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            if self.input_cursor > 0:
+                self.input_buffer = (self.input_buffer[:self.input_cursor - 1]
+                                     + self.input_buffer[self.input_cursor:])
+                self.input_cursor -= 1
+            self.completion_state = None
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == curses.KEY_DC:
+            if self.input_cursor < len(self.input_buffer):
+                self.input_buffer = (self.input_buffer[:self.input_cursor]
+                                     + self.input_buffer[self.input_cursor + 1:])
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == curses.KEY_LEFT:
+            if self.input_cursor > 0:
+                self.input_cursor -= 1
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == curses.KEY_RIGHT:
+            if self.input_cursor < len(self.input_buffer):
+                self.input_cursor += 1
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == curses.KEY_HOME:
+            if self.input_buffer:
+                if self.input_cursor > 0:
+                    self.input_cursor = 0
+                    self._input_dirty = True
+                    self.dirty = True
+                else:
+                    win = self.get_current_window()
+                    self._wrap_window(win)
+                    win.scroll_offset = max(0, len(win.wrapped_cache) - self._content_height)
+                    self._chat_dirty = True
+                    self.dirty = True
+            else:
+                win = self.get_current_window()
+                self._wrap_window(win)
+                win.scroll_offset = max(0, len(win.wrapped_cache) - self._content_height)
+                self._chat_dirty = True
+                self.dirty = True
+
+        elif ch == curses.KEY_END:
+            if self.input_cursor < len(self.input_buffer):
+                self.input_cursor = len(self.input_buffer)
+                self._input_dirty = True
+                self.dirty = True
+            else:
+                self.get_current_window().scroll_offset = 0
+                self._chat_dirty = True
+                self.dirty = True
+
+        elif ch == 1:    # Ctrl+A
+            self.input_cursor = 0
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 5:    # Ctrl+E
+            self.input_cursor = len(self.input_buffer)
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 11:   # Ctrl+K
+            self.input_buffer = self.input_buffer[:self.input_cursor]
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 21:   # Ctrl+U
+            self.input_buffer = ""
+            self.input_cursor = 0
+            self.history_index  = -1
+            self._history_draft = ""
+            self.completion_state = None
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 23:   # Ctrl+W
+            buf = self.input_buffer
+            pos = self.input_cursor
+            while pos > 0 and buf[pos - 1] == " ": pos -= 1
+            while pos > 0 and buf[pos - 1] != " ": pos -= 1
+            self.input_buffer = buf[:pos] + buf[self.input_cursor:]
+            self.input_cursor = pos
+            self.completion_state = None
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 2:    # Ctrl+B — bold
+            self.input_buffer = (self.input_buffer[:self.input_cursor]
+                                 + "\x02" + self.input_buffer[self.input_cursor:])
+            self.input_cursor += 1
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 29:   # Ctrl+] — italic
+            self.input_buffer = (self.input_buffer[:self.input_cursor]
+                                 + "\x1D" + self.input_buffer[self.input_cursor:])
+            self.input_cursor += 1
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 31:   # Ctrl+_ — underline
+            self.input_buffer = (self.input_buffer[:self.input_cursor]
+                                 + "\x1F" + self.input_buffer[self.input_cursor:])
+            self.input_cursor += 1
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 15:   # Ctrl+O — reset formatting
+            self.input_buffer = (self.input_buffer[:self.input_cursor]
+                                 + "\x0F" + self.input_buffer[self.input_cursor:])
+            self.input_cursor += 1
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 6:    # Ctrl+F — word right
+            pos = self.input_cursor
+            buf = self.input_buffer
+            while pos < len(buf) and buf[pos] == " ": pos += 1
+            while pos < len(buf) and buf[pos] != " ": pos += 1
+            self.input_cursor = pos
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 16:   # Ctrl+P — previous history
+            _hlen = len(self.input_history)
+            if _hlen:
+                if self.history_index == -1:
+                    self._history_draft = self.input_buffer
+                self.history_index = min(self.history_index + 1, _hlen - 1)
+                self.input_buffer = self.input_history[self.history_index]
+                self.input_cursor = len(self.input_buffer)
+                self._input_dirty = True
+                self.dirty = True
+
+        elif ch == curses.KEY_UP:
+            if self.input_buffer or self.history_index >= 0:
+                _hlen = len(self.input_history)
+                if _hlen:
+                    if self.history_index == -1:
+                        self._history_draft = self.input_buffer
+                    self.history_index = min(self.history_index + 1, _hlen - 1)
+                    self.input_buffer = self.input_history[self.history_index]
+                    self.input_cursor = len(self.input_buffer)
+                    self._input_dirty = True
+                    self.dirty = True
+            else:
+                win = self.get_current_window()
+                self._wrap_window(win)
+                max_off = max(0, len(win.wrapped_cache) - self._content_height)
+                win.scroll_offset = min(win.scroll_offset + 1, max_off)
+                self._chat_dirty = True
+                self.dirty = True
+
+        elif ch == curses.KEY_DOWN:
+            if self.history_index >= 0:
+                self.history_index -= 1
+                self.input_buffer = (self._history_draft if self.history_index < 0
+                                     else self.input_history[self.history_index])
+                self.input_cursor = len(self.input_buffer)
+                self._input_dirty = True
+                self.dirty = True
+            else:
+                win = self.get_current_window()
+                win.scroll_offset = max(0, win.scroll_offset - 1)
+                self._chat_dirty = True
+                self.dirty = True
+
+        elif ch == 9:    # Tab — nick completion
+            self.do_nick_complete()
+
+        elif ch == curses.KEY_BTAB:  # Shift+Tab — reverse nick completion
+            self.do_nick_complete(reverse=True)
+
+        elif ch == 3:    # Ctrl+C
+            raise SystemExit
+
+        elif ch == 14:   # Ctrl+N — next window
+            self.switch_to_next_window()
+            self._chat_dirty = self._userlist_dirty = True
+
+        elif ch == curses.KEY_PPAGE:
+            win = self.get_current_window()
+            self._wrap_window(win)
+            max_off = max(0, len(win.wrapped_cache) - self._content_height)
+            win.scroll_offset = min(win.scroll_offset + self._content_height // 2, max_off)
+            self._chat_dirty = True
+            self.dirty = True
+
+        elif ch == curses.KEY_NPAGE:
+            win = self.get_current_window()
+            win.scroll_offset = max(0, win.scroll_offset - self._content_height // 2)
+            self._chat_dirty = True
+            self.dirty = True
+
+        elif ch == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+            except curses.error:
+                return False
+            # Fire on any button-1 event (press or click) regardless of platform
+            # constant differences between ncurses and pdcurses/windows-curses.
+            # Values 1-16 cover: released, pressed, clicked, double, triple.
+            if not (bstate & 0x001F):
+                return False
+            # Left-click: open URL if the clicked line is a URL line
+            chat_w = self.chat_win.getmaxyx()[1]
+            if my < 1 or my >= self.chat_height or mx >= chat_w:
+                return False  # title bar, input area, or userlist column
+            win = self.get_current_window()
+            self._wrap_window(win)
+            total     = len(win.wrapped_cache)
+            offset    = win.scroll_offset
+            end_idx   = total - offset
+            start_idx = max(0, end_idx - self._content_height)
+            line_idx  = start_idx + (my - 1)  # row 0 is the title bar
+            if line_idx >= total:
+                return False
+            url = win.url_map.get(line_idx)
+            if not url:
+                return False
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+            self.window_by_name["*status*"].add_line(f"Opening: {url}")
+            self._chat_dirty = True
+            self.dirty = True
+
+        elif 32 <= ch <= 1114111:
+            try:
+                ch_str = chr(ch)
+            except (ValueError, OverflowError):
+                ch_str = ""
+            if ch_str:
+                self.input_buffer = (self.input_buffer[:self.input_cursor]
+                                     + ch_str + self.input_buffer[self.input_cursor:])
+                self.input_cursor += 1
+                self.history_index  = -1
+                self.completion_state = None
+                self._input_dirty = True
+                self.dirty = True
+
+        elif ch == curses.KEY_RESIZE:
+            self.dirty = True
+
         return False
 
-    def default(self, line: str) -> None:
-        print(f"Unknown command: {line.split()[0] if line.split() else ''}. Try 'help'.")
+    # ── IRCv3 outgoing +typing helpers ───────────────────────────────────────
 
-    # --- new commands: info / pick / inspect / last / script / alias / ignore / note ---
+    def _typing_chat_target(self) -> str:
+        """Return the current chat target, or '' for non-chat windows."""
+        cur = self.get_current_window()
+        return "" if cur.name in ("*status*", "*dashboard*") else cur.name
 
-    def do_info(self, arg: str) -> None:
-        """info [user]   One-line user summary (uses focused_user if no arg)."""
-        user = self._resolve_user(arg)
-        if not user:
-            return
-        profile = build_profile(self._time_filtered(), user)
-        sm = profile["score_means"]
-        peak = _peak_hours(profile["by_hour"]).split(",")[0] or "—"
-        top_chan = _top_str(profile["channels"], 1) or "—"
-        score_strs = []
-        for k in SCORE_KEYS:
-            v = sm.get(k)
-            score_strs.append(f"{k}={_color_score(v) if isinstance(v, float) else '—'}")
-        note = self.state.notes.get(user, "")
-        bits = [
-            user,
-            f"lines={profile['authored']}",
-            f"days={len(profile['by_day'])}",
-            f"peak={peak}",
-            f"top_chan={top_chan}",
-            *score_strs,
-        ]
-        if note:
-            bits.append(f"note=\"{note}\"")
-        if user in self.state.ignore_set:
-            bits.append("[IGNORED]")
-        print("  " + "  ".join(bits))
-
-    def do_pick(self, arg: str) -> None:
-        """pick <N>   Focus on the Nth item from the previous listing (1-indexed).
-        Falls back to the author of the Nth entry from the previous entry list."""
-        parts = self._split(arg)
-        if not parts or not parts[0].isdigit():
-            print("Usage: pick <N>"); return
-        idx = int(parts[0]) - 1
-        listing = self.state.last_listing
-        if not listing and self.state.last_entries:
-            seen: list[str] = []
-            for e in self.state.last_entries:
-                if e.user and e.user not in seen:
-                    seen.append(e.user)
-            listing = seen
-        if idx < 0 or idx >= len(listing):
-            print(f"No item {idx + 1} in last listing (have {len(listing)}).")
-            return
-        pick = listing[idx]
-        self._push_focus()
-        self.state.focused_user = pick
-        print(f"Focused user = {pick}")
-        self._refresh_prompt()
-
-    def do_inspect(self, arg: str) -> None:
-        """inspect <N>   Show full raw line / pretty-printed JSON for entry N from the
-        previous listing (flagged, errors, grep, show, threads)."""
-        parts = self._split(arg)
-        if not parts or not parts[0].isdigit():
-            print("Usage: inspect <N>"); return
-        idx = int(parts[0]) - 1
-        if idx < 0 or idx >= len(self.state.last_entries):
-            print(f"No entry {idx + 1} in last listing (have {len(self.state.last_entries)}).")
-            return
-        e = self.state.last_entries[idx]
-        print(f"=== Entry {idx + 1} ({e.fmt}) ===")
-        print(f"  ts:     {e.ts}")
-        print(f"  user:   {e.user}")
-        print(f"  target: {e.target}")
-        print(f"  level:  {e.level}")
-        print(f"  event:  {e.event}")
-        print(f"  text:   {e.text}")
-        if e.fmt == "json":
-            try:
-                obj = json.loads(e.raw)
-                print("  json:")
-                print(json.dumps(obj, indent=2, default=str))
-                return
-            except json.JSONDecodeError:
-                pass
-        print(f"  raw:    {e.raw}")
-
-    def do_last(self, arg: str) -> None:
-        """last   Re-print the captured output of the previous command."""
-        if not self.state.last_output:
-            print("(no previous output)")
-            return
-        sys.stdout.write(self.state.last_output)
-
-    def do_script(self, arg: str) -> None:
-        """script <path>   Run TUI commands from a file (one per line; # comments)."""
-        path = arg.strip().strip('"').strip("'")
-        if not path:
-            print("Usage: script <path>"); return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-        except OSError as exc:
-            print(f"Could not read {path}: {exc}"); return
-        saved_pager = self.state.pager_enabled
-        saved_in_script = self._in_script
-        self.state.pager_enabled = False
-        self._in_script = True
-        try:
-            for raw in lines:
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                print(f"{self.prompt}{line}")
-                if self.onecmd(line):
-                    return
-                self._refresh_prompt()
-        finally:
-            self.state.pager_enabled = saved_pager
-            self._in_script = saved_in_script
-
-    def do_alias(self, arg: str) -> None:
-        """alias                       List all aliases.
-        alias <name>                 Show one alias.
-        alias <name> = <command>     Define/replace.
-        alias <name> =               Remove."""
-        s = arg.strip()
-        if not s:
-            if not self.state.aliases:
-                print("(no aliases)")
-                return
-            for name, cmd_ in sorted(self.state.aliases.items()):
-                print(f"  {name} = {cmd_}")
-            return
-        if "=" in s:
-            name, _, body = s.partition("=")
-            name = name.strip()
-            body = body.strip()
-            if not name:
-                print("Usage: alias <name> = <command>"); return
-            if not body:
-                self.state.aliases.pop(name, None)
-                _save_json(_aliases_path(), self.state.aliases)
-                print(f"Removed alias '{name}'.")
-                return
-            self.state.aliases[name] = body
-            _save_json(_aliases_path(), self.state.aliases)
-            print(f"alias {name} = {body}")
+    def _send_typing(self, state: str) -> None:
+        """Send a +typing TAGMSG; update outgoing state bookkeeping."""
+        if state == "done":
+            target = self._typing_out_target
         else:
-            if s in self.state.aliases:
-                print(f"  {s} = {self.state.aliases[s]}")
-            else:
-                print(f"(no alias '{s}')")
-
-    def do_ignore(self, arg: str) -> None:
-        """ignore                       List ignored users.
-        ignore <user>...             Add to ignore list.
-        ignore add <user>...         Add (explicit).
-        ignore drop <user>...        Remove from ignore list.
-        ignore list                  List ignored users."""
-        parts = self._split(arg)
-        if not parts or (len(parts) == 1 and parts[0].lower() == "list"):
-            if not self.state.ignore_set:
-                print("(ignore list empty)")
-                return
-            for u in sorted(self.state.ignore_set):
-                print(f"  {u}")
+            target = self._typing_chat_target()
+        if not target:
             return
-        sub = parts[0].lower()
-        if sub == "add" and len(parts) >= 2:
-            for u in parts[1:]:
-                self.state.ignore_set.add(u)
-        elif sub == "drop" and len(parts) >= 2:
-            for u in parts[1:]:
-                self.state.ignore_set.discard(u)
-        else:
-            for u in parts:
-                self.state.ignore_set.add(u)
-        _save_json(_ignore_path(), sorted(self.state.ignore_set))
-        print(f"Ignore list now: {len(self.state.ignore_set)} users.")
-        self._refresh_prompt()
-
-    def do_note(self, arg: str) -> None:
-        """note                       List notes.
-        note <user>                 Show note.
-        note <user> <text>          Set note.
-        note <user> --del           Remove note."""
-        s = arg.strip()
-        if not s:
-            if not self.state.notes:
-                print("(no notes)")
-                return
-            for u, n in sorted(self.state.notes.items()):
-                print(f"  {u}: {n}")
+        c = self._active_client()
+        if "message-tags" not in c._active_caps:
             return
-        head, _, body = s.partition(" ")
-        user = head
-        body = body.strip()
-        if not body:
-            if user in self.state.notes:
-                print(f"  {user}: {self.state.notes[user]}")
-            else:
-                print(f"(no note for '{user}')")
-            return
-        if body in {"--del", "--delete", "-d"}:
-            removed = self.state.notes.pop(user, None)
-            _save_json(_notes_path(), self.state.notes)
-            if removed is not None:
-                print(f"Removed note for '{user}'.")
-            else:
-                print(f"(no note for '{user}')")
-            return
-        self.state.notes[user] = body
-        _save_json(_notes_path(), self.state.notes)
-        print(f"  {user}: {body}")
+        c.cmd_tagmsg(target, {"+typing": state})
+        if state == "done":
+            self._typing_out_target = ""
+            self._typing_out_last   = 0.0
+            self._typing_out_state  = ""
+        elif state == "active":
+            self._typing_out_target = target
+            self._typing_out_last   = time.monotonic()
+            self._typing_out_state  = "active"
+        else:  # paused
+            self._typing_out_target = target
+            self._typing_out_state  = "paused"
 
-    # --- tab completion ------------------------------------------------------
-
-    def complete_user(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-
-    def complete_analyze(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-
-    def complete_ask(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-
-    def complete_compare(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-
-    def complete_interact(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-
-    def complete_show(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-
-    def complete_info(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-
-    def complete_dist(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-
-    def complete_zscores(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-
-    def complete_bursts(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-
-    def complete_threads(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-
-    def complete_flagged(self, text, line, begidx, endidx):
-        prev = line[:begidx].split()
-        if len(prev) >= 2:
-            return self._complete_prefix(text, self._nicks())
-        return []
-
-    def complete_target(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._targets())
-
-    def complete_load(self, text, line, begidx, endidx):
-        return self._complete_path(text)
-
-    def complete_diff(self, text, line, begidx, endidx):
-        return self._complete_path(text)
-
-    def complete_script(self, text, line, begidx, endidx):
-        return self._complete_path(text)
-
-    def complete_view(self, text, line, begidx, endidx):
-        prev = line[:begidx].split()
-        if len(prev) <= 1:
-            return self._complete_prefix(text, ["save", "load", "drop", "show", "list"])
-        if len(prev) == 2 and prev[1] in ("load", "drop", "show"):
-            return self._complete_prefix(text, list(self.state.views))
-        return []
-
-    def complete_export(self, text, line, begidx, endidx):
-        prev = line[:begidx].split()
-        if len(prev) <= 1:
-            return self._complete_prefix(text, ["profile", "report", "edges"])
-        if len(prev) == 2 and prev[1] == "profile":
-            return self._complete_prefix(text, self._nicks())
-        return self._complete_path(text)
-
-    def complete_set(self, text, line, begidx, endidx):
-        prev = line[:begidx].split()
-        if len(prev) <= 1:
-            return self._complete_prefix(text, ["top", "llm_url", "llm_model",
-                                                "max_chunk_chars", "llm_cache",
-                                                "pager", "color"])
-        return []
-
-    def complete_alias(self, text, line, begidx, endidx):
-        prev = line[:begidx].split()
-        if len(prev) <= 1:
-            return self._complete_prefix(text, list(self.state.aliases))
-        return []
-
-    def complete_ignore(self, text, line, begidx, endidx):
-        prev = line[:begidx].split()
-        if len(prev) <= 1:
-            return self._complete_prefix(text, ["add", "drop", "list"] + self._nicks())
-        if len(prev) >= 2 and prev[1] == "drop":
-            return self._complete_prefix(text, sorted(self.state.ignore_set))
-        return self._complete_prefix(text, self._nicks())
-
-    def complete_note(self, text, line, begidx, endidx):
-        prev = line[:begidx].split()
-        if len(prev) <= 1:
-            return self._complete_prefix(text, self._nicks())
-        return []
-
-    def complete_watch(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, ["--bg", "--stop"])
-
-    # --- new completions ----------------------------------------------------
-    def complete_sessions(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_sentiment(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_topics(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_anomalies(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_lifecycle(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_pattern(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_timeline(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_heatmap(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_llm_explain(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_summarize(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_multi(self, text, line, begidx, endidx):
-        prev = line[:begidx].split()
-        if len(prev) <= 1:
-            return self._complete_prefix(text, ["add", "list", "clear", "report"])
-        if len(prev) == 2 and prev[1] == "add":
-            return self._complete_prefix(text, self._nicks())
-        return []
-    def complete_web(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, ["start", "stop", "status"])
-    def complete_webportal(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, ["enable", "disable", "status"])
-    def complete_webhook(self, text, line, begidx, endidx):
-        prev = line[:begidx].split()
-        if len(prev) <= 1:
-            return self._complete_prefix(text, ["set", "test", "clear"])
-        return []
-    def complete_plugin(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, ["load", "list", "reload"])
-    def complete_rules(self, text, line, begidx, endidx):
-        prev = line[:begidx].split()
-        if len(prev) <= 1:
-            return self._complete_prefix(text, ["add", "remove", "toggle"])
-        return []
-    def complete_export_html(self, text, line, begidx, endidx):
-        return self._complete_path(text)
-    def complete_export_sql(self, text, line, begidx, endidx):
-        return self._complete_path(text)
-    # completions for 10 new features
-    def complete_templates(self, text, line, begidx, endidx):
-        return []
-    def complete_changepoints(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_rootcause(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_forecast(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_multifactor(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_chart(self, text, line, begidx, endidx):
-        prev = line[:begidx].split()
-        if len(prev) <= 1:
-            return self._complete_prefix(text, ["timeline", "histogram", "network"])
-        return self._complete_path(text)
-    def complete_dataframe(self, text, line, begidx, endidx):
-        return []
-    def complete_recurrence(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_churn(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_pareto(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, ["users", "events", "targets", "levels"])
-    # completions for dashboard + 12 new features
-    def complete_dashboard(self, text, line, begidx, endidx):
-        return []
-    def complete_watch_alert(self, text, line, begidx, endidx):
-        return []
-    def complete_forecast_anomaly(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_alert_fatigue(self, text, line, begidx, endidx):
-        return []
-    def complete_export_html_drilldown(self, text, line, begidx, endidx):
-        return self._complete_path(text)
-    def complete_session_times(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_influence(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_template_filter(self, text, line, begidx, endidx):
-        return []
-    def complete_drift(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_save_profile(self, text, line, begidx, endidx):
-        prev = line[:begidx].split()
-        if len(prev) <= 1:
-            return self._complete_prefix(text, self._nicks())
-        return self._complete_path(text)
-    def complete_load_profile(self, text, line, begidx, endidx):
-        return self._complete_path(text)
-    def complete_compare_profiles(self, text, line, begidx, endidx):
-        return self._complete_path(text)
-    def complete_auto_tag(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_auto_tag_bulk(self, text, line, begidx, endidx):
-        return []
-    def complete_recurrence_breach(self, text, line, begidx, endidx):
-        return self._complete_prefix(text, self._nicks())
-    def complete_save_config(self, text, line, begidx, endidx):
-        return []
-    def complete_load_config(self, text, line, begidx, endidx):
-        return []
-
-
-# ---------- main -------------------------------------------------------------
-
-def _default_llm_cache_path() -> str:
-    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    return os.path.join(base, "analyzelog_llm.json")
-
-
-def main(argv: list[str] | None = None) -> int:
-    for stream in (sys.stdout, sys.stderr):
+    async def run(self) -> None:
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-        except (AttributeError, ValueError):
+            await self._run_loop()
+        except (SystemExit, asyncio.CancelledError, KeyboardInterrupt):
             pass
-    _Color.auto_disable()
 
-    p = argparse.ArgumentParser(description="Interactive log analyzer (TUI by default; --batch for one-shot).")
-    p.add_argument("--log", default="ai_scores.log")
-    p.add_argument("--user")
-    p.add_argument("--users", help="Pair 'A,B' for interaction analysis (--batch only)")
-    p.add_argument("--compare", help="Comma list 'A,B[,C,...]' for behavior comparison (--batch only)")
-    p.add_argument("--top", type=int, default=15)
-    p.add_argument("--llm-url", default="http://127.0.0.1:8033/")
-    p.add_argument("--llm-model", default="local")
-    p.add_argument("--max-chunk-chars", type=int, default=12000)
-    p.add_argument("--llm-cache", default=_default_llm_cache_path(),
-                   help="Path to LLM response cache JSON ('none' to disable)")
-    p.add_argument("--since", help="Time-range lower bound (ISO date or '5h ago')")
-    p.add_argument("--until", help="Time-range upper bound (ISO date or '5h ago')")
-    p.add_argument("--batch", action="store_true")
-    p.add_argument("--no-llm", action="store_true")
-    p.add_argument("--show-lines", type=int, default=0)
-    p.add_argument("--ask", help="With --batch and --user, ask a free-form question")
-    p.add_argument("--flagged", help="With --batch, list lines matching score expression")
-    p.add_argument("--dist", action="store_true",
-                   help="With --batch, show score distributions (whole log or --user)")
-    p.add_argument("--zscores", action="store_true",
-                   help="With --batch and --user, show z-scores vs population")
-    p.add_argument("--similar", action="store_true")
-    p.add_argument("--similar-threshold", type=float, default=0.95)
-    p.add_argument("--similar-min-lines", type=int, default=5)
-    p.add_argument("--bursts", help="With --batch, detect bursts for the given user")
-    p.add_argument("--bursts-window", type=int, default=60)
-    p.add_argument("--bursts-z", type=float, default=3.0)
-    p.add_argument("--diff", help="With --batch, diff against another log file")
-    p.add_argument("--export-profile", help="With --batch and --user, write profile to this path")
-    p.add_argument("--export-report", help="With --batch, write report JSON to this path")
-    p.add_argument("--export-edges", help="With --batch, write edges (.csv or .dot)")
-    p.add_argument("--watch", action="store_true",
-                   help="Tail the log file and print new entries; runs forever")
-    p.add_argument("-c", "--cmd", action="append", default=[],
-                   help="Run TUI command(s) before the prompt (repeatable). Use 'quit' to exit after.")
-    p.add_argument("--c", dest="show_commands", action="store_true",
-                   help="On startup, open the TUI and print the full command reference.")
-    p.add_argument("--prometheus", action="store_true", help="With --batch, print Prometheus metrics")
-    p.add_argument("--export-html", help="With --batch, write HTML report to this path")
-    p.add_argument("--export-sql", help="With --batch, export entries to SQLite database")
-    p.add_argument("--sessions", help="With --batch, detect sessions for the given user")
-    p.add_argument("--sessions-gap", type=int, default=30, help="Session gap in minutes")
-    p.add_argument("--sentiment", help="With --batch, show sentiment for the given user")
-    p.add_argument("--topics", help="With --batch, show topics/keywords for the given user")
-    p.add_argument("--lifecycle", help="With --batch, lifecycle analysis for the given user")
-    p.add_argument("--pattern", help="With --batch, pattern-of-life for the given user")
-    p.add_argument("--anomalies", help="With --batch, detect anomalies for the given user")
-    p.add_argument("--anomalies-z", type=float, default=2.5)
-    p.add_argument("--sequences", type=int, nargs="?", const=3, default=0,
-                   help="With --batch, find common interaction sequences (optional min_support)")
-    p.add_argument("--timeline", help="With --batch, ASCII timeline for the given user")
-    p.add_argument("--heatmap", help="With --batch, calendar heatmap for the given user")
-    p.add_argument("--net", type=int, nargs="?", const=15, default=0,
-                   help="With --batch, show network graph (optional top N edges)")
-    p.add_argument("--correlate", nargs=2, metavar=("PATH", "WINDOW"),
-                   help="With --batch, cross-log correlation: --correlate other.log 60")
-    p.add_argument("--auto-report", action="store_true", help="With --batch, LLM-generated narrative report")
-    p.add_argument("--web", type=int, nargs="?", const=8088, default=0,
-                   help="Start web API server on given port")
-    p.add_argument("--webportal", action="store_true",
-                   help="Start web-based interactive console on port 80")
-    p.add_argument("--plugin-dir", help="Directory to load analysis plugins from")
-    p.add_argument("--cron", action="store_true", help="Run in cron mode (batch with optional alerts)")
-    p.add_argument("--cron-output", help="Append cron output to this file")
-    p.add_argument("--webhook-url", help="Webhook URL for alerts (cron mode)")
-    p.add_argument("--templates", type=int, nargs="?", const=20, default=0,
-                   help="With --batch, extract log templates (optional N)")
-    p.add_argument("--changepoints", help="With --batch, detect change points for the given user")
-    p.add_argument("--changepoints-window", type=int, default=3, help="Window in days for change point detection")
-    p.add_argument("--rootcause", nargs="+", metavar=("USER [LOOKBACK]"),
-                   help="With --batch, find root causes: --rootcause user [lookback_sec]")
-    p.add_argument("--forecast", help="With --batch, forecast activity for the given user")
-    p.add_argument("--forecast-days", type=int, default=7)
-    p.add_argument("--multifactor", help="With --batch, multi-factor anomaly score for the user")
-    p.add_argument("--chart", nargs="+", metavar=("TYPE PATH [USER]"),
-                   help="With --batch, generate chart: --chart timeline out.png [user]")
-    p.add_argument("--dataframe", nargs="?", const="", default=None,
-                   help="With --batch, view as DataFrame (optional expression)")
-    p.add_argument("--recurrence", help="With --batch, detect recurrence patterns for user")
-    p.add_argument("--churn", help="With --batch, predict churn risk for user")
-    p.add_argument("--pareto", nargs="?", const="users", default=None,
-                   help="With --batch, Pareto analysis (users|events|targets|levels)")
-    # Dashboard + 12 new feature CLI flags
-    p.add_argument("--dashboard", action="store_true", help="Launch curses real-time dashboard")
-    p.add_argument("--forecast-anomaly", nargs=3, metavar=("USER", "Z", "DAYS"),
-                   help="Forecast-aware anomaly detection: --forecast-anomaly user 2.5 7")
-    p.add_argument("--alert-fatigue", type=int, nargs="?", const=1, default=0,
-                   help="With --batch, compute alert fatigue scores (optional window hours)")
-    p.add_argument("--export-html-drilldown", nargs="+", metavar=("PATH [USER...]"),
-                   help="Write collapsible HTML report: --export-html-drilldown report.html [user]")
-    p.add_argument("--session-times", nargs=3, metavar=("A", "B", "GAP"),
-                   help="Session-aware response times: --session-times user_a user_b 30")
-    p.add_argument("--influence", nargs=3, metavar=("SEED", "HOPS", "WIN"),
-                   help="Influence chain tracking: --influence user 3 300")
-    p.add_argument("--template-filter", help="Filter current view by template ID")
-    p.add_argument("--drift", nargs=4, metavar=("USER", "WA", "WB", "GAP"),
-                   help="Drift detection: --drift user 7 7 0")
-    p.add_argument("--save-profile", nargs=2, metavar=("USER", "PATH"),
-                   help="Save user profile to JSON: --save-profile user path.json")
-    p.add_argument("--load-profile", help="Load and display a saved profile")
-    p.add_argument("--auto-tag", help="With --batch, auto-tag a user using LLM")
-    p.add_argument("--auto-tag-bulk", type=int, nargs="?", const=10, default=0,
-                   help="With --batch, auto-tag top N users")
-    p.add_argument("--recurrence-breach", nargs="+", metavar=("USER [DAYS]"),
-                   help="Check recurrence breach: --recurrence-breach user [3]")
-    p.add_argument("--dashboard-alerts", action="store_true",
-                   help="Show alert fatigue dashboard summary")
-    args = p.parse_args(argv)
+    async def _run_loop(self) -> None:
+        while True:
+            # ── 1. Keyboard — checked first so local input beats network traffic ──
+            # Drain all pending keys in one pass.  Enter is async so we break after
+            # it and let the redraw fire before consuming the next key.
+            had_key = False
+            while True:
+                ch = self.stdscr.getch()
+                if ch == -1:
+                    break
+                had_key = True
+                try:
+                    is_enter = self._handle_key(ch)
+                except Exception:
+                    is_enter = False
+                if is_enter:
+                    # Send +typing=done *before* clearing the buffer.
+                    if self._typing_out_state in ("active", "paused"):
+                        self._send_typing("done")
+                    line = self.input_buffer
+                    if line.strip():
+                        self.input_history.appendleft(line)
+                        save_input_history_line(line)
+                    self.history_index  = -1
+                    self._history_draft = ""
+                    await self.handle_input_line(line)
+                    self.input_buffer  = ""
+                    self.input_cursor  = 0
+                    self.completion_state = None
+                    self._input_dirty  = True
+                    break  # redraw before consuming the next key
 
-    try:
-        all_entries = list(iter_entries(args.log))
-    except FileNotFoundError:
-        print(f"File not found: {args.log}", file=sys.stderr)
-        return 1
+            # ── 1b. Outgoing +typing notifications ────────────────────────────────
+            if had_key:
+                _new_tgt = self._typing_chat_target()
+                if _new_tgt != self._typing_out_target and self._typing_out_state in ("active", "paused"):
+                    self._send_typing("done")   # switched windows while typing
+                if self.input_buffer.strip() and _new_tgt:
+                    self._typing_last_key = time.monotonic()
+                    if time.monotonic() - self._typing_out_last >= 3.0:
+                        self._send_typing("active")
+                elif not self.input_buffer.strip() and self._typing_out_state in ("active", "paused"):
+                    self._send_typing("done")   # buffer cleared (Ctrl-U / backspace to empty)
 
-    since = parse_iso_arg(args.since) if args.since else None
-    until = parse_iso_arg(args.until) if args.until else None
-    if args.since and not since:
-        print(f"Could not parse --since {args.since!r}", file=sys.stderr); return 2
-    if args.until and not until:
-        print(f"Could not parse --until {args.until!r}", file=sys.stderr); return 2
+            # ── 2. Immediate input refresh — bypasses the 30fps chat throttle ────
+            # Typing, cursor movement and backspace feel instantaneous because the
+            # input pane is repainted right here, not in the next throttled frame.
+            if had_key and self._input_dirty:
+                self._draw_input()
+                self._input_dirty = False
+                self.input_win.noutrefresh()
+                curses.doupdate()
 
-    active = apply_time_filter(all_entries, since, until)
-
-    cache_path = args.llm_cache
-    if cache_path and cache_path.lower() in {"none", "off", ""}:
-        cache_path = None
-    if cache_path:
-        cache_dir = os.path.dirname(cache_path)
-        if cache_dir:
+            # ── 3. Network events (capped to prevent flood from starving keyboard) ─
+            n = 0
             try:
-                os.makedirs(cache_dir, exist_ok=True)
-            except OSError:
+                while n < 64:
+                    event = self.ui_queue.get_nowait()
+                    try:
+                        await self.handle_event(event)
+                    except Exception as _ev_exc:
+                        self.window_by_name["*status*"].add_line(
+                            f"[err] event handler crashed: {_ev_exc}")
+                        self._chat_dirty = True
+                        self.dirty = True
+                    n += 1
+            except asyncio.QueueEmpty:
                 pass
-    cache = LLMCache(cache_path) if cache_path else None
 
-    if args.watch:
-        print(f"Watching {args.log}. Ctrl-C to stop.")
-        watch_loop(args.log, watch_callback_default)
-        return 0
+            # ── 3b. Outgoing +typing=paused after 5 s of inactivity ──────────────
+            if (self._typing_out_state == "active"
+                    and self._typing_out_target
+                    and self.input_buffer.strip()
+                    and time.monotonic() - self._typing_last_key >= 5.0):
+                self._send_typing("paused")
 
-    if args.batch:
-        if args.diff:
-            try:
-                other = list(iter_entries(args.diff))
-            except FileNotFoundError:
-                print(f"File not found: {args.diff}", file=sys.stderr); return 1
-            sa = summarize(active, 1000)
-            sb = summarize(other, 1000)
-            print_log_diff(args.log, args.diff, diff_summaries(sa, sb))
-            return 0
+            # ── 4. Dashboard auto-refresh ─────────────────────────────────────────
+            now = time.monotonic()
+            on_dashboard = (self.get_current_window().name == "*dashboard*")
+            # When the user navigates back to the dashboard from another window,
+            # drop the profile view so the suspects list auto-refreshes normally.
+            # _dashboard_profile_locked is set by commands that switch to profile in
+            # the same tick — skip the reset once so the 30-second hold can start.
+            if on_dashboard and not self._prev_on_dashboard and self._dashboard_mode == "profile":
+                if self._dashboard_profile_locked:
+                    self._dashboard_profile_locked = False  # consume lock; hold the profile
+                else:
+                    self._dashboard_mode = "suspects"       # genuine navigate-back — reset
+            # Profile views (/summarize, /ai, /topai) hold for 120 s then expire.
+            if self._dashboard_mode == "profile" and now - self._dashboard_last_update >= 120.0:
+                self._dashboard_mode = "suspects"
+            self._prev_on_dashboard = on_dashboard
+            # Auto-refresh is suppressed while showing a profile (/ai output) so
+            # the suspects rebuild doesn't overwrite it mid-read.
+            if self._dashboard_mode == "suspects":
+                if on_dashboard and now - self._dashboard_last_update >= self._dashboard_ota_interval:
+                    await self.update_dashboard()
+                    self._dashboard_dirty = False
+                    self._dashboard_last_update = now
+                    self._chat_dirty = True
+                    self.dirty = True
+                elif self._dashboard_dirty and now - self._dashboard_last_update >= 1.0:
+                    await self.update_dashboard()
+                    self._dashboard_dirty = False
+                    self._dashboard_last_update = now
+                    if on_dashboard:
+                        self._chat_dirty = True
 
-        if args.prometheus:
-            print(prometheus_metrics(active))
-            return 0
+            # ── 5. Full redraw (chat + userlist; throttled to ~30fps) ─────────────
+            if self.dirty and self.redraw():
+                self.dirty = False
 
-        if args.export_html:
-            s = summarize(active, args.top)
-            profiles = None
-            if args.user:
-                profiles = [build_profile(active, args.user)]
-            write_html_report(args.export_html, s, profiles)
-            return 0
+            # ── 6. Adaptive sleep: yield once when busy, wait 16ms when idle ──────
+            # asyncio.sleep(0) hands control back to the event loop for one cycle
+            # (lets IRC reads and translation tasks progress) then returns
+            # immediately — keeping the loop hot during active typing or floods.
+            await asyncio.sleep(0.001 if (had_key or n > 0) else 0.016)
 
-        if args.export_sql:
-            print(export_to_sqlite(active, args.export_sql))
-            return 0
+# =========================
+# Main
+# =========================
+async def main_curses(stdscr, ai_detector: EnsembleAIDetector):
+    curses.start_color()
+    curses.use_default_colors()
+    try:
+        curses.curs_set(1)  # visible cursor for input editing
+    except curses.error:
+        pass
 
-        if args.sessions:
-            sessions = detect_sessions(active, args.sessions, args.sessions_gap)
-            for i, s in enumerate(sessions, 1):
-                dur = (s.end - s.start).total_seconds()
-                dur_s = f"{dur / 60:.0f}min" if dur < 3600 else f"{dur / 3600:.1f}h"
-                print(f"#{i:<3d}  {s.start:%Y-%m-%d %H:%M} - {s.end:%H:%M}  {dur_s:>10}  {s.line_count:>4d} lines")
-            if not sessions:
-                print("(no sessions)")
-            return 0
+    for i, color in enumerate([curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_YELLOW,
+                               curses.COLOR_GREEN, curses.COLOR_WHITE, curses.COLOR_BLUE, curses.COLOR_RED], 1):
+        curses.init_pair(i, color, -1)
+    # pair 8: ACTION lines — green + italic where supported
+    curses.init_pair(8, curses.COLOR_GREEN, -1)
 
-        if args.sentiment:
-            s = user_sentiment(active, args.sentiment)
-            if s:
-                print(f"Sentiment for {args.sentiment}: compound={s['mean_compound']:.3f} pos={s['pos_rate']:.1%} neg={s['neg_rate']:.1%} agree={s['agree_rate']:.1%}")
-            else:
-                print(f"(no data for {args.sentiment})")
-            return 0
+    ui_queue: asyncio.Queue = asyncio.Queue()
+    scoring_engine = ScoringEngine(ai_detector)
+    client = IRCClient(DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, ui_queue, scoring_engine)
+    tui = TUI(stdscr, ui_queue, client)
 
-        if args.topics:
-            t = user_topics(active, args.topics)
-            if t.get("keywords"):
-                print(f"Keywords for {args.topics}:")
-                for kw, n in t["keywords"][:15]:
-                    print(f"  {n:>5d}  {kw}")
-            return 0
+    # Initial dashboard
+    await tui.update_dashboard()
 
-        if args.lifecycle:
-            lc = analyze_lifecycle(active, args.lifecycle)
-            if lc.first_seen:
-                print(f"Lifecycle for {args.lifecycle}: first={_fmt_dt(lc.first_seen)} last={_fmt_dt(lc.last_seen)} trend={lc.activity_trend} stages={len(lc.stages)}")
-            return 0
-
-        if args.pattern:
-            pol = pattern_of_life(active, args.pattern)
-            if pol.hourly_profile:
-                glyphs = "▁▂▃▄▅▆▇█"
-                vals = [pol.hourly_profile.get(h, 0) for h in range(24)]
-                peak_v = max(vals) or 1
-                bar = "".join(glyphs[min(int(v / peak_v * 7), 7)] for v in vals)
-                print(f"Pattern for {args.pattern}: peak={pol.peak_hour}:00 quiet={pol.quiet_hours} consistency={pol.consistency_score:.2f}")
-                print(f"  {bar}  (00..23)")
-            return 0
-
-        if args.anomalies:
-            anoms = detect_anomalies(active, args.anomalies, args.anomalies_z)
-            for a in anoms:
-                print(f"  {a.metric} z={a.zscore:.2f} value={a.value:.1f} expected={a.expected:.1f}")
-            if not anoms:
-                print("(no anomalies)")
-            return 0
-
-        if args.sequences:
-            seqs = find_common_sequences(active, min_support=args.sequences)
-            for s in seqs:
-                print(f"  {s.count:>5d}x  {' -> '.join(s.pattern)}")
-            if not seqs:
-                print("(no sequences)")
-            return 0
-
-        if args.timeline:
-            print(ascii_timeline(active, args.timeline))
-            return 0
-
-        if args.heatmap:
-            print(calendar_heatmap(active, args.heatmap))
-            return 0
-
-        if args.net:
-            edges = build_edge_graph(active)
-            print(ascii_network_graph(edges, top_n=args.net))
-            return 0
-
-        if args.correlate:
-            path, window_str = args.correlate
-            try:
-                other = list(iter_entries(path))
-            except FileNotFoundError:
-                print(f"File not found: {path}", file=sys.stderr); return 1
-            corr = correlate_logs(active, other, int(window_str))
-            for c in corr[:20]:
-                print(f"  {c.count:>5d}x  {c.event_a} ~~ {c.event_b}  delay={c.avg_delay_seconds:.0f}s")
-            return 0
-
-        if args.auto_report:
-            s = summarize(active, args.top)
-            counts: Counter = Counter(e.user for e in active if e.user)
-            top_users_list = [u for u, _ in counts.most_common(10)]
-            profiles_list = [build_profile(active, u) for u in top_users_list]
-            llm_auto_report(s, profiles_list, args.llm_url, args.llm_model,
-                            args.max_chunk_chars, cache=cache)
-            return 0
-
-        if args.cron:
-            alert_engine = AlertEngine()
-            return cron_mode(active, alert_engine, args.webhook_url, args.cron_output)
-
-        if args.templates:
-            templates = extract_log_templates(active, args.templates)
-            for template, count, sample in templates:
-                print(f"  {count:>5d}x  {template[:160]}")
-            return 0
-
-        if args.changepoints:
-            cps = detect_change_points(active, args.changepoints, args.changepoints_window)
-            for cp in cps:
-                dir_ = "UP" if cp.after_val > cp.before_val else "DOWN"
-                print(f"  {dir_} {cp.metric} at {cp.at.date()} {cp.before_val:.1f}->{cp.after_val:.1f} effect={cp.effect_size:.2f}")
-            if not cps:
-                print("(no change points)")
-            return 0
-
-        if args.rootcause:
-            user = args.rootcause[0]
-            lookback = int(args.rootcause[1]) if len(args.rootcause) > 1 else 120
-            causes = trace_root_causes(active, user, lookback)
-            for rc in causes[:15]:
-                print(f"  {rc.occurrences:>4d}x  corr={rc.correlation:.2f}  lag={rc.avg_lag_seconds:.0f}s  {rc.preceding_user:<20s} {rc.preceding_event}")
-            if not causes:
-                print("(no root causes)")
-            return 0
-
-        if args.forecast:
-            fc = forecast_activity(active, args.forecast, args.forecast_days)
-            print(f"Forecast for {args.forecast}: trend={fc.trend}")
-            for d, v in fc.predictions:
-                print(f"  {d}: {v:.0f}")
-            return 0
-
-        if args.multifactor:
-            mf = multi_factor_anomaly(active, args.multifactor)
-            if mf:
-                print(f"Multi-factor anomaly for {args.multifactor}: composite={mf.composite_score:+.3f}")
-            else:
-                print("(insufficient data)")
-            return 0
-
-        if args.chart:
-            sub = args.chart[0]
-            if sub == "timeline" and len(args.chart) >= 2:
-                path = args.chart[1]
-                user = args.chart[2] if len(args.chart) > 2 else None
-                chart_timeline(active, path, user)
-            else:
-                print("Usage: --chart timeline <path> [user]")
-            return 0
-
-        if args.dataframe is not None:
-            print(dataframe_view(active, args.dataframe))
-            return 0
-
-        if args.recurrence:
-            recs = detect_recurrence(active, args.recurrence)
-            for r in recs:
-                print(f"  [{r.pattern_type:>7}]  confidence={r.confidence:.0%}  {r.description}")
-            if not recs:
-                print("(no recurrence patterns)")
-            return 0
-
-        if args.churn:
-            pred = predict_churn(active, args.churn)
-            level = "HIGH" if pred.risk_score > 0.6 else "MEDIUM" if pred.risk_score > 0.3 else "LOW"
-            print(f"Churn for {args.churn}: risk={level} ({pred.risk_score:.2f})")
-            for f in pred.factors:
-                print(f"  - {f}")
-            return 0
-
-        if args.pareto:
-            p = pareto_analysis(active, args.pareto)
-            print(f"Pareto ({args.pareto}): top {p.top_80_pct_count} items account for ~80%")
-            for name, count, cum in p.items[:25]:
-                print(f"  {cum:>5.0f}%  {count:>7d}  {name}")
-            return 0
-
-        if args.dashboard:
-            run_dashboard(all_entries, cache and AlertEngine() or None, args.log)
-            return 0
-
-        if args.forecast_anomaly:
-            user, z_s, days_s = args.forecast_anomaly
-            fa = forecast_aware_anomaly(active, user, float(z_s), int(days_s))
-            print(json.dumps(fa, indent=2))
-            return 0
-
-        if args.alert_fatigue:
-            scores = alert_fatigue_scores(AlertEngine(), active, args.alert_fatigue)
-            for s in scores:
-                print(f"  {s.rule_name:<20s}  fires={s.fires_total:<5d}  rate={s.signal_rate:.0%}  {s.suggestion}")
-            return 0
-
-        if args.export_html_drilldown:
-            path = args.export_html_drilldown[0]
-            users = args.export_html_drilldown[1:] or ([args.user] if args.user else [])
-            s = summarize(active, args.top)
-            profiles = [build_profile(active, u) for u in users if u] if users else None
-            write_html_report_drilldown(path, s, profiles)
-            print(f"Drill-down HTML report written to {path}")
-            return 0
-
-        if args.session_times:
-            ua, ub, gap_s = args.session_times
-            results = session_response_times(active, ua, ub, int(gap_s))
-            if not results:
-                print("(no session data)")
-            else:
-                print(f"Session-aware response times ({ua} <-> {ub}):")
-                for r in results[:20]:
-                    print(f"  [{r['session_start']}] {r['responder']} responded in {r['delay_seconds']:.0f}s")
-            return 0
-
-        if args.influence:
-            seed, hops_s, win_s = args.influence
-            chains = influence_chains(active, seed, int(hops_s), int(win_s))
-            if not chains:
-                print(f"(no chains for {seed})")
-            else:
-                print(f"Influence chains ({len(chains)}):")
-                for ch in chains[:20]:
-                    print("  " + " -> ".join(c["user"] for c in ch))
-            return 0
-
-        if args.template_filter:
-            filtered = filter_by_template(active, args.template_filter)
-            if not filtered:
-                print(f"(no matches for template {args.template_filter})")
-            else:
-                print(f"Template '{args.template_filter}' ({len(filtered)} entries):")
-                for e in filtered[:30]:
-                    print(f"  {e.raw[:200]}")
-            return 0
-
-        if args.drift:
-            user, wa_s, wb_s, gap_s = args.drift
-            result = drift_detection(active, user, int(wa_s), int(wb_s), int(gap_s))
-            print(json.dumps(result, indent=2))
-            return 0
-
-        if args.save_profile:
-            user, path = args.save_profile
-            print(save_profile(user, active, path))
-            return 0
-
-        if args.load_profile:
-            prof = load_profile(args.load_profile)
-            if prof:
-                print(json.dumps(prof, indent=2, default=str)[:2000])
-            return 0
-
-        if args.auto_tag:
-            tag = auto_tag_user(active, args.auto_tag, args.llm_url, args.llm_model,
-                                args.max_chunk_chars, cache)
-            print(f"Tags for {args.auto_tag}: {tag}")
-            return 0
-
-        if args.auto_tag_bulk:
-            tags = auto_tag_bulk(active, args.llm_url, args.llm_model,
-                                 args.max_chunk_chars, cache, args.auto_tag_bulk)
-            for user, tag in tags.items():
-                print(f"  {user:<20s}  {tag}")
-            return 0
-
-        if args.recurrence_breach:
-            parts = args.recurrence_breach
-            user = parts[0]
-            days = int(parts[1]) if len(parts) > 1 else 3
-            result = check_recurrence_breach(active, user, days)
-            print(json.dumps(result, indent=2))
-            return 0
-
-        if args.dashboard_alerts:
-            engine = AlertEngine()
-            scores = alert_fatigue_scores(engine, active, 1)
-            if not scores:
-                print("(no rules to score)")
-            else:
-                for s in scores:
-                    print(f"  {s.rule_name:<20s}  rate={s.signal_rate:.0%}")
-            return 0
-
-        if args.similar:
-            pairs = find_similar_users(active,
-                                       min_lines=args.similar_min_lines,
-                                       threshold=args.similar_threshold)
-            print_similar_users(pairs)
-            return 0
-
-        if args.flagged:
-            try:
-                filters = parse_score_filter(args.flagged)
-            except ValueError as exc:
-                print(f"Bad score expression: {exc}", file=sys.stderr); return 2
-            u_l = args.user.lower() if args.user else None
-            count = 0
-            for e in active:
-                if u_l and not (e.user and e.user.lower() == u_l):
-                    continue
-                if matches_score_filter(e, filters):
-                    print(e.raw)
-                    count += 1
-            print(f"# {count} matches", file=sys.stderr)
-            return 0
-
-        if args.bursts:
-            bursts = detect_bursts(active, args.bursts,
-                                   window_seconds=args.bursts_window,
-                                   z_threshold=args.bursts_z)
-            print_bursts(args.bursts, bursts, args.bursts_window)
-            return 0
-
-        if args.zscores:
-            if not args.user:
-                print("--zscores requires --user", file=sys.stderr); return 2
-            profile = build_profile(active, args.user)
-            pop = population_score_stats(active)
-            print_zscores(profile, pop)
-            return 0
-
-        if args.dist:
-            if args.user:
-                print_score_dist(args.user, collect_scores(active, args.user))
-            else:
-                print_score_dist("(population)", collect_scores(active))
-            return 0
-
-        if args.export_edges:
-            edges = build_edge_graph(active)
-            ext = os.path.splitext(args.export_edges)[1].lower()
-            if ext == ".dot":
-                export_edges_dot(edges, args.export_edges)
-            else:
-                export_edges_csv(edges, args.export_edges)
-            print(f"Wrote {args.export_edges} ({len(edges)} edges)")
-            return 0
-        if args.export_report:
-            export_summary_json(summarize(active, args.top), args.export_report)
-            print(f"Wrote {args.export_report}")
-            return 0
-        if args.export_profile:
-            if not args.user:
-                print("--export-profile requires --user", file=sys.stderr); return 2
-            profile = build_profile(active, args.user)
-            ext = os.path.splitext(args.export_profile)[1].lower()
-            if ext == ".csv":
-                export_profile_csv(profile, args.export_profile)
-            else:
-                export_profile_json(profile, args.export_profile)
-            print(f"Wrote {args.export_profile}")
-            return 0
-
-        if args.compare:
-            users = [u.strip() for u in args.compare.split(",") if u.strip()]
-            if len(users) < 2:
-                print("--compare must be at least 'A,B'", file=sys.stderr); return 2
-            profiles = [build_profile(active, u) for u in users]
-            print(f"=== {args.log}  compare: {' vs '.join(users)} ===")
-            print_compare_table_n(profiles)
-            if not args.no_llm:
-                compare_n_users_with_llm(profiles, args.llm_url, args.llm_model,
-                                         args.max_chunk_chars, cache=cache)
-            return 0
-
-        if args.users:
-            pair = [u.strip() for u in args.users.split(",") if u.strip()]
-            if len(pair) != 2:
-                print("--users must be 'A,B'", file=sys.stderr); return 2
-            a, b = pair
-            matched = [e for e in active if line_is_interaction(e, a, b)]
-            print(f"=== {args.log}  interactions: {a} <-> {b} ({len(matched)} lines) ===")
-            if args.show_lines:
-                for e in matched[:args.show_lines]:
-                    print(f"  {e.text[:300]}")
-            if not args.no_llm:
-                analyze_interaction_with_llm(
-                    a, b, [e.text for e in matched],
-                    args.llm_url, args.llm_model, args.max_chunk_chars, cache=cache,
-                )
-            return 0
-
-        if args.ask:
-            if not args.user:
-                print("--ask requires --user", file=sys.stderr); return 2
-            matched = [e for e in active if line_matches_user(e, args.user)]
-            print(f"=== {args.log}  ask about '{args.user}': {args.ask} ===")
-            if not args.no_llm:
-                ask_about_user_with_llm(
-                    args.user, args.ask, [e.text for e in matched],
-                    args.llm_url, args.llm_model, args.max_chunk_chars, cache=cache,
-                )
-            return 0
-
-        if args.user:
-            matched = [e for e in active if line_matches_user(e, args.user)]
-            print(f"=== {args.log}  filtered to user '{args.user}' ===")
-            print_report(summarize(matched, args.top))
-
-            if args.show_lines:
-                print(f"\nFirst {min(args.show_lines, len(matched))} matched lines:")
-                for e in matched[:args.show_lines]:
-                    print(f"  {e.raw[:300]}")
-
-            if not args.no_llm:
-                analyze_user_with_llm(
-                    args.user, [e.text for e in matched],
-                    args.llm_url, args.llm_model, args.max_chunk_chars, cache=cache,
-                )
-        else:
-            print(f"=== {args.log} ===")
-            print_report(summarize(active, args.top))
-        return 0
-
-    state = ShellState(
-        log_path=args.log,
-        entries=all_entries,
-        focused_user=args.user,
-        since=since,
-        until=until,
-        top_n=args.top,
-        llm_url=args.llm_url,
-        llm_model=args.llm_model,
-        max_chunk_chars=args.max_chunk_chars,
-        llm_cache=cache,
-        webhook_url=args.webhook_url or "",
-        plugin_dir=args.plugin_dir or "",
-        template_filter=args.template_filter or "",
-        profile_dir=os.path.join(os.path.dirname(args.log) or ".", "profiles"),
-    )
-    load_shell_config(state)
-    if args.plugin_dir:
-        load_plugins_from(args.plugin_dir)
-    if args.web:
-        global _web_entries  # noqa: PLW0603
-        _web_entries = all_entries
-        state.web_server = start_web_server(args.web)
-        print(f"Web API server started at http://127.0.0.1:{args.web}")
-    shell = LogShell(state)
-    _set_current_shell(shell)
-    shell._refresh_prompt()
-
-    if args.webportal:
-        try:
-            _webportal_server = start_webportal(shell, "127.0.0.1", 80)
-            print("Web portal started at http://127.0.0.1:80")
-        except OSError as exc:
-            print(f"Could not start web portal: {exc}")
+    tasks = [
+        asyncio.create_task(client.run_connection()),
+        asyncio.create_task(tui.run()),
+    ]
 
     try:
-        startup_cmds: list[str] = []
-        if args.show_commands:
-            startup_cmds.append("commands")
-        startup_cmds.extend(args.cmd)
-
-        if startup_cmds:
-            print(shell.intro, end="")
-            for c in startup_cmds:
-                print(f"{shell.prompt}{c}")
-                if shell.onecmd(c):
-                    return 0
-                shell._refresh_prompt()
-            shell.cmdloop(intro="")
-        else:
-            shell.cmdloop()
-    except KeyboardInterrupt:
-        print()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except (SystemExit, asyncio.CancelledError, KeyboardInterrupt):
+        pass
     finally:
-        if state.llm_cache:
-            state.llm_cache.save()
-    return 0
+        # Cancel any tasks still running (e.g. if we exit via SystemExit or
+        # the gather is cancelled by asyncio.run on SIGINT).
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        # Drain cancellations — ignore whatever they return.
+        await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Cleanly QUIT all connected servers (primary + any added via /server).
+        for ctx in tui.servers.values():
+            c = ctx.client
+            c.running = False
+            if c.writer:
+                try:
+                    c.send_raw("QUIT :Client exiting")
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(c.writer.drain()), timeout=0.4)
+                    except Exception:
+                        pass
+                    c.writer.close()
+                    try:
+                        await asyncio.wait_for(c.writer.wait_closed(), timeout=0.4)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+def _in_virtualenv() -> bool:
+    """Return True if the interpreter is running inside a virtual environment."""
+    return hasattr(sys, "real_prefix") or (
+        hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix
+    )
+
+
+def _ensure_deps() -> bool:
+    """Check for every required and optional package.
+    Any that are absent are installed via pip automatically.
+    Returns True if at least one package was installed (the process must
+    restart so that the freshly installed modules can be imported).
+    Skipped entirely when --no-install is set."""
+
+    if _NO_INSTALL:
+        return False
+
+    # (import_name, pip_package_name, description_for_display)
+    wanted: List[Tuple[str, str, str]] = [
+        ("anthropic",    "anthropic",      "Claude API client  (/askai, /summarize)"),
+        ("openai",       "openai",         "OpenAI API client  (/askai, /summarize with GPT models)"),
+    ]
+    if not _NO_AI:
+        wanted += [
+            ("transformers", "transformers",   "AI text detection  (HuggingFace)"),
+            ("torch",        "torch",          "AI text detection  (PyTorch)"),
+        ]
+    missing = [
+        (imp, pkg, desc) for imp, pkg, desc in wanted
+        if importlib.util.find_spec(imp) is None
+    ]
+    if not missing:
+        return False
+
+    w = 44
+    print("─" * w)
+    print("  Missing packages — installing via pip:")
+    for _, pkg, desc in missing:
+        print(f"    • {pkg:<20}  {desc}")
+    print("─" * w)
+    print()
+
+    installed_any = False
+    for imp, pkg, desc in missing:
+        print(f"  ▸ pip install {pkg}")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+            print(f"  ✓  {pkg} installed\n")
+            installed_any = True
+        except subprocess.CalledProcessError:
+            print(f"  ✗  {pkg} failed — some features may be unavailable\n")
+
+    return installed_any
+
+
+def main():
+    if _REQUIRE_VENV and not _in_virtualenv():
+        sys.exit(
+            "error: --require-virtualenv is set but no virtual environment is active.\n"
+            "  Create and activate one:\n"
+            "    python -m venv venv\n"
+            "    .\\venv\\Scripts\\activate   (Windows)\n"
+            "    source venv/bin/activate    (Linux/macOS)"
+        )
+
+    global DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, DEFAULT_CHANNEL
+    global NICKSERV_PASSWORD, SASL_MECHANISM, SASL_CERT, SASL_KEY
+    global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GITHUB_TOKEN
+    global OLLAMA_URL, LLAMACPP_URL
+
+    # Ensure the pre-curses terminal output can render Unicode box-drawing
+    # characters and symbols on Windows (default console codec is cp1252).
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+    # Install any missing packages before doing anything else.
+    # If something was installed the process restarts so all module-level
+    # imports pick up the newly available packages.
+    if _ensure_deps():
+        print("  All packages ready — restarting...\n")
+        sys.exit(subprocess.call([sys.executable] + sys.argv))
+
+    # ── Startup prompts (plain terminal, before curses takes over) ──────────────
+    print("╔══════════════════════════════════════╗")
+    print("║       eyearesee  —  IRC client       ║")
+    print("╚══════════════════════════════════════╝")
+    print("  Press Enter to accept the [default].\n")
+
+    # Load all settings from irc_config.json; env vars are the fallback already
+    # applied at module level.  Config file takes precedence over env vars.
+    _saved = load_irc_config()
+
+    if _saved.get("server"):        DEFAULT_SERVER     = _saved["server"]
+    if _saved.get("port"):          DEFAULT_PORT       = int(_saved["port"])
+    if _saved.get("nick"):          DEFAULT_NICK       = _saved["nick"]
+    if _saved.get("channel"):       DEFAULT_CHANNEL    = _saved["channel"]
+    if _saved.get("sasl_mechanism"):SASL_MECHANISM     = _saved["sasl_mechanism"].upper()
+    if _saved.get("sasl_cert"):     SASL_CERT          = _saved["sasl_cert"]
+    if _saved.get("sasl_key"):      SASL_KEY           = _saved["sasl_key"]
+    if _saved.get("nickserv_password"): NICKSERV_PASSWORD = _saved["nickserv_password"]
+    if _saved.get("anthropic_api_key"): ANTHROPIC_API_KEY = _saved["anthropic_api_key"]
+    if _saved.get("openai_api_key"):    OPENAI_API_KEY    = _saved["openai_api_key"]
+    if _saved.get("deepseek_api_key"):  DEEPSEEK_API_KEY  = _saved["deepseek_api_key"]
+    if _saved.get("github_token"):      GITHUB_TOKEN      = _saved["github_token"]
+    if _saved.get("ollama_url"):        OLLAMA_URL        = _saved["ollama_url"]
+    if _saved.get("llamacpp_url"):      LLAMACPP_URL      = _saved["llamacpp_url"]
+    if _saved.get("autojoin"):
+        _AUTOJOIN_CHANNELS.update(_saved["autojoin"])
+
+    # ── Safe input helper (returns "" on EOF so defaults are used) ─────────────
+    def _input(prompt: str) -> str:
+        try:
+            return input(prompt)
+        except EOFError:
+            return ""
+
+    # ── IRC connection ───────────────────────────────────────────────────────────
+
+    # Server — accepts host  or  host:port
+    raw = _input(f"  Server   [{DEFAULT_SERVER}] : ").strip()
+    if raw:
+        if ":" in raw:
+            host, _, port_str = raw.rpartition(":")
+            if port_str.isdigit():
+                DEFAULT_SERVER, DEFAULT_PORT = host, int(port_str)
+            else:
+                DEFAULT_SERVER = raw          # treat whole thing as hostname
+        else:
+            DEFAULT_SERVER = raw
+
+    # Nick
+    raw = _input(f"  Nick     [{DEFAULT_NICK}] : ").strip()
+    if raw:
+        # IRC nicks: letters/digits/[-\[\]\\`_^{|}], max 30 chars (RFC 1459 §2.3.1)
+        raw = re.sub(r'[^a-zA-Z0-9\[\]\\`_\-^{|}]', '', raw)[:30]
+        if raw:
+            DEFAULT_NICK = raw
+
+    # Channel — prepend # if omitted
+    raw = _input(f"  Channel  [{DEFAULT_CHANNEL}] : ").strip()
+    if raw:
+        DEFAULT_CHANNEL = raw if raw.startswith("#") else "#" + raw
+        # Strip characters illegal in channel names: NUL, BEL, space, comma, CR/LF
+        DEFAULT_CHANNEL = re.sub(r'[\x00-\x07\x09-\x1f\x7f ,]', '', DEFAULT_CHANNEL)[:50] \
+                          or DEFAULT_CHANNEL
+
+    # ── SASL ────────────────────────────────────────────────────────────────────
+
+    _mech_hint = f"PLAIN/SCRAM-SHA-256/EXTERNAL/ECDSA-NIST256P-CHALLENGE"
+    raw = _input(f"  SASL     [{SASL_MECHANISM}] ({_mech_hint}) : ").strip().upper()
+    if raw:
+        SASL_MECHANISM = raw
+
+    # NickServ / SASL password (PLAIN and SCRAM-SHA-256)
+    _pw_hint = "[configured]" if NICKSERV_PASSWORD else "blank to skip"
+    raw = getpass.getpass(f"  Password ({_pw_hint}) : ")
+    if raw:
+        NICKSERV_PASSWORD = raw
+
+    # Cert/key paths — only relevant for EXTERNAL and ECDSA
+    if SASL_MECHANISM in ("EXTERNAL", "ECDSA-NIST256P-CHALLENGE"):
+        if SASL_MECHANISM == "EXTERNAL":
+            _cert_hint = SASL_CERT or "path to PEM cert"
+            raw = _input(f"  SASL cert [{_cert_hint}] : ").strip()
+            if raw:
+                SASL_CERT = raw
+        _key_hint = SASL_KEY or "path to PEM key"
+        raw = _input(f"  SASL key  [{_key_hint}] : ").strip()
+        if raw:
+            SASL_KEY = raw
+
+    # ── AI API keys ──────────────────────────────────────────────────────────────
+
+    print()
+    print("  AI API keys — press Enter to keep existing value, '-' to clear.")
+
+    def _prompt_key(label: str, current: str) -> str:
+        hint = "[configured]" if current else "blank to skip"
+        val = _input(f"  {label:<22} ({hint}) : ").strip()
+        if val == "-":
+            return ""
+        return val if val else current
+
+    ANTHROPIC_API_KEY = _prompt_key("Anthropic API key", ANTHROPIC_API_KEY)
+    OPENAI_API_KEY    = _prompt_key("OpenAI API key",    OPENAI_API_KEY)
+    DEEPSEEK_API_KEY  = _prompt_key("DeepSeek API key",  DEEPSEEK_API_KEY)
+    GITHUB_TOKEN      = _prompt_key("GitHub token",      GITHUB_TOKEN)
+
+    print()
+    print("  Local inference servers (press Enter to keep).")
+    raw = _input(f"  Ollama URL    [{OLLAMA_URL}] : ").strip()
+    if raw:
+        OLLAMA_URL = raw
+    raw = _input(f"  llama.cpp URL [{LLAMACPP_URL}] : ").strip()
+    if raw:
+        LLAMACPP_URL = raw
+
+    # ── Persist everything to irc_config.json ───────────────────────────────────
+    _cfg: dict = {
+        "server":            DEFAULT_SERVER,
+        "port":              DEFAULT_PORT,
+        "nick":              DEFAULT_NICK,
+        "channel":           DEFAULT_CHANNEL,
+        "sasl_mechanism":    SASL_MECHANISM,
+        "nickserv_password": NICKSERV_PASSWORD,
+        "ollama_url":        OLLAMA_URL,
+        "llamacpp_url":      LLAMACPP_URL,
+    }
+    # Cert/key only written when non-empty (paths are sensitive enough to omit
+    # if unused, and writing empty strings would clutter the file).
+    if SASL_CERT:     _cfg["sasl_cert"]          = SASL_CERT
+    if SASL_KEY:      _cfg["sasl_key"]            = SASL_KEY
+    if ANTHROPIC_API_KEY: _cfg["anthropic_api_key"] = ANTHROPIC_API_KEY
+    if OPENAI_API_KEY:    _cfg["openai_api_key"]    = OPENAI_API_KEY
+    if DEEPSEEK_API_KEY:  _cfg["deepseek_api_key"]  = DEEPSEEK_API_KEY
+    if GITHUB_TOKEN:      _cfg["github_token"]       = GITHUB_TOKEN
+    save_irc_config(_cfg)
+
+    print(f"\n  → {DEFAULT_SERVER}:{DEFAULT_PORT} (SSL)  nick={DEFAULT_NICK}"
+          + (f"  channel={DEFAULT_CHANNEL}" if DEFAULT_CHANNEL else ""))
+    print()
+
+    # Load AI models before curses starts so progress prints go to the normal
+    # terminal and don't corrupt the TUI display.
+    if _NO_AI:
+        print("  AI detection: DISABLED (--no-ai)")
+    ai_detector = EnsembleAIDetector(disabled=_NO_AI)
+    if not _NO_AI:
+        _load_all_nick_ai_history()
+
+    # Start logging immediately — before curses initialises — so the session
+    # record is written even if the TUI fails to start (bad terminal size, etc.).
+    log_session_start(DEFAULT_SERVER, DEFAULT_NICK)
+    log_state = f"ON  → {AI_LOG_PATH}" if _ai_logging_enabled else "OFF (set IRC_AI_LOG=1 to enable)"
+    print(f"  AI logging : {log_state}")
+    print()
+
+    try:
+        curses.wrapper(lambda stdscr: asyncio.run(main_curses(stdscr, ai_detector)))
+    except (KeyboardInterrupt, SystemExit):
+        pass
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
