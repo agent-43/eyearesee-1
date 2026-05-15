@@ -7,7 +7,8 @@ eyearesee is a sophisticated, single-file terminal-based IRC client featuring an
 - [Architecture and AI Composition](#architecture-and-ai-composition)
 - [Core IRC Features](#core-irc-features)
 - [AI Detection System](#ai-detection-system)
-- [Interactive Commands](#interactive-commands)
+- [Comprehensive Command Reference](#comprehensive-command-reference)
+- [Keyboard and Mouse Interactions](#keyboard-and-mouse-interactions)
 - [Dependencies](#dependencies)
 - [Summary](#summary)
 
@@ -69,27 +70,53 @@ The detector computes eight distinct signals for every incoming message to deter
 | **Watermark** | `watermark_score()` | Analysis of token spacing regularity and "green-red" list bias. |
 | **Timing** | `timing_anomaly_score()` | Log-normal modeling of inter-message intervals to detect automation. |
 
-*Ensemble weighting automatically adapts to message length (e.g., favoring heuristics for short messages and classifiers/binoculars for longer text).*
+---
+
+## Comprehensive Command Reference
+
+### Messaging
+- `/msg`, `/query`, `/jitsi`, `/chain`, `/idle`, `/together`, `/adjacent`, `/targets`, `/notice`, `/me`, `/reply`, `/react`, `/ml` (multiline), `/redact`, `/tagmsg`, `/x0` (image upload)
+
+### Channels
+- `/join`, `/part`, `/topic`, `/names`, `/kick`, `/invite`, `/mode`, `/autojoin`
+
+### Operator
+- `/op`, `/deop`, `/voice`, `/devoice`, `/hop`, `/dehop`, `/ban`, `/ban -l`, `/unban`
+
+### Users & Status
+- `/nick`, `/whois`, `/whowas`, `/who`, `/ignore`, `/unignore`, `/away`, `/back`, `/seen`, `/tell`, `/monitor`, `/whox`, `/cluster`
+
+### AI Detection
+- `/ai`, `/topai`, `/bot`, `/unbot`, `/aitoggle`, `/logtoggle`, `/learn_tell`, `/forget_tell`, `/scan_watermark`, `/fingerprint`
+
+### AI Integration (Claude, OpenAI, Ollama)
+- `/askai`, `/summarize`, `/model`, `/vibe`, `/explain`, `/api`
+
+### Translation & Utilities
+- `/autotranslate`, `/linkpreview`, `/dcc` (send/trust/untrust/trusted/status)
+
+### Windows & Navigation
+- `/win`, `/close` (`/wc`), `/clear`, `/alias`, `/links`, `/list`, `/lf`, `/theme`, `/userlist`, `/znc`
+
+### Connection & Services
+- `/server`, `/reconnect`, `/replay`, `/register`, `/pem`, `/ns`, `/cs`, `/ctcp`
+
+### Plugins & System
+- `/loadplugin`, `/unloadplugin`, `/reloadplugin`, `/plugins`, `/redraw`, `/quit`, `/help`, `/commands`, `/mute`
 
 ---
 
-## Interactive Commands
+## Keyboard and Mouse Interactions
 
-| Command | Function |
-| :--- | :--- |
-| `/ai <nick>` | Displays a full AI profile with per-signal breakdown and verdict. |
-| `/topai` | Ranks users in the current channel by AI likelihood. |
-| `/bot <nick>` | Marks a user as a confirmed bot and trains a fingerprint. |
-| `/unbot <nick>` | Removes the confirmed-bot status from a user. |
-| `/learn_tell <phrase>` | Adds n-grams to the collaborative blocklist. |
-| `/forget_tell <phrase>` | Removes n-grams from the blocklist. |
-| `/scan_watermark` | Scans text or recent messages for watermark patterns. |
-| `/aitoggle` | Enables or disables real-time AI scoring. |
-| `/explain <nick>` | Performs an LLM-based behavioural analysis of a specific user. |
-| `/askai <question>` | Queries a configured LLM (Claude, GPT, Ollama, llama.cpp). |
-| `/model` | Lists or selects the active AI provider and model. |
-| `/fingerprint` | Displays fingerprints of confirmed bots. |
-| `/cluster` | Clusters users based on linguistic similarity. |
+### Keyboard Shortcuts
+- **Navigation:** `Ctrl+N` (Next window), `Tab` / `Shift+Tab` (Completion / Navigation), `PgUp` / `PgDn` (Scrolling)
+- **Editing:** `Ctrl+A` (Home), `Ctrl+E` (End), `Ctrl+K` (Clear after cursor), `Ctrl+W` (Delete word)
+- **Formatting:** `Ctrl+B` (Bold), `Ctrl+]` (Italic), `Ctrl+_` (Underline), `Ctrl+O` (Reset formatting)
+
+### Mouse Support
+- **URLs:** Click to open in default browser.
+- **Nicks:** Click in userlist or chat to initiate a `/query`.
+- **Header:** Click to switch between active channels/windows.
 
 ---
 
