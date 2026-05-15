@@ -3970,9 +3970,10 @@ class IRCClient:
             elif ctcp_cmd == "FINGER":
                 self.send_raw(f"NOTICE {nick} :\x01FINGER No finger info\x01")
             elif ctcp_cmd == "DCC":
-                # DCC SEND/CHAT handling
+                # DCC SEND / TSEND / RESUME / ACCEPT
                 dcc_parts = ctcp_args.split()
-                if len(dcc_parts) >= 4 and dcc_parts[0] == "SEND":
+                if len(dcc_parts) >= 4 and dcc_parts[0] in ("SEND", "TSEND"):
+                    is_turbo = dcc_parts[0] == "TSEND"
                     filename = dcc_parts[1]
                     try:
                         ip_int = int(dcc_parts[2])
@@ -3980,8 +3981,11 @@ class IRCClient:
                     except ValueError:
                         return
                     filesize = int(dcc_parts[4]) if len(dcc_parts) > 4 else 0
-                    # Dispatch to TUI which checks trusted list
-                    await self.ui_queue.put(("dcc_offer", nick, filename, ip_int, port, filesize))
+                    await self.ui_queue.put(("dcc_offer", nick, filename, ip_int, port, filesize, is_turbo))
+                elif len(dcc_parts) == 4 and dcc_parts[0] == "RESUME":
+                    await self.ui_queue.put(("dcc_resume_req", nick, dcc_parts[1], int(dcc_parts[2]), int(dcc_parts[3])))
+                elif len(dcc_parts) == 4 and dcc_parts[0] == "ACCEPT":
+                    await self.ui_queue.put(("dcc_resume_ack", nick, dcc_parts[1], int(dcc_parts[2]), int(dcc_parts[3])))
             return  # CTCP — never treat as normal message
 
         if nick not in self.users:
@@ -4505,14 +4509,21 @@ class IRCClient:
     _dcc_in:  dict = {}
     _dcc_seq: int = 0
 
-    async def _dcc_send_file(self, tid: str, nick: str, filepath: str) -> None:
-        """Background task: listen, offer via CTCP, stream file, report progress."""
+    async def _dcc_send_file(self, tid: str, nick: str, filepath: str,
+                              turbo: bool = False, resume_pos: int = 0) -> None:
+        """Background task: listen, offer via CTCP, stream file, report progress.
+
+        If *resume_pos* > 0 the file bytes before that offset are skipped
+        (receiver already has them).  *turbo* skips the ACK wait after each block.
+        """
         try:
             filesize = os.path.getsize(filepath)
             filename = os.path.basename(filepath)
         except OSError as e:
             await self.ui_queue.put(("dcc_progress", tid, nick, filepath, 0, 0, f"error: {e}"))
             return
+        if resume_pos > 0:
+            filename = os.path.basename(filepath)
 
         # Get our local IP from the IRC socket
         sock = self.writer.get_extra_info("sockname") if self.writer else None
@@ -4525,42 +4536,56 @@ class IRCClient:
         # Start TCP listener on a random port
         try:
             server = await asyncio.start_server(
-                lambda r, w: self._dcc_handle_client(tid, r, w, filepath, filesize),
+                lambda r, w: self._dcc_handle_client(tid, r, w, filepath, filesize, turbo),
                 host="0.0.0.0", port=0)
             port = server.sockets[0].getsockname()[1]
         except OSError as e:
             await self.ui_queue.put(("dcc_progress", tid, nick, filename, 0, filesize, f"error: {e}"))
             return
 
-        self._dcc_out[tid]["server"] = server
+        self._dcc_out[tid].update({"server": server, "port": port, "turbo": turbo})
         await self.ui_queue.put(("dcc_progress", tid, nick, filename, 0, filesize, "listening"))
 
-        # Send DCC SEND offer
+        # Send DCC SEND / TSEND offer, possibly with resume
+        cmd = "TSEND" if turbo else "SEND"
         self.send_raw(
-            f"PRIVMSG {nick} :\x01DCC SEND {filename} {ip_int} {port} {filesize}\x01")
+            f"PRIVMSG {nick} :\x01DCC {cmd} {filename} {ip_int} {port} {filesize}\x01")
 
-        # Wait for connection with a timeout, then clean up server
-        await asyncio.sleep(60)
+        # Wait up to 120 s for the receiver to connect (or reconnect after resume)
+        for _ in range(120):
+            if self._dcc_out.get(tid, {}).get("done"):
+                break
+            await asyncio.sleep(1)
         server.close()
         await server.wait_closed()
         entry = self._dcc_out.get(tid)
-        if entry and entry["sent"] < entry["total"]:
+        if entry and not entry.get("done") and entry.get("sent", 0) < entry.get("total", 0):
             await self.ui_queue.put(("dcc_progress", tid, nick, filename,
                                      entry["sent"], filesize, "timeout"))
 
     async def _dcc_handle_client(self, tid: str, reader: asyncio.StreamReader,
                                   writer: asyncio.StreamWriter,
-                                  filepath: str, filesize: int) -> None:
+                                  filepath: str, filesize: int,
+                                  turbo: bool = False) -> None:
         """Handle an incoming DCC connection: send file in 1024-byte blocks."""
         entry = self._dcc_out.get(tid)
         if not entry:
             writer.close()
             return
-        entry["writer"] = writer
         nick = entry["nick"]
         filename = os.path.basename(filepath)
+        resume_at = entry.get("resume_at", 0)
+
+        # Handle reconnection for resume — use the stored position
+        start_pos = max(resume_at, entry.get("sent", 0))
+        entry["resume_at"] = 0  # consumed
+        entry["writer"] = writer
+
         try:
             with open(filepath, "rb") as f:
+                if start_pos > 0:
+                    f.seek(start_pos)
+                    entry["sent"] = start_pos
                 while entry["sent"] < filesize:
                     chunk = f.read(1024)
                     if not chunk:
@@ -4570,11 +4595,13 @@ class IRCClient:
                     entry["sent"] += len(chunk)
                     await self.ui_queue.put(
                         ("dcc_progress", tid, nick, filename, entry["sent"], filesize, "transferring"))
-                    # Wait for ACK (4 bytes, network-order unsigned long)
-                    try:
-                        await asyncio.wait_for(reader.readexactly(4), timeout=30)
-                    except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError):
-                        break
+                    if not turbo:
+                        # Standard DCC: wait for ACK (4 bytes, network-order unsigned long)
+                        try:
+                            await asyncio.wait_for(reader.readexactly(4), timeout=30)
+                        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError):
+                            break
+            entry["done"] = True
             await self.ui_queue.put(
                 ("dcc_progress", tid, nick, filename, entry["sent"], filesize, "done"))
         except Exception as e:
@@ -4587,35 +4614,49 @@ class IRCClient:
                 pass
 
     async def _dcc_recv_file(self, tid: str, nick: str, filename: str,
-                              ip_int: int, port: int, filesize: int) -> None:
-        """Connect to the sender and download the file."""
+                              ip_int: int, port: int, filesize: int,
+                              turbo: bool = False,
+                              resume_at: int = 0,
+                              use_tor: bool = False) -> None:
+        """Connect to the sender and download the file.
+
+        *turbo* omits ACKs.  *resume_at* starts writing at that offset (partial
+        file must exist).  *use_tor* routes the connection through SOCKS5.
+        """
         ip = socket.inet_ntoa(int.to_bytes(ip_int, 4, 'big'))
         safe_name = "".join(c for c in filename if c.isalnum() or c in "._- ")
         filepath = os.path.join(DCC_DIR, safe_name) if safe_name else os.path.join(DCC_DIR, "dcc_file")
         os.makedirs(DCC_DIR, exist_ok=True)
 
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, port), timeout=30)
+            if use_tor:
+                reader, writer = await asyncio.wait_for(
+                    _socks5_connect(ip, port), timeout=30)
+            else:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port), timeout=30)
             self._dcc_in[tid]["reader"] = reader
             self._dcc_in[tid]["writer"] = writer
-        except (OSError, asyncio.TimeoutError) as e:
+        except (OSError, asyncio.TimeoutError, ConnectionError) as e:
             await self.ui_queue.put(("dcc_progress", tid, nick, filename, 0, filesize, f"error: {e}"))
             return
 
         await self.ui_queue.put(("dcc_progress", tid, nick, filename, 0, filesize, "connecting"))
         try:
-            with open(filepath, "wb") as f:
+            mode = "ab" if resume_at > 0 else "wb"
+            with open(filepath, mode) as f:
+                if resume_at > 0:
+                    self._dcc_in[tid]["sent"] = resume_at
                 while self._dcc_in.get(tid, {}).get("sent", 0) < filesize:
                     chunk = await asyncio.wait_for(reader.read(1024), timeout=60)
                     if not chunk:
                         break
                     f.write(chunk)
                     self._dcc_in[tid]["sent"] += len(chunk)
-                    # Send ACK: total bytes received as 4-byte network-order unsigned long
-                    ack = struct.pack("!I", self._dcc_in[tid]["sent"])
-                    writer.write(ack)
-                    await writer.drain()
+                    if not turbo:
+                        ack = struct.pack("!I", self._dcc_in[tid]["sent"])
+                        writer.write(ack)
+                        await writer.drain()
                     await self.ui_queue.put(
                         ("dcc_progress", tid, nick, filename,
                          self._dcc_in[tid]["sent"], filesize, "transferring"))
@@ -4634,21 +4675,70 @@ class IRCClient:
             except Exception:
                 pass
 
-    def cmd_dcc_send(self, nick: str, filepath: str) -> str:
+    def cmd_dcc_send(self, nick: str, filepath: str, turbo: bool = False) -> str:
         """Initiate an outgoing DCC SEND. Returns a transfer id."""
         self._dcc_seq += 1
         tid = f"dcc{self._dcc_seq}"
         self._dcc_out[tid] = {"nick": nick, "filepath": filepath, "total": 0,
-                              "sent": 0, "server": None, "writer": None}
-        asyncio.create_task(self._dcc_send_file(tid, nick, filepath))
+                              "sent": 0, "server": None, "writer": None,
+                              "turbo": turbo, "resume_at": 0, "port": 0}
+        asyncio.create_task(self._dcc_send_file(tid, nick, filepath, turbo=turbo))
         return tid
 
+    def cmd_dcc_tsend(self, nick: str, filepath: str) -> str:
+        """Initiate an outgoing DCC TSEND (turbo, no ACKs)."""
+        return self.cmd_dcc_send(nick, filepath, turbo=True)
+
     def cmd_dcc_accept(self, tid: str, nick: str, filename: str,
-                        ip_int: int, port: int, filesize: int) -> None:
+                        ip_int: int, port: int, filesize: int,
+                        turbo: bool = False) -> None:
         """Accept an incoming DCC SEND from a trusted user."""
+        use_tor = getattr(self, "use_tor", False)
         self._dcc_in[tid] = {"nick": nick, "filename": filename, "total": filesize,
-                             "sent": 0, "reader": None, "writer": None}
-        asyncio.create_task(self._dcc_recv_file(tid, nick, filename, ip_int, port, filesize))
+                             "sent": 0, "reader": None, "writer": None, "turbo": turbo}
+        asyncio.create_task(self._dcc_recv_file(
+            tid, nick, filename, ip_int, port, filesize,
+            turbo=turbo, use_tor=use_tor))
+
+    def cmd_dcc_resume(self, tid: str) -> None:
+        """Resume a failed incoming DCC transfer."""
+        entry = self._dcc_in.get(tid)
+        if not entry:
+            return
+        ip_int = entry.get("ip_int", 0)
+        port = entry.get("port", 0)
+        filesize = entry.get("total", 0)
+        sent = entry.get("sent", 0)
+        if sent <= 0 or sent >= filesize:
+            return
+        nick = entry["nick"]
+        filename = entry["filename"]
+        # Ask sender to resume
+        self.send_raw(
+            f"PRIVMSG {nick} :\x01DCC RESUME {filename} {port} {sent}\x01")
+
+    def _dcc_handle_resume_req(self, tid: str, port: int, position: int) -> None:
+        """Handle incoming DCC RESUME request (receiver wants to resume)."""
+        for _tid, entry in self._dcc_out.items():
+            if entry.get("port") == port and position < entry.get("total", 0):
+                entry["resume_at"] = position
+                filename = os.path.basename(entry["filepath"])
+                self.send_raw(
+                    f"PRIVMSG {entry['nick']} :\x01DCC ACCEPT {filename} {port} {position}\x01")
+                break
+
+    def _dcc_handle_resume_ack(self, tid: str, filename: str, port: int, position: int) -> None:
+        """Handle incoming DCC ACCEPT (sender approved resume)."""
+        entry = self._dcc_in.get(tid)
+        if not entry:
+            return
+        # Restart the download from the resume position
+        asyncio.create_task(self._dcc_recv_file(
+            tid, entry["nick"], filename,
+            entry.get("ip_int", 0), port, entry.get("total", 0),
+            turbo=entry.get("turbo", False),
+            resume_at=position,
+            use_tor=getattr(self, "use_tor", False)))
 
     def cmd_notice(self, target: str, text: str) -> None:
         self.send_raw(f"NOTICE {target} :{text}")
@@ -5043,6 +5133,171 @@ class PluginManager:
                 pass
 
 
+# =========================
+# Script Engine (Python / Lua)
+# =========================
+SCRIPT_DIR_SCRIPTS = os.path.join(_SCRIPT_DIR, "scripts")
+
+class ScriptAPI:
+    """Minimal API passed to each loaded script."""
+
+    def __init__(self, name: str, tui: "TUI") -> None:
+        self.name = name
+        self._tui = tui
+
+    async def status(self, text: str) -> None:
+        await self._tui.ui_queue.put(("status", f"[script:{self.name}] {text}"))
+
+    def send(self, target: str, text: str) -> None:
+        self._tui._active_client().cmd_msg(target, text)
+
+    def send_raw(self, line: str) -> None:
+        self._tui._active_client().send_raw(line)
+
+    def add_to_window(self, name: str, text: str) -> None:
+        win = self._tui.window_by_name.get(name)
+        if win is None:
+            win = self._tui.ensure_window(name, is_channel=name.startswith("#"))
+        win.add_line(text, timestamp=True)
+        self._tui._chat_dirty = True
+        self._tui.dirty = True
+
+    @property
+    def current_nick(self) -> str:
+        return self._tui._active_client().nick
+
+    @property
+    def current_channel(self) -> Optional[str]:
+        return self._tui.current_channel
+
+
+class ScriptEngine:
+    """Lightweight scripting engine that loads .py and .lua files from scripts/.
+
+    Python scripts define module-level hook functions:
+        on_message(api, nick, target, msg, is_action, is_replay)
+        on_join(api, nick, channel)
+        on_part(api, nick, channel)
+        on_quit(api, nick, reason)
+        on_nick_change(api, old_nick, new_nick)
+        on_command(api, cmd, args)  — for custom /commands
+
+    Lua scripts (via lupa if installed) define the same hooks as global functions.
+    """
+
+    def __init__(self, tui: "TUI") -> None:
+        self._tui = tui
+        self._scripts: Dict[str, Tuple[ScriptAPI, Any, str]] = {}  # name → (api, module, lang)
+        self._hooks: Dict[str, List[Tuple[ScriptAPI, Callable]]] = {}
+        self._commands: Dict[str, Tuple[ScriptAPI, Callable]] = {}
+        self._lua_available: bool = False
+        try:
+            import lupa  # type: ignore
+            self._lua_available = True
+            self._lua_runtime = lupa.LuaRuntime(unpack_returned_tuples=True)
+        except ImportError:
+            self._lua_runtime = None
+
+    def _load_py(self, path: str) -> Tuple[bool, str]:
+        name = os.path.splitext(os.path.basename(path))[0]
+        try:
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                return False, f"Cannot load '{path}'"
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception as exc:
+            return False, f"Python error: {exc}"
+        api = ScriptAPI(name, self._tui)
+        self._scripts[name] = (api, module, "py")
+        self._register_hooks(name, module)
+        return True, f"Loaded Python script '{name}'"
+
+    def _load_lua(self, path: str) -> Tuple[bool, str]:
+        if not self._lua_available:
+            return False, "lupa not installed — install with: pip install lupa"
+        name = os.path.splitext(os.path.basename(path))[0]
+        try:
+            with open(path, encoding="utf-8") as f:
+                source = f.read()
+            lua_globals = self._lua_runtime.execute(source)
+        except Exception as exc:
+            return False, f"Lua error: {exc}"
+        api = ScriptAPI(name, self._tui)
+        self._scripts[name] = (api, lua_globals, "lua")
+        self._register_lua_hooks(name, lua_globals, api)
+        return True, f"Loaded Lua script '{name}'"
+
+    def _register_hooks(self, name: str, module: Any) -> None:
+        api = self._scripts[name][0]
+        for hook_name in ("on_message", "on_join", "on_part", "on_quit",
+                          "on_nick_change", "on_command"):
+            fn = getattr(module, hook_name, None)
+            if fn is not None:
+                self._hooks.setdefault(hook_name, []).append((api, fn))
+                # Register /command for on_command hooks
+                if hook_name == "on_command":
+                    cmd_name = getattr(fn, "_cmd_name", name.lower())
+                    self._commands[cmd_name] = (api, fn)
+
+    def _register_lua_hooks(self, name: str, lua_globals: Any, api: ScriptAPI) -> None:
+        for hook_name in ("on_message", "on_join", "on_part", "on_quit",
+                          "on_nick_change", "on_command"):
+            fn = getattr(lua_globals, hook_name, None)
+            if fn is not None:
+                self._hooks.setdefault(hook_name, []).append((api, fn))
+                if hook_name == "on_command":
+                    self._commands[name.lower()] = (api, fn)
+
+    def load(self, path: str) -> Tuple[bool, str]:
+        name = os.path.splitext(os.path.basename(path))[0]
+        if name in self._scripts:
+            return False, f"Script '{name}' already loaded"
+        if path.endswith(".py"):
+            return self._load_py(path)
+        elif path.endswith(".lua"):
+            return self._load_lua(path)
+        else:
+            return False, f"Unsupported script type: {path}"
+
+    def unload(self, name: str) -> Tuple[bool, str]:
+        if name not in self._scripts:
+            return False, f"No script named '{name}' loaded"
+        del self._scripts[name]
+        for hook_list in self._hooks.values():
+            hook_list[:] = [(a, h) for a, h in hook_list if a.name != name]
+        self._commands = {c: v for c, v in self._commands.items() if v[0].name != name}
+        return True, f"Unloaded script '{name}'"
+
+    def list_scripts(self) -> List[Tuple[str, str]]:
+        return [(n, lang) for n, (_, _, lang) in self._scripts.items()]
+
+    def get_command(self, cmd: str) -> Optional[Tuple[ScriptAPI, Callable]]:
+        return self._commands.get(cmd)
+
+    async def dispatch(self, event: str, **kwargs) -> None:
+        handlers = self._hooks.get(event)
+        if not handlers:
+            return
+        for api, handler in handlers:
+            try:
+                result = handler(api, **kwargs)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
+
+    def load_all(self) -> List[str]:
+        """Load all .py and .lua files from SCRIPT_DIR_SCRIPTS."""
+        os.makedirs(SCRIPT_DIR_SCRIPTS, exist_ok=True)
+        msgs = []
+        for fn in sorted(os.listdir(SCRIPT_DIR_SCRIPTS)):
+            if fn.endswith((".py", ".lua")):
+                ok, msg = self.load(os.path.join(SCRIPT_DIR_SCRIPTS, fn))
+                msgs.append(msg)
+        return msgs
+
+
 class ServerContext:
     """Holds all state that is scoped to a single IRC server connection."""
     __slots__ = ("server_id", "client", "channel_users", "user_scores",
@@ -5244,6 +5499,8 @@ class TUI:
         self._build_slash_handlers()
 
         self.plugin_manager = PluginManager()
+        self.script_engine = ScriptEngine(self)
+        self.script_engine.load_all()
 
         stdscr.nodelay(True)
         stdscr.keypad(True)
@@ -6483,6 +6740,8 @@ class TUI:
         h["banlist"]       = self._ev_banlist
         h["dcc_progress"]  = self._ev_dcc_progress
         h["dcc_offer"]     = self._ev_dcc_offer
+        h["dcc_resume_req"] = self._ev_dcc_resume_req
+        h["dcc_resume_ack"] = self._ev_dcc_resume_ack
         for k in ("whois", "status"):
             h[k] = self._ev_status_line
 
@@ -6626,6 +6885,8 @@ class TUI:
         self.dirty = True
         await self.plugin_manager.dispatch("on_message", nick=nick, target=target,
                                            msg=msg, is_action=is_action, is_replay=is_replay)
+        await self.script_engine.dispatch("on_message", nick=nick, target=target,
+                                          msg=msg, is_action=is_action, is_replay=is_replay)
 
     async def _ev_typing(self, event):
         _, nick, target, state = event
@@ -6809,6 +7070,7 @@ class TUI:
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
         await self.plugin_manager.dispatch("on_join", nick=nick, channel=channel)
+        await self.script_engine.dispatch("on_join", nick=nick, channel=channel)
 
     async def _ev_self_join(self, event):
         _, channel = event
@@ -6990,19 +7252,42 @@ class TUI:
         self.dirty = True
 
     async def _ev_dcc_offer(self, event):
-        _, nick, filename, ip_int, port, filesize = event
+        # event: (_, nick, filename, ip_int, port, filesize, is_turbo)
+        _, nick, filename, ip_int, port, filesize = event[:6]
+        is_turbo = event[6] if len(event) > 6 else False
         fsize_str = f"{filesize // 1024} KB" if filesize > 1024 else f"{filesize} B"
         if nick.lower() in self._dcc_trusted:
             client = self._active_client()
             client._dcc_seq += 1
             tid = f"dcc{client._dcc_seq}"
-            client.cmd_dcc_accept(tid, nick, filename, ip_int, port, filesize)
+            client._dcc_in[tid] = {"nick": nick, "filename": filename, "total": filesize,
+                                   "sent": 0, "reader": None, "writer": None,
+                                   "turbo": is_turbo, "ip_int": ip_int, "port": port}
+            client.cmd_dcc_accept(tid, nick, filename, ip_int, port, filesize, turbo=is_turbo)
             await self.ui_queue.put(("status",
-                f"DCC: auto-accepting {filename} ({fsize_str}) from trusted user {nick}"))
+                f"DCC: {'turbo-' if is_turbo else ''}auto-accepting {filename} ({fsize_str}) from {nick}"))
         else:
             await self.ui_queue.put(("status",
-                f"DCC: incoming {filename} ({fsize_str}) from {nick} — "
+                f"DCC: incoming {'turbo-' if is_turbo else ''}{filename} ({fsize_str}) from {nick} — "
                 f"use /dcc trust {nick} to auto-accept"))
+
+    async def _ev_dcc_resume_req(self, event):
+        _, nick, filename, port, position = event
+        client = self._active_client()
+        client._dcc_handle_resume_req(None, port, position)
+        await self.ui_queue.put(("status",
+            f"DCC: resume request from {nick} for {filename} at byte {position}"))
+
+    async def _ev_dcc_resume_ack(self, event):
+        _, nick, filename, port, position = event
+        client = self._active_client()
+        # Find the matching incoming transfer
+        for tid, entry in list(client._dcc_in.items()):
+            if entry.get("nick") == nick and entry.get("filename") == filename:
+                client._dcc_handle_resume_ack(tid, filename, port, position)
+                await self.ui_queue.put(("status",
+                    f"DCC: resuming {filename} from byte {position}"))
+                break
 
     async def _ev_status_line(self, event):
         msg = str(event[1]) if len(event) > 1 else str(event)
@@ -7071,6 +7356,7 @@ class TUI:
         h["unloadplugin"] = self._slash_unloadplugin
         h["reloadplugin"] = self._slash_reloadplugin
         h["plugins"]      = self._slash_plugins
+        h["script"]       = self._slash_script
         h["redraw"]       = self._slash_redraw
         h["links"]        = self._slash_links
         h["list"]         = self._slash_list
@@ -7143,7 +7429,19 @@ class TUI:
                         await self.ui_queue.put(
                             ("status", f"[plugin:{plug_api.name}] error: {plug_exc}"))
                 else:
-                    self._active_client().send_raw(line[1:])
+                    script_entry = self.script_engine.get_command(cmd)
+                    if script_entry:
+                        scr_api, scr_handler = script_entry
+                        scr_args = line[1 + len(cmd):].lstrip()
+                        try:
+                            result = scr_handler(scr_api, scr_args)
+                            if asyncio.iscoroutine(result):
+                                await result
+                        except Exception as scr_exc:
+                            await self.ui_queue.put(
+                                ("status", f"[script:{scr_api.name}] error: {scr_exc}"))
+                    else:
+                        self._active_client().send_raw(line[1:])
         else:
             stripped_line = line.strip()
             ext = os.path.splitext(stripped_line)[1].lower()
@@ -9125,11 +9423,12 @@ class TUI:
         _E("/pgp list",                       "List GPG public keys in your keyring")
         _E("/tor on|off|status",              "Route IRC connections through Tor SOCKS5 proxy")
         _C("")
-        _H("Plugins")
+        _H("Plugins & Scripts")
         _E("/loadplugin <path>",   "Load a Python plugin file; its setup(api) is called")
         _E("/unloadplugin <name>", "Unload a plugin and remove its commands")
         _E("/reloadplugin <name>", "Reload a plugin from its original file (hot-swap)")
         _E("/plugins",             "List loaded plugins and their registered commands")
+        _E("/script load|unload|reload|list", "Manage Python/Lua scripts in scripts/ dir")
         _C("")
         _H("General")
         _E("/redraw [channel]",   "Force full screen repaint and reload userlist from server")
@@ -9138,7 +9437,7 @@ class TUI:
         _E("/commands",       "This full command list")
         _E("/mute",           "Toggle mention beep on/off (highlight stays active)")
         _E("/linkpreview",    "Toggle automatic URL link preview on/off")
-        _E("/dcc <sub>",      "DCC: send|trust|untrust|trusted|status — file transfers")
+        _E("/dcc <sub>",      "DCC: send|tsend|resume|trust|untrust|trusted|status — file transfers")
         _C("")
         self.current_window_index = 0
         self._chat_dirty = True
@@ -9185,7 +9484,7 @@ class TUI:
             "  /win <n>  /close (/wc)  /clear  /links  /list [pat]  /lf <kw|min=n>",
             "  /alias [name] [expansion]  list/set/remove command aliases",
             "  /chain [nick]  message tree for current window  /jitsi  video call",
-            "  /theme <1-5>  /userlist  Ctrl+N next window  /dcc send|trust|status",
+            "  /theme <1-5>  /userlist  Ctrl+N next window  /dcc send|tsend|resume|trust|status",
             "  Tab/Shift+Tab nick-complete  PgUp/Dn scroll",
             "  Left-click a highlighted URL line to open it in the browser",
             "  Left-click a nick in userlist or chat to open a DM /query",
@@ -9196,6 +9495,9 @@ class TUI:
             "── Plugins ────────────────────────────────────────────────",
             "  /loadplugin <path>  load .py plugin    /plugins  list loaded",
             "  /unloadplugin <name>    /reloadplugin <name>  hot-swap",
+            "── Scripts ──────────────────────────────────────────────────",
+            "  /script load <path>  load .py/.lua    /script list  loaded",
+            "  /script unload <name>    /script reload  all hot-reload",
         ]:
             self.window_by_name["*status*"].add_line(l)
         self.current_window_index = 0
@@ -9243,20 +9545,36 @@ class TUI:
         """Manage DCC file transfers."""
         parts = (args + " " + extra).strip().split()
         if not parts:
-            await self.ui_queue.put(("status", "Usage: /dcc <send|trust|untrust|trusted|status> ..."))
+            await self.ui_queue.put(("status", "Usage: /dcc <send|tsend|resume|trust|untrust|trusted|status> ..."))
             return
         sub = parts[0].lower()
-        if sub == "send":
+        if sub in ("send", "tsend"):
+            turbo = sub == "tsend"
             if len(parts) < 3:
-                await self.ui_queue.put(("status", "Usage: /dcc send <nick> <filepath>"))
+                await self.ui_queue.put(("status", f"Usage: /dcc {sub} <nick> <filepath>"))
                 return
             nick = parts[1]
             filepath = " ".join(parts[2:])
             if not os.path.isfile(filepath):
                 await self.ui_queue.put(("status", f"File not found: {filepath}"))
                 return
-            tid = self._active_client().cmd_dcc_send(nick, filepath)
-            await self.ui_queue.put(("status", f"DCC {tid}: sending {filepath} to {nick}"))
+            client = self._active_client()
+            if turbo:
+                tid = client.cmd_dcc_tsend(nick, filepath)
+            else:
+                tid = client.cmd_dcc_send(nick, filepath)
+            await self.ui_queue.put(("status", f"DCC {tid}: {'turbo-' if turbo else ''}sending {filepath} to {nick}"))
+        elif sub == "resume":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /dcc resume <tid>"))
+                return
+            tid = parts[1]
+            client = self._active_client()
+            if tid not in client._dcc_in:
+                await self.ui_queue.put(("status", f"No incoming DCC transfer '{tid}'"))
+                return
+            client.cmd_dcc_resume(tid)
+            await self.ui_queue.put(("status", f"DCC: resume requested for {tid}"))
         elif sub == "trust":
             if len(parts) < 2:
                 await self.ui_queue.put(("status", "Usage: /dcc trust <nick>"))
@@ -9666,6 +9984,41 @@ class TUI:
         for name, cmds in plugins:
             cmds_str = "  ".join(f"/{c}" for c in cmds) if cmds else "(no commands)"
             await self.ui_queue.put(("status", f"[plugin] {name}  {cmds_str}"))
+
+    async def _slash_script(self, args, extra, line):
+        parts = (args + " " + extra).strip().split()
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /script load|unload|reload|list"))
+            return
+        sub = parts[0].lower()
+        if sub == "load":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /script load <path>"))
+                return
+            ok, msg = self.script_engine.load(parts[1])
+            await self.ui_queue.put(("status", f"[script] {msg}"))
+        elif sub == "unload":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /script unload <name>"))
+                return
+            ok, msg = self.script_engine.unload(parts[1])
+            await self.ui_queue.put(("status", f"[script] {msg}"))
+        elif sub == "reload":
+            self.script_engine = ScriptEngine(self)
+            msgs = self.script_engine.load_all()
+            for m in msgs:
+                await self.ui_queue.put(("status", f"[script] {m}"))
+        elif sub == "list":
+            scripts = self.script_engine.list_scripts()
+            if not scripts:
+                await self.ui_queue.put(("status", "[script] No scripts loaded"))
+            else:
+                for name, lang in scripts:
+                    await self.ui_queue.put(("status", f"[script] {name} ({lang})"))
+        elif sub == "dir":
+            await self.ui_queue.put(("status", f"[script] Scripts directory: {SCRIPT_DIR_SCRIPTS}"))
+        else:
+            await self.ui_queue.put(("status", "Usage: /script load|unload|reload|list|dir"))
 
     async def _slash_x0(self, args, extra, line):
         path = args.strip()
