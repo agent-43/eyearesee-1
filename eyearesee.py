@@ -19,6 +19,7 @@ import io
 import json
 import re
 import ssl
+import struct
 import time
 import os
 import random
@@ -142,6 +143,7 @@ IRC_CONFIG_PATH    = os.path.join(_SCRIPT_DIR, "irc_config.json")
 INPUT_HISTORY_MAX  = 500
 CHAT_LOG_DIR       = os.path.join(_SCRIPT_DIR, "chat_logs")
 LINK_LOG_DIR       = os.path.join(_SCRIPT_DIR, "link_logs")
+DCC_DIR            = os.path.join(_SCRIPT_DIR, "dcc_downloads")
 CHAT_LOG_LOAD      = 500
 # User-contributed tell-phrases learned via /learn_tell
 USER_TELL_PATH     = os.path.join(_SCRIPT_DIR, "user_tell_phrases.json")
@@ -2771,6 +2773,8 @@ class IRCClient:
         self._isupport: dict = {}
         # Accumulates RPL_LIST (322) results between /list and RPL_LISTEND (323).
         self._list_results: list = []
+        # Accumulates RPL_BANLIST (367) results between /ban -l and RPL_ENDOFBANLIST (368).
+        self._banlist_results: list = []
         self._irc_handlers: dict = {}
         self._build_irc_handlers()
         # Strong references to fire-and-forget scoring tasks so they are not
@@ -3701,6 +3705,19 @@ class IRCClient:
                 self.send_raw(f"NOTICE {nick} :\x01SOURCE https://github.com (custom eyearesee)\x01")
             elif ctcp_cmd == "FINGER":
                 self.send_raw(f"NOTICE {nick} :\x01FINGER No finger info\x01")
+            elif ctcp_cmd == "DCC":
+                # DCC SEND/CHAT handling
+                dcc_parts = ctcp_args.split()
+                if len(dcc_parts) >= 4 and dcc_parts[0] == "SEND":
+                    filename = dcc_parts[1]
+                    try:
+                        ip_int = int(dcc_parts[2])
+                        port   = int(dcc_parts[3])
+                    except ValueError:
+                        return
+                    filesize = int(dcc_parts[4]) if len(dcc_parts) > 4 else 0
+                    # Dispatch to TUI which checks trusted list
+                    await self.ui_queue.put(("dcc_offer", nick, filename, ip_int, port, filesize))
             return  # CTCP — never treat as normal message
 
         if nick not in self.users:
@@ -4024,6 +4041,19 @@ class IRCClient:
         self._list_results = []
         await self.ui_queue.put(("list_results", results))
 
+    async def _irc_banlist(self, nick, params, prefix):  # 367 RPL_BANLIST
+        if len(params) >= 3:
+            channel = params[1]
+            mask = params[2]
+            setter = params[3] if len(params) > 3 else ""
+            ts_raw = params[4] if len(params) > 4 else ""
+            self._banlist_results.append((channel, mask, setter, ts_raw))
+
+    async def _irc_banlist_end(self, nick, params, prefix):  # 368 RPL_ENDOFBANLIST
+        results = self._banlist_results
+        self._banlist_results = []
+        await self.ui_queue.put(("banlist", results))
+
     async def _irc_isupport(self, nick, params, prefix):  # 005 RPL_ISUPPORT
         """Parse ISUPPORT tokens and extract useful server capabilities."""
         # params = [yournick, TOKEN, TOKEN=value, ..., "are supported by this server"]
@@ -4093,6 +4123,8 @@ class IRCClient:
         h["401"]          = self._irc_no_such_nick
         h["322"]          = self._irc_list
         h["323"]          = self._irc_listend
+        h["367"]          = self._irc_banlist
+        h["368"]          = self._irc_banlist_end
         h["324"]          = self._irc_chanmode
         h["005"]          = self._irc_isupport
         h["AWAY"]         = self._irc_away_notify
@@ -4201,6 +4233,158 @@ class IRCClient:
     def cmd_ctcp(self, target: str, ctcp_cmd: str, args: str = "") -> None:
         payload = f"{ctcp_cmd} {args}".strip()
         self.send_raw(f"PRIVMSG {target} :\x01{payload}\x01")
+
+    # ── DCC file transfers ──────────────────────────────────────────────────
+    # Active outgoing transfers: id → {nick, filename, filepath, total, sent, task, server, writer}
+    # Active incoming transfers: id → {nick, filename, filepath, total, sent, reader, writer}
+    _dcc_out: dict = {}
+    _dcc_in:  dict = {}
+    _dcc_seq: int = 0
+
+    async def _dcc_send_file(self, tid: str, nick: str, filepath: str) -> None:
+        """Background task: listen, offer via CTCP, stream file, report progress."""
+        try:
+            filesize = os.path.getsize(filepath)
+            filename = os.path.basename(filepath)
+        except OSError as e:
+            await self.ui_queue.put(("dcc_progress", tid, nick, filepath, 0, 0, f"error: {e}"))
+            return
+
+        # Get our local IP from the IRC socket
+        sock = self.writer.get_extra_info("sockname") if self.writer else None
+        local_ip = sock[0] if sock else "0.0.0.0"
+        try:
+            ip_int = int.from_bytes(socket.inet_aton(local_ip), 'big')
+        except OSError:
+            ip_int = int.from_bytes(socket.inet_aton("0.0.0.0"), 'big')
+
+        # Start TCP listener on a random port
+        try:
+            server = await asyncio.start_server(
+                lambda r, w: self._dcc_handle_client(tid, r, w, filepath, filesize),
+                host="0.0.0.0", port=0)
+            port = server.sockets[0].getsockname()[1]
+        except OSError as e:
+            await self.ui_queue.put(("dcc_progress", tid, nick, filename, 0, filesize, f"error: {e}"))
+            return
+
+        self._dcc_out[tid]["server"] = server
+        await self.ui_queue.put(("dcc_progress", tid, nick, filename, 0, filesize, "listening"))
+
+        # Send DCC SEND offer
+        self.send_raw(
+            f"PRIVMSG {nick} :\x01DCC SEND {filename} {ip_int} {port} {filesize}\x01")
+
+        # Wait for connection with a timeout, then clean up server
+        await asyncio.sleep(60)
+        server.close()
+        await server.wait_closed()
+        entry = self._dcc_out.get(tid)
+        if entry and entry["sent"] < entry["total"]:
+            await self.ui_queue.put(("dcc_progress", tid, nick, filename,
+                                     entry["sent"], filesize, "timeout"))
+
+    async def _dcc_handle_client(self, tid: str, reader: asyncio.StreamReader,
+                                  writer: asyncio.StreamWriter,
+                                  filepath: str, filesize: int) -> None:
+        """Handle an incoming DCC connection: send file in 1024-byte blocks."""
+        entry = self._dcc_out.get(tid)
+        if not entry:
+            writer.close()
+            return
+        entry["writer"] = writer
+        nick = entry["nick"]
+        filename = os.path.basename(filepath)
+        try:
+            with open(filepath, "rb") as f:
+                while entry["sent"] < filesize:
+                    chunk = f.read(1024)
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+                    await writer.drain()
+                    entry["sent"] += len(chunk)
+                    await self.ui_queue.put(
+                        ("dcc_progress", tid, nick, filename, entry["sent"], filesize, "transferring"))
+                    # Wait for ACK (4 bytes, network-order unsigned long)
+                    try:
+                        await asyncio.wait_for(reader.readexactly(4), timeout=30)
+                    except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError):
+                        break
+            await self.ui_queue.put(
+                ("dcc_progress", tid, nick, filename, entry["sent"], filesize, "done"))
+        except Exception as e:
+            await self.ui_queue.put(
+                ("dcc_progress", tid, nick, filename, entry["sent"], filesize, f"error: {e}"))
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def _dcc_recv_file(self, tid: str, nick: str, filename: str,
+                              ip_int: int, port: int, filesize: int) -> None:
+        """Connect to the sender and download the file."""
+        ip = socket.inet_ntoa(int.to_bytes(ip_int, 4, 'big'))
+        safe_name = "".join(c for c in filename if c.isalnum() or c in "._- ")
+        filepath = os.path.join(DCC_DIR, safe_name) if safe_name else os.path.join(DCC_DIR, "dcc_file")
+        os.makedirs(DCC_DIR, exist_ok=True)
+
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port), timeout=30)
+            self._dcc_in[tid]["reader"] = reader
+            self._dcc_in[tid]["writer"] = writer
+        except (OSError, asyncio.TimeoutError) as e:
+            await self.ui_queue.put(("dcc_progress", tid, nick, filename, 0, filesize, f"error: {e}"))
+            return
+
+        await self.ui_queue.put(("dcc_progress", tid, nick, filename, 0, filesize, "connecting"))
+        try:
+            with open(filepath, "wb") as f:
+                while self._dcc_in.get(tid, {}).get("sent", 0) < filesize:
+                    chunk = await asyncio.wait_for(reader.read(1024), timeout=60)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    self._dcc_in[tid]["sent"] += len(chunk)
+                    # Send ACK: total bytes received as 4-byte network-order unsigned long
+                    ack = struct.pack("!I", self._dcc_in[tid]["sent"])
+                    writer.write(ack)
+                    await writer.drain()
+                    await self.ui_queue.put(
+                        ("dcc_progress", tid, nick, filename,
+                         self._dcc_in[tid]["sent"], filesize, "transferring"))
+
+            status = "done" if self._dcc_in.get(tid, {}).get("sent", 0) >= filesize else "partial"
+            await self.ui_queue.put(
+                ("dcc_progress", tid, nick, filename,
+                 self._dcc_in[tid].get("sent", 0), filesize, status))
+        except Exception as e:
+            await self.ui_queue.put(
+                ("dcc_progress", tid, nick, filename,
+                 self._dcc_in[tid].get("sent", 0), filesize, f"error: {e}"))
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    def cmd_dcc_send(self, nick: str, filepath: str) -> str:
+        """Initiate an outgoing DCC SEND. Returns a transfer id."""
+        self._dcc_seq += 1
+        tid = f"dcc{self._dcc_seq}"
+        self._dcc_out[tid] = {"nick": nick, "filepath": filepath, "total": 0,
+                              "sent": 0, "server": None, "writer": None}
+        asyncio.create_task(self._dcc_send_file(tid, nick, filepath))
+        return tid
+
+    def cmd_dcc_accept(self, tid: str, nick: str, filename: str,
+                        ip_int: int, port: int, filesize: int) -> None:
+        """Accept an incoming DCC SEND from a trusted user."""
+        self._dcc_in[tid] = {"nick": nick, "filename": filename, "total": filesize,
+                             "sent": 0, "reader": None, "writer": None}
+        asyncio.create_task(self._dcc_recv_file(tid, nick, filename, ip_int, port, filesize))
 
     def cmd_notice(self, target: str, text: str) -> None:
         self.send_raw(f"NOTICE {target} :{text}")
@@ -4705,6 +4889,13 @@ class TUI:
         self._seen_times: Dict[str, Tuple[float, str, str]] = {}
         # /tell queue: nick_lower → [(from_nick, msg, timestamp), ...]
         self._tell_queue: Dict[str, List[Tuple[str, str, float]]] = {}
+
+        # Ban list viewer: cached from last /ban -l
+        self._cached_banlist: list = []
+        # Channel list cache for local filtering
+        self._cached_list_results: list = []
+        # DCC transfers
+        self._dcc_trusted: set = set(load_irc_config().get("dcc_trusted", []))
 
         # Performance caches — maintained incrementally to avoid per-frame rebuilds
         # NOTE: _suspect_nicks and _sorted_users are now aliased from the active
@@ -5996,8 +6187,11 @@ class TUI:
         h["markread"]    = self._ev_markread
         h["mode"]        = self._ev_mode
         h["kick"]        = self._ev_kick
-        h["list_results"] = self._ev_list_results
-        h["chanmode"]     = self._ev_chanmode
+        h["list_results"]  = self._ev_list_results
+        h["chanmode"]      = self._ev_chanmode
+        h["banlist"]       = self._ev_banlist
+        h["dcc_progress"]  = self._ev_dcc_progress
+        h["dcc_offer"]     = self._ev_dcc_offer
         for k in ("whois", "status"):
             h[k] = self._ev_status_line
 
@@ -6451,18 +6645,73 @@ class TUI:
 
     async def _ev_list_results(self, event):
         _, results = event
+        self._cached_list_results = list(results)
         ch_count = len(results)
         sw = self._status_win()
         sw.add_line(f"── Channel list ({ch_count} channels) ──")
-        if ch_count <= 200:
+        limit = 500
+        if ch_count <= limit:
             for ch, users, topic in results:
                 short_topic = topic[:60] + "…" if len(topic) > 60 else topic
                 sw.add_line(f"  {ch:<20} {users:>4}  {short_topic}")
         else:
-            sw.add_line(f"  ({ch_count} channels — too many to display, try /list <pattern>)")
+            for ch, users, topic in results[:limit]:
+                short_topic = topic[:60] + "…" if len(topic) > 60 else topic
+                sw.add_line(f"  {ch:<20} {users:>4}  {short_topic}")
+            sw.add_line(f"  ... ({ch_count - limit} more — use /lf <keyword> or /lf min=<n> to filter)")
         sw.add_line(f"── End of channel list ──")
         self._chat_dirty = True
         self.dirty = True
+
+    async def _ev_banlist(self, event):
+        _, results = event
+        self._cached_banlist = list(results)
+        sw = self._status_win()
+        if not results:
+            sw.add_line("── Ban list: empty ──")
+        else:
+            sw.add_line(f"── Ban list ({len(results)} entries) ──")
+            for ch, mask, setter, ts_raw in results:
+                ts_str = time.strftime("%Y-%m-%d", time.localtime(float(ts_raw))) if ts_raw else ""
+                by = f" by {setter}" if setter else ""
+                sw.add_line(f"  {mask:<30} {by}{ts_str}")
+            sw.add_line("── End of ban list ──")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _ev_dcc_progress(self, event):
+        _, tid, nick, fname, sent, total, status = event
+        sw = self._status_win()
+        if status in ("done", "partial"):
+            sw.add_line(f"DCC {tid}: {fname} to {nick} complete ({sent}/{total} bytes)")
+        elif status == "timeout":
+            sw.add_line(f"DCC {tid}: {fname} to {nick} timed out ({sent}/{total})")
+        elif status.startswith("error"):
+            sw.add_line(f"DCC {tid}: {fname} {status}")
+        elif status == "transferring":
+            pct = 100 * sent // total if total else 0
+            sw.add_line(f"DCC {tid}: {fname} → {nick}  {pct}% ({sent}/{total})")
+        elif status == "listening":
+            sw.add_line(f"DCC {tid}: offering {fname} to {nick}...")
+        elif status == "connecting":
+            sw.add_line(f"DCC {tid}: receiving {fname} from {nick}...")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _ev_dcc_offer(self, event):
+        _, nick, filename, ip_int, port, filesize = event
+        fsize_str = f"{filesize // 1024} KB" if filesize > 1024 else f"{filesize} B"
+        if nick.lower() in self._dcc_trusted:
+            client = self._active_client()
+            client._dcc_seq += 1
+            tid = f"dcc{client._dcc_seq}"
+            client.cmd_dcc_accept(tid, nick, filename, ip_int, port, filesize)
+            await self.ui_queue.put(("status",
+                f"DCC: auto-accepting {filename} ({fsize_str}) from trusted user {nick}"))
+        else:
+            await self.ui_queue.put(("status",
+                f"DCC: incoming {filename} ({fsize_str}) from {nick} — "
+                f"use /dcc trust {nick} to auto-accept"))
 
     async def _ev_status_line(self, event):
         msg = str(event[1]) if len(event) > 1 else str(event)
@@ -6534,6 +6783,8 @@ class TUI:
         h["redraw"]       = self._slash_redraw
         h["links"]        = self._slash_links
         h["list"]         = self._slash_list
+        h["lf"]           = self._slash_lf
+        h["dcc"]          = self._slash_dcc
         h["userlist"]     = self._slash_userlist
         h["znc"]          = self._slash_znc
         h["jitsi"]        = self._slash_jitsi
@@ -7104,7 +7355,14 @@ class TUI:
             self._active_client().cmd_mode(self.current_channel, f"-h {args}")
 
     async def _slash_ban(self, args, extra, line):
-        if args and self.current_channel:
+        if not self.current_channel:
+            await self.ui_queue.put(("status", "No channel active"))
+            return
+        if args.strip() == "-l":
+            self._active_client().send_raw(f"MODE {self.current_channel} +b")
+            await self.ui_queue.put(("status", f"Fetching ban list for {self.current_channel}..."))
+            return
+        if args:
             mask = args if "!" in args or "@" in args else f"{args}!*@*"
             self._active_client().cmd_mode(self.current_channel, f"+b {mask}")
 
@@ -8313,6 +8571,7 @@ class TUI:
         _E("/hop <nick>",   "Grant half-op  (+h)")
         _E("/dehop <nick>", "Remove half-op (-h)")
         _E("/ban <nick|mask>","Ban user; bare nick expands to nick!*@*")
+        _E("/ban -l", "List bans in current channel")
         _E("/unban <mask>", "Remove a ban mask")
         _C("")
         _H("Users & Status")
@@ -8376,6 +8635,7 @@ class TUI:
         _E("/alias [name] [expansion]", "List, set or remove command alias (/alias -<name> to remove)")
         _E("/links [n]", "Show last n links shared in this channel (default 20)")
         _E("/list [pattern]","Fetch and display the server's channel list")
+        _E("/lf [keyword|min=<n>]","Locally filter cached /list results by keyword or min users")
         _E("/theme <1-5>","Switch colour theme: Classic Hacker Ocean Sunset Neon")
         _E("/userlist",   "Toggle the user list panel on/off")
         _E("/znc <cmd>",  "Send a command to ZNC's *status (e.g. /znc play *chan 60)")
@@ -8397,6 +8657,7 @@ class TUI:
         _E("/commands",       "This full command list")
         _E("/mute",           "Toggle mention beep on/off (highlight stays active)")
         _E("/linkpreview",    "Toggle automatic URL link preview on/off")
+        _E("/dcc <sub>",      "DCC: send|trust|untrust|trusted|status — file transfers")
         _C("")
         self.current_window_index = 0
         self._chat_dirty = True
@@ -8414,7 +8675,7 @@ class TUI:
             "  /kick <chan> <nick> [reason]  /invite <nick> [chan]",
             "  /names [chan]  /mode [chan] [modes]",
             "── Operator ──────────────────────────────────────────────",
-            "  /op /deop /voice /devoice /hop /dehop  /ban /unban",
+            "  /op /deop /voice /devoice /hop /dehop  /ban [-l] /unban",
             "── Users ─────────────────────────────────────────────────",
             "  /nick <new>  /whois <nick>  /whowas <nick>  /who <pat>",
             "  /idle <nick>     24h activity heatmap",
@@ -8436,10 +8697,10 @@ class TUI:
             "── Connection ─────────────────────────────────────────────",
             "  /server [-ssl] <host> [port]  (parallel; -ssl for TLS)  /reconnect",
             "── Interface ──────────────────────────────────────────────",
-            "  /win <n>  /close (/wc)  /clear  /links  /list [pat]  /znc <cmd>",
+            "  /win <n>  /close (/wc)  /clear  /links  /list [pat]  /lf <kw|min=n>",
             "  /alias [name] [expansion]  list/set/remove command aliases",
             "  /chain [nick]  message tree for current window  /jitsi  video call",
-            "  /theme <1-5>  /userlist  Ctrl+N next window",
+            "  /theme <1-5>  /userlist  Ctrl+N next window  /dcc send|trust|status",
             "  Tab/Shift+Tab nick-complete  PgUp/Dn scroll",
             "  Left-click a highlighted URL line to open it in the browser",
             "  Left-click a nick in userlist or chat to open a DM /query",
@@ -8461,6 +8722,95 @@ class TUI:
         self._resize_windows()
         state = "shown" if self._show_userlist else "hidden"
         await self.ui_queue.put(("status", f"Userlist {state}"))
+
+    async def _slash_lf(self, args, extra, line):
+        """Locally filter the cached channel list by keyword or min users."""
+        if not self._cached_list_results:
+            await self.ui_queue.put(("status", "No cached list results. Run /list first."))
+            return
+        results = self._cached_list_results
+        kw = (args + " " + extra).strip()
+        if kw.startswith("min="):
+            try:
+                min_users = int(kw[4:])
+            except ValueError:
+                await self.ui_queue.put(("status", "Usage: /lf min=<number>"))
+                return
+            filtered = [r for r in results if r[1].isdigit() and int(r[1]) >= min_users]
+            desc = f"with ≥{min_users} users"
+        elif kw:
+            kw_lower = kw.lower()
+            filtered = [r for r in results if kw_lower in r[0].lower() or kw_lower in r[2].lower()]
+            desc = f"matching '{kw}'"
+        else:
+            filtered = list(results)
+            desc = "all"
+        sw = self._status_win()
+        sw.add_line(f"── Filtered list ({len(filtered)} channels {desc}) ──")
+        for ch, users, topic in filtered:
+            short_topic = topic[:60] + "…" if len(topic) > 60 else topic
+            sw.add_line(f"  {ch:<20} {users:>4}  {short_topic}")
+        sw.add_line("── End ──")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_dcc(self, args, extra, line):
+        """Manage DCC file transfers."""
+        parts = (args + " " + extra).strip().split()
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /dcc <send|trust|untrust|trusted|status> ..."))
+            return
+        sub = parts[0].lower()
+        if sub == "send":
+            if len(parts) < 3:
+                await self.ui_queue.put(("status", "Usage: /dcc send <nick> <filepath>"))
+                return
+            nick = parts[1]
+            filepath = " ".join(parts[2:])
+            if not os.path.isfile(filepath):
+                await self.ui_queue.put(("status", f"File not found: {filepath}"))
+                return
+            tid = self._active_client().cmd_dcc_send(nick, filepath)
+            await self.ui_queue.put(("status", f"DCC {tid}: sending {filepath} to {nick}"))
+        elif sub == "trust":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /dcc trust <nick>"))
+                return
+            nick = parts[1].lower()
+            self._dcc_trusted.add(nick)
+            cfg = load_irc_config()
+            cfg["dcc_trusted"] = sorted(self._dcc_trusted)
+            save_irc_config(cfg)
+            await self.ui_queue.put(("status", f"DCC: {parts[1]} added to trusted list"))
+        elif sub == "untrust":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /dcc untrust <nick>"))
+                return
+            nick = parts[1].lower()
+            self._dcc_trusted.discard(nick)
+            cfg = load_irc_config()
+            cfg["dcc_trusted"] = sorted(self._dcc_trusted)
+            save_irc_config(cfg)
+            await self.ui_queue.put(("status", f"DCC: {parts[1]} removed from trusted list"))
+        elif sub == "trusted":
+            if self._dcc_trusted:
+                await self.ui_queue.put(("status", f"DCC trusted: {', '.join(sorted(self._dcc_trusted))}"))
+            else:
+                await self.ui_queue.put(("status", "DCC trusted list is empty"))
+        elif sub == "status":
+            active = []
+            for client in [c.client for c in self.servers.values()]:
+                for tid, entry in getattr(client, "_dcc_out", {}).items():
+                    active.append(f"{tid}: {entry['nick']} {entry['sent']}/{entry['total']}")
+                for tid, entry in getattr(client, "_dcc_in", {}).items():
+                    active.append(f"{tid}: {entry['nick']} {entry.get('sent',0)}/{entry['total']}")
+            if active:
+                for s in active:
+                    await self.ui_queue.put(("status", f"  {s}"))
+            else:
+                await self.ui_queue.put(("status", "No active DCC transfers"))
+        else:
+            await self.ui_queue.put(("status", "Subcommands: send, trust, untrust, trusted, status"))
 
     async def _slash_list(self, args, extra, line):
         """Fetch and display the server's channel list (RPL_LIST 322/323)."""
