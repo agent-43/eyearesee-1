@@ -4101,6 +4101,13 @@ class IRCClient:
         elif msg.startswith("\x01") and msg.endswith("\x01"):
             # Generic CTCP request (handled above — this path is dead for CTCP)
             return
+        # User scoring — compute initial scores from historical state
+        u_state = self.users.get(nick)
+        if u_state is None:
+            u_state = UserState(nick)
+            self.users[nick] = u_state
+        u_score = self.scoring.score_user(u_state)
+        m_score = 50
         # mention tag: server indicates this message mentions our nick
         mention = tags.get("mention", "")
         await self.ui_queue.put(("msg", nick, target, msg, u_score, m_score, 0, 0,
@@ -5773,6 +5780,8 @@ class TUI:
         # ── IRC operator / user mode tracking ──────────────────────────────────────
         self._own_umodes: set = set()
         self._ircop_nicks: set = set()
+        self._PREFIX_BY_LETTER: set = set("ovhaq")
+        self._MODE_ARGS_CHARS: set = set("ovhaqbeklI")
 
         # ── Built-in bouncer ──────────────────────────────────────────────────────
         self._bouncer_enabled: bool = True         # master toggle
@@ -6940,6 +6949,15 @@ class TUI:
     @staticmethod
     def _prefix_rank(mode_char: str) -> int:
         return {"~": 5, "&": 4, "@": 3, "%": 2, "+": 1}.get(mode_char, 0)
+
+    @staticmethod
+    def _highest_prefix(modes: set) -> str:
+        mode_to_prefix = {"q": "~", "a": "&", "o": "@", "h": "%", "v": "+"}
+        order = ["q", "a", "o", "h", "v"]
+        for m in order:
+            if m in modes:
+                return mode_to_prefix[m]
+        return ""
 
     def _sort_users_by_mode(self, ch: str) -> List[str]:
         modes = self.channel_user_modes.get(ch, {})
