@@ -158,6 +158,8 @@ GPG_BINARY: str    = os.environ.get("IRC_GPG_BINARY", "gpg")
 # Tor SOCKS5 proxy
 TOR_PROXY_HOST: str = os.environ.get("IRC_TOR_PROXY_HOST", "127.0.0.1")
 TOR_PROXY_PORT: int = int(os.environ.get("IRC_TOR_PROXY_PORT", "9050"))
+# STS policy persistence
+STS_POLICY_PATH    = os.path.join(_SCRIPT_DIR, "sts_policies.json")
 
 # AI provider keys
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -2967,6 +2969,10 @@ class IRCClient:
         self.nick = nick
         self.use_ssl = use_ssl
         self.use_tor = use_tor
+        self.tor_strict: bool = False
+        self._own_umodes: set = set()      # user modes (+i, +o, +w, etc.)
+        self._ircop_nicks: set = set()     # nicks known to be IRC operators
+        self._sts_policies: dict = self._load_sts_policies()
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.ui_queue = ui_queue
@@ -3026,7 +3032,52 @@ class IRCClient:
     def server_id(self) -> str:
         return f"{self.server}:{self.port}"
 
+    def _load_sts_policies(self) -> dict:
+        try:
+            with open(STS_POLICY_PATH, encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_sts_policies(self) -> None:
+        try:
+            with open(STS_POLICY_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._sts_policies, f, indent=2)
+        except Exception:
+            pass
+
+    def _clear_expired_sts(self) -> None:
+        now = time.time()
+        expired = [
+            srv for srv, pol in self._sts_policies.items()
+            if pol["duration"] > 0 and now > pol["timestamp"] + pol["duration"]
+        ]
+        for srv in expired:
+            del self._sts_policies[srv]
+        if expired:
+            self._save_sts_policies()
+
     async def connect(self) -> None:
+        # STS policy check: if a pinned policy exists and is still valid,
+        # force SSL and the pinned port.
+        self._clear_expired_sts()
+        policy = self._sts_policies.get(self.server)
+        if policy and not self.use_ssl:
+            self.use_ssl = True
+            self.port = policy["port"]
+            await self.ui_queue.put(("status",
+                f"[STS] Enforcing pinned policy — upgraded to SSL port {self.port}"))
+        if policy and self.port != policy["port"]:
+            self.port = policy["port"]
+            await self.ui_queue.put(("status",
+                f"[STS] Enforcing pinned SSL port {self.port}"))
+
+        # Onion-only mode: refuse clearnet hosts
+        if self.tor_strict and not self.server.endswith(".onion"):
+            raise ConnectionError(
+                f"Tor strict mode: refusing clearnet host '{self.server}' "
+                f"(only .onion addresses allowed)")
+
         via = " (via Tor)" if self.use_tor else ""
         proto = "SSL" if self.use_ssl else "plain"
         await self.ui_queue.put(("status", f"Connecting to {self.server}:{self.port} ({proto}{via})..."))
@@ -3798,12 +3849,22 @@ class IRCClient:
         except (TypeError, ValueError):
             duration_int = 0
         if duration_int <= 0:
-            # Server is revoking its STS policy. Nothing to warn about.
+            self._sts_policies.pop(self.server, None)
+            self._save_sts_policies()
+            try:
+                self.ui_queue.put_nowait(("status", f"[STS] Policy revoked for {self.server}"))
+            except Exception:
+                pass
             return
         preload = "preload" in params
-        msg = (f"[STS] Server requires TLS — reconnect with SSL on port {port} "
-               f"(policy duration={duration_int}s{', preload' if preload else ''}). "
-               f"Use /server {self.server} {port} ssl to upgrade.")
+        now = time.time()
+        self._sts_policies[self.server] = {
+            "port": port_int, "duration": duration_int, "timestamp": now,
+        }
+        self._save_sts_policies()
+        msg = (f"[STS] Pinned policy for {self.server}: SSL port {port}, "
+               f"duration={duration_int}s (expires {time.strftime('%Y-%m-%d %H:%M:%S',
+                     time.localtime(now + duration_int))})")
         try:
             self.ui_queue.put_nowait(("status", msg))
         except Exception:
@@ -3846,6 +3907,8 @@ class IRCClient:
                 await self.ui_queue.put(("status", f"Joining {ch}..."))
         if not self.current_channel and DEFAULT_CHANNEL:
             self.current_channel = DEFAULT_CHANNEL
+        # Query own user modes (triggers 221 RPL_UMODEIS)
+        self.send_raw(f"MODE {self.nick}")
 
     async def _irc_join(self, nick, params, prefix):
         if not params:
@@ -3870,7 +3933,35 @@ class IRCClient:
             await self.ui_queue.put(("topic", params[0], params[-1] if len(params) > 1 else ""))
 
     async def _irc_mode(self, nick, params, prefix):
+        # User mode change for self — update own modes
+        if params and self._irc_lower(params[0]) == self._irc_lower(self.nick):
+            self._apply_umodes(params[1])
+            await self.ui_queue.put(("own_umodes", self._own_umodes.copy()))
         await self.ui_queue.put(("mode", nick, params))
+
+    def _apply_umodes(self, modestr: str) -> None:
+        """Parse a user mode string like ``+io-x`` and update ``_own_umodes``."""
+        adding = True
+        for ch in modestr:
+            if ch == "+":
+                adding = True
+            elif ch == "-":
+                adding = False
+            elif ch.isalpha():
+                if adding:
+                    self._own_umodes.add(ch)
+                else:
+                    self._own_umodes.discard(ch)
+
+    async def _irc_umodeis(self, nick, params, prefix):  # 221 RPL_UMODEIS
+        if len(params) >= 2:
+            self._apply_umodes(params[1])
+            await self.ui_queue.put(("own_umodes", self._own_umodes.copy()))
+
+    async def _irc_youreoper(self, nick, params, prefix):  # 381 RPL_YOUREOPER
+        self._own_umodes.add("o")
+        await self.ui_queue.put(("own_umodes", self._own_umodes.copy()))
+        await self.ui_queue.put(("status", "[oper] You are now an IRC operator (+o)"))
 
     async def _irc_whois_reply(self, cmd_key: str, nick, params, prefix):
         w = params[1] if len(params) > 1 else "?"
@@ -3883,7 +3974,9 @@ class IRCClient:
             info = params[3] if len(params) > 3 else ""
             text = f"[whois] {w}  server: {srv}" + (f" — {info}" if info else "")
         elif cmd_key == "313":
-            text = f"[whois] {w}  is an IRC operator"
+            self._ircop_nicks.add(self._irc_lower(w))
+            await self.ui_queue.put(("ircop_status", w, True))
+            text = f"[whois] {w}  ◈ is an IRC operator"
         elif cmd_key == "317" and len(params) >= 3:
             try:
                 secs = int(params[2])
@@ -3986,6 +4079,13 @@ class IRCClient:
                     await self.ui_queue.put(("dcc_resume_req", nick, dcc_parts[1], int(dcc_parts[2]), int(dcc_parts[3])))
                 elif len(dcc_parts) == 4 and dcc_parts[0] == "ACCEPT":
                     await self.ui_queue.put(("dcc_resume_ack", nick, dcc_parts[1], int(dcc_parts[2]), int(dcc_parts[3])))
+                elif len(dcc_parts) >= 4 and dcc_parts[0] == "CHAT":
+                    try:
+                        ip_int = int(dcc_parts[2])
+                        port   = int(dcc_parts[3])
+                    except ValueError:
+                        return
+                    await self.ui_queue.put(("dcc_chat_offer", nick, ip_int, port))
             return  # CTCP — never treat as normal message
 
         if nick not in self.users:
@@ -4010,6 +4110,13 @@ class IRCClient:
 
     async def _irc_nick_change(self, nick, params, prefix):
         new_nick = params[0] if params else ""
+        old_lower = self._irc_lower(nick)
+        new_lower = self._irc_lower(new_nick)
+        if old_lower in self._ircop_nicks:
+            self._ircop_nicks.discard(old_lower)
+            self._ircop_nicks.add(new_lower)
+            await self.ui_queue.put(("ircop_status", nick, False))
+            await self.ui_queue.put(("ircop_status", new_nick, True))
         if nick == self.nick:
             self.nick = new_nick
             # If we reclaimed our desired nick, stop the recovery loop.
@@ -4372,6 +4479,8 @@ class IRCClient:
         h["904"]          = self._irc_sasl_fail
         h["900"]          = self._irc_logged_in
         h["001"]          = self._irc_welcome
+        h["221"]          = self._irc_umodeis
+        h["381"]          = self._irc_youreoper
         h["JOIN"]         = self._irc_join
         h["PART"]         = self._irc_part
         h["KICK"]         = self._irc_kick
@@ -4508,6 +4617,7 @@ class IRCClient:
     _dcc_out: dict = {}
     _dcc_in:  dict = {}
     _dcc_seq: int = 0
+    _dcc_chats: Dict[str, dict] = {}  # tid → {nick, reader, writer, task}
 
     async def _dcc_send_file(self, tid: str, nick: str, filepath: str,
                               turbo: bool = False, resume_pos: int = 0) -> None:
@@ -4739,6 +4849,128 @@ class IRCClient:
             turbo=entry.get("turbo", False),
             resume_at=position,
             use_tor=getattr(self, "use_tor", False)))
+
+    # ── DCC CHAT ──────────────────────────────────────────────────────────────
+
+    def cmd_dcc_chat(self, nick: str) -> Optional[str]:
+        """Initiate a DCC CHAT with *nick*.
+
+        Opens a TCP listener, sends the CTCP offer, and returns the transfer id
+        (or None on failure).
+        """
+        self._dcc_seq += 1
+        tid = f"dcc_chat{self._dcc_seq}"
+        # Start listener – will be filled when connection arrives
+        self._dcc_chats[tid] = {"nick": nick, "reader": None, "writer": None, "task": None}
+        asyncio.create_task(self._dcc_chat_listen(tid, nick))
+        return tid
+
+    async def _dcc_chat_listen(self, tid: str, nick: str) -> None:
+        """Background: create TCP listener, send CTCP offer, accept connection."""
+        sock = self.writer.get_extra_info("sockname") if self.writer else None
+        local_ip = sock[0] if sock else "0.0.0.0"
+        try:
+            ip_int = int.from_bytes(socket.inet_aton(local_ip), 'big')
+        except OSError:
+            ip_int = int.from_bytes(socket.inet_aton("0.0.0.0"), 'big')
+        try:
+            server = await asyncio.start_server(
+                lambda r, w: self._dcc_chat_on_connect(tid, nick, r, w),
+                host="0.0.0.0", port=0)
+            port = server.sockets[0].getsockname()[1]
+        except OSError as e:
+            await self.ui_queue.put(("dcc_chat_offer", tid, nick, 0, 0, f"error: {e}"))
+            return
+        self._dcc_chats[tid]["server"] = server
+        self.send_raw(
+            f"PRIVMSG {nick} :\x01DCC CHAT chat {ip_int} {port}\x01")
+        await self.ui_queue.put(("dcc_chat_offer", tid, nick, 0, 0, "listening"))
+        # Wait up to 120 s for connection
+        await asyncio.sleep(120)
+        server.close()
+        await server.wait_closed()
+        if tid in self._dcc_chats and self._dcc_chats[tid].get("writer") is None:
+            self._dcc_chats.pop(tid, None)
+            await self.ui_queue.put(("dcc_chat_closed", tid, nick))
+
+    def _dcc_chat_on_connect(self, tid: str, nick: str,
+                              reader: asyncio.StreamReader,
+                              writer: asyncio.StreamWriter) -> None:
+        """Called when the remote side connects to our listener."""
+        entry = self._dcc_chats.get(tid)
+        if not entry:
+            writer.close()
+            return
+        entry["reader"] = reader
+        entry["writer"] = writer
+        task = asyncio.create_task(self._dcc_chat_reader(tid, nick, reader))
+        entry["task"] = task
+        self.ui_queue.put_nowait(("dcc_chat_offer", tid, nick, 0, 0, "connected"))
+
+    def _accept_dcc_chat(self, tid: str, nick: str, ip_int: int, port: int) -> None:
+        """Connect to the remote side's DCC CHAT listener."""
+        ip = socket.inet_ntoa(int.to_bytes(ip_int, 4, 'big'))
+        asyncio.create_task(self._dcc_chat_connect_out(tid, nick, ip, port))
+
+    async def _dcc_chat_connect_out(self, tid: str, nick: str, ip: str, port: int) -> None:
+        """Connect out to accept an incoming DCC CHAT offer."""
+        use_tor = getattr(self, "use_tor", False)
+        try:
+            if use_tor:
+                reader, writer = await asyncio.wait_for(
+                    _socks5_connect(ip, port), timeout=30)
+            else:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port), timeout=30)
+        except (OSError, asyncio.TimeoutError, ConnectionError) as e:
+            await self.ui_queue.put(("dcc_chat_closed", tid, nick))
+            return
+        entry = self._dcc_chats.get(tid)
+        if not entry:
+            writer.close()
+            return
+        entry["reader"] = reader
+        entry["writer"] = writer
+        task = asyncio.create_task(self._dcc_chat_reader(tid, nick, reader))
+        entry["task"] = task
+        await self.ui_queue.put(("dcc_chat_offer", tid, nick, 0, 0, "connected"))
+
+    async def _dcc_chat_reader(self, tid: str, nick: str,
+                                reader: asyncio.StreamReader) -> None:
+        """Background: read lines from the DCC CHAT socket and forward to UI."""
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip("\r\n")
+                await self.ui_queue.put(("dcc_chat_msg", tid, nick, text))
+        except Exception:
+            pass
+        finally:
+            self._dcc_chats.pop(tid, None)
+            await self.ui_queue.put(("dcc_chat_closed", tid, nick))
+
+    def dcc_chat_send(self, tid: str, text: str) -> None:
+        """Send *text* over the DCC CHAT connection identified by *tid*."""
+        entry = self._dcc_chats.get(tid)
+        if entry and entry.get("writer"):
+            try:
+                entry["writer"].write((text + "\n").encode("utf-8"))
+            except Exception:
+                pass
+
+    def dcc_chat_close(self, tid: str) -> None:
+        """Close a DCC CHAT connection."""
+        entry = self._dcc_chats.pop(tid, None)
+        if entry:
+            if entry.get("task"):
+                entry["task"].cancel()
+            try:
+                if entry.get("writer"):
+                    entry["writer"].close()
+            except Exception:
+                pass
 
     def cmd_notice(self, target: str, text: str) -> None:
         self.send_raw(f"NOTICE {target} :{text}")
@@ -5505,10 +5737,13 @@ class TUI:
         stdscr.nodelay(True)
         stdscr.keypad(True)
 
-        # Auto-translate CJK (Chinese/Japanese/…) messages to English
+        # ── Auto-translate CJK (Chinese/Japanese/…) messages to English
         self.auto_translate: bool = True
         # Auto-fetch link metadata (title, image info, domain warnings)
         self.link_preview_enabled: bool = True
+        # ── IRC operator / user mode tracking ──────────────────────────────────────
+        self._own_umodes: set = set()
+        self._ircop_nicks: set = set()
 
         # ── Built-in bouncer ──────────────────────────────────────────────────────
         self._bouncer_enabled: bool = True         # master toggle
@@ -5527,7 +5762,9 @@ class TUI:
 
         # ── Tor ───────────────────────────────────────────────────────────────────
         self._use_tor: bool = load_irc_config().get("tor", {}).get("enabled", False)
+        self._tor_strict: bool = load_irc_config().get("tor", {}).get("strict", False)
         self.client.use_tor = self._use_tor
+        self.client.tor_strict = self._tor_strict
 
     # ── Multi-server helpers ─────────────────────────────────────────────────
 
@@ -6426,7 +6663,8 @@ class TUI:
             for i, nick in enumerate(users[:self.chat_height - 2]):
                 ai_pct = self.user_ai_scores.get(nick, 0)
                 mode_char = self._highest_prefix(modes.get(nick, set()))
-                display_nick = (mode_char + nick) if mode_char else nick
+                oper_mark = "◈" if nick.lower() in self._ircop_nicks else ""
+                display_nick = (mode_char + oper_mark + nick) if (mode_char or oper_mark) else nick
                 nick_vis = _str_visual_width(display_nick)
                 padded   = display_nick + " " * max(0, 18 - nick_vis)
                 line     = _truncate_to_width(f"{padded} [{ai_pct:2d}%]", uw)
@@ -6564,10 +6802,11 @@ class TUI:
         # text will go.  Status/dashboard windows have no chat target.
         cur_win = self.get_current_window()
         _cur_nick = self._active_client().nick
+        oper_indicator = "◈" if "o" in self._own_umodes else ""
         if cur_win.name not in ("*status*", "*dashboard*"):
-            prompt = f"[{cur_win.name}] {_cur_nick}> "
+            prompt = f"[{cur_win.name}] {oper_indicator}{_cur_nick}> "
         else:
-            prompt = f"{_cur_nick}> "
+            prompt = f"{oper_indicator}{_cur_nick}> "
         iw     = self._input_w
 
         # All width calculations use visual column counts (not character counts)
@@ -6735,6 +6974,8 @@ class TUI:
         h["markread"]    = self._ev_markread
         h["mode"]        = self._ev_mode
         h["kick"]        = self._ev_kick
+        h["own_umodes"]  = self._ev_own_umodes
+        h["ircop_status"] = self._ev_ircop_status
         h["list_results"]  = self._ev_list_results
         h["chanmode"]      = self._ev_chanmode
         h["banlist"]       = self._ev_banlist
@@ -6742,6 +6983,9 @@ class TUI:
         h["dcc_offer"]     = self._ev_dcc_offer
         h["dcc_resume_req"] = self._ev_dcc_resume_req
         h["dcc_resume_ack"] = self._ev_dcc_resume_ack
+        h["dcc_chat_offer"]  = self._ev_dcc_chat_offer
+        h["dcc_chat_msg"]    = self._ev_dcc_chat_msg
+        h["dcc_chat_closed"] = self._ev_dcc_chat_closed
         for k in ("whois", "status"):
             h[k] = self._ev_status_line
 
@@ -6799,6 +7043,8 @@ class TUI:
                 p = ref_prev[:50] + "…" if len(ref_prev) > 50 else ref_prev
                 win.add_line(f"  ↩ {ref_nick}: {p}", timestamp=False)
         prefix_str = f"* {nick} " if is_action else f"<{nick}> "
+        if nick.lower() in self._ircop_nicks:
+            prefix_str = "◈" + prefix_str
         # Replay lines get a visual marker; account shown if account-tag active
         replay_mark = "[↑] " if is_replay else ""
         acc_mark    = f"[{account}]" if account else ""
@@ -7014,6 +7260,11 @@ class TUI:
             self._suspect_nicks.discard(old_nick)
             if score >= self.ai_suspect_threshold:
                 self._suspect_nicks.add(new_nick)
+        old_lower = old_nick.lower()
+        new_lower = new_nick.lower()
+        if old_lower in self._ircop_nicks:
+            self._ircop_nicks.discard(old_lower)
+            self._ircop_nicks.add(new_lower)
         self._status_win().add_line(f"* {old_nick} is now known as {new_nick}")
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
@@ -7131,6 +7382,7 @@ class TUI:
                         self._unread_windows.add(ch_win.name)
                         self._input_dirty = True
         self._suspect_nicks.discard(nick)
+        self._ircop_nicks.discard(nick.lower())
         self.user_scores.pop(nick, None)
         self.user_ai_scores.pop(nick, None)
         self._chat_dirty = self._userlist_dirty = True
@@ -7194,6 +7446,21 @@ class TUI:
                 self._unread_windows.add(ch_win.name)
                 self._input_dirty = True
         self._chat_dirty = self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_own_umodes(self, event):
+        self._own_umodes = event[1]
+        self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_ircop_status(self, event):
+        _, nick, is_oper = event
+        lower = nick.lower()
+        if is_oper:
+            self._ircop_nicks.add(lower)
+        else:
+            self._ircop_nicks.discard(lower)
+        self._userlist_dirty = True
         self.dirty = True
 
     async def _ev_list_results(self, event):
@@ -7289,6 +7556,75 @@ class TUI:
                     f"DCC: resuming {filename} from byte {position}"))
                 break
 
+    # ── DCC CHAT event handlers ─────────────────────────────────────────────
+    def _dcc_chat_window_name(self, nick: str) -> str:
+        return f"=DCC-chat-{nick}"
+
+    def _dcc_chat_tid_for_window(self, win_name: str) -> Optional[str]:
+        for tid, entry in self._active_client()._dcc_chats.items():
+            if self._dcc_chat_window_name(entry["nick"]) == win_name:
+                return tid
+        return None
+
+    async def _ev_dcc_chat_offer(self, event):
+        if len(event) >= 6:
+            _, tid, nick, ip_int, port, status = event
+        else:
+            _, nick, ip_int, port = event
+            status = "offer"
+            tid = None
+        if status == "listening":
+            await self.ui_queue.put(("status", f"DCC CHAT: offering chat to {nick}..."))
+            return
+        if status == "connected":
+            win_name = self._dcc_chat_window_name(nick)
+            win = self.window_by_name.get(win_name)
+            if win:
+                win.add_line("* DCC CHAT connected")
+                self._chat_dirty = True
+                self.dirty = True
+            return
+        if status == "error":
+            await self.ui_queue.put(("status", f"DCC CHAT: error with {nick}"))
+            return
+        # Incoming offer — auto-accept from trusted or prompt
+        fsize_str = ""
+        if nick.lower() in self._dcc_trusted:
+            client = self._active_client()
+            client._dcc_seq += 1
+            tid = f"dcc_chat{client._dcc_seq}"
+            client._dcc_chats[tid] = {"nick": nick, "reader": None, "writer": None, "task": None}
+            client._accept_dcc_chat(tid, nick, ip_int, port)
+            win_name = self._dcc_chat_window_name(nick)
+            self.ensure_window(win_name, is_channel=False)
+            w = self.window_by_name[win_name]
+            w.add_line("* DCC CHAT connecting...")
+            await self.ui_queue.put(("status",
+                f"DCC CHAT: auto-accepting from trusted user {nick}"))
+        else:
+            await self.ui_queue.put(("status",
+                f"DCC CHAT: incoming from {nick} — use /dcc trust {nick} to auto-accept"))
+
+    async def _ev_dcc_chat_msg(self, event):
+        _, tid, nick, text = event
+        win_name = self._dcc_chat_window_name(nick)
+        win = self.window_by_name.get(win_name)
+        if win is None:
+            win = self.ensure_window(win_name, is_channel=False)
+        win.add_line(f"<{nick}> {text}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _ev_dcc_chat_closed(self, event):
+        _, tid, nick = event
+        win_name = self._dcc_chat_window_name(nick)
+        win = self.window_by_name.get(win_name)
+        if win:
+            win.add_line("* DCC CHAT disconnected")
+        self._chat_dirty = True
+        self.dirty = True
+        await self.ui_queue.put(("status", f"DCC CHAT with {nick} closed"))
+
     async def _ev_status_line(self, event):
         msg = str(event[1]) if len(event) > 1 else str(event)
         self._status_win().add_line(msg)
@@ -7362,6 +7698,7 @@ class TUI:
         h["list"]         = self._slash_list
         h["lf"]           = self._slash_lf
         h["dcc"]          = self._slash_dcc
+        h["dccchat"]      = self._slash_dccchat
         h["userlist"]     = self._slash_userlist
         h["znc"]          = self._slash_znc
         h["jitsi"]        = self._slash_jitsi
@@ -7461,6 +7798,19 @@ class TUI:
 
     async def _send_plain_text(self, line: str) -> None:
         cur_win = self.get_current_window()
+        # DCC CHAT: route text over the direct TCP connection
+        if cur_win.name.startswith("=DCC-chat-"):
+            nick = cur_win.name[len("=DCC-chat-"):]
+            client = self._active_client()
+            tid = self._dcc_chat_tid_for_window(cur_win.name)
+            if tid:
+                client.dcc_chat_send(tid, line)
+                cur_win.add_line(f"<{client.nick}> {line}")
+                self._chat_dirty = True
+                self.dirty = True
+            else:
+                await self.ui_queue.put(("status", "DCC CHAT not connected"))
+            return
         if cur_win.name not in ("*status*", "*dashboard*"):
             target = cur_win.name
         else:
@@ -8111,6 +8461,7 @@ class TUI:
         new_client    = IRCClient(new_host, new_port, nick, srv_raw_queue,
                                   new_scoring, use_ssl=use_ssl,
                                   use_tor=self._use_tor)
+        new_client.tor_strict = self._tor_strict
         new_ctx = ServerContext(new_sid, new_client)
         self.servers[new_sid] = new_ctx
 
@@ -8824,16 +9175,34 @@ class TUI:
                 ctx.client.use_tor = False
             self._save_tor_config()
             await self.ui_queue.put(("status", "Tor disabled — new connections use direct TCP"))
+        elif sub == "strict":
+            self._tor_strict = True
+            self.client.tor_strict = True
+            for ctx in self.servers.values():
+                ctx.client.tor_strict = True
+            self._save_tor_config()
+            await self.ui_queue.put(("status",
+                "Tor strict mode ON — only .onion hosts allowed"))
+        elif sub == "nostrict":
+            self._tor_strict = False
+            self.client.tor_strict = False
+            for ctx in self.servers.values():
+                ctx.client.tor_strict = False
+            self._save_tor_config()
+            await self.ui_queue.put(("status",
+                "Tor strict mode OFF — clearnet hosts allowed"))
         elif sub in ("status", ""):
             await self.ui_queue.put(("status",
                 f"Tor: {'ON' if self._use_tor else 'OFF'}  "
+                f"Strict: {'ON' if self._tor_strict else 'OFF'}  "
                 f"proxy: {TOR_PROXY_HOST}:{TOR_PROXY_PORT}"))
         else:
-            await self.ui_queue.put(("status", "Usage: /tor on|off|status"))
+            await self.ui_queue.put(("status", "Usage: /tor on|off|strict|nostrict|status"))
 
     def _save_tor_config(self) -> None:
         cfg = load_irc_config()
         cfg.setdefault("tor", {})["enabled"] = self._use_tor
+        cfg.setdefault("tor", {})["strict"] = self._tor_strict
         save_irc_config(cfg)
 
     async def _slash_jitsi(self, args, extra, line):
@@ -9389,7 +9758,7 @@ class TUI:
         _H("Connection")
         _E("/server [-ssl] <host> [port]", "Add a parallel server connection (SSL with -ssl, else plain)")
         _E("/reconnect",                   "Drop and re-establish the current connection")
-        _E("/tor on|off|status",           "Route IRC connections through Tor SOCKS5 proxy")
+        _E("/tor on|off|strict|nostrict|status", "Route IRC through Tor; strict = .onion only")
         _E("/replay [on|off|n]",           "Request chat history replay via CHATHISTORY (needs /replay on)")
         _E("/register <account|*> <email> <pw>","Register an account via draft/account-registration")
         _E("/pem [/path/to.pem]",          "Generate NIST P-256 key pair for SASL ECDSA auth")
@@ -9421,7 +9790,7 @@ class TUI:
         _E("/pgp sign <msg>",                 "Sign a message with your GPG key")
         _E("/pgp verify <msg> <sig>",         "Verify a detached signature")
         _E("/pgp list",                       "List GPG public keys in your keyring")
-        _E("/tor on|off|status",              "Route IRC connections through Tor SOCKS5 proxy")
+        _E("/tor on|off|strict|nostrict|status", "Route IRC through Tor; strict = .onion only")
         _C("")
         _H("Plugins & Scripts")
         _E("/loadplugin <path>",   "Load a Python plugin file; its setup(api) is called")
@@ -9437,7 +9806,8 @@ class TUI:
         _E("/commands",       "This full command list")
         _E("/mute",           "Toggle mention beep on/off (highlight stays active)")
         _E("/linkpreview",    "Toggle automatic URL link preview on/off")
-        _E("/dcc <sub>",      "DCC: send|tsend|resume|trust|untrust|trusted|status — file transfers")
+        _E("/dcc <sub>",      "DCC: send|tsend|resume|chat|trust|untrust|trusted|status — file/chat transfers")
+        _E("/dccchat close|list", "Manage DCC CHAT connections")
         _C("")
         self.current_window_index = 0
         self._chat_dirty = True
@@ -9479,12 +9849,12 @@ class TUI:
             "── BNC & GPG & Tor ─────────────────────────────────────────",
             "  /bouncer on|off|status|detach|attach|replay   built-in BNC",
             "  /pgp encrypt|decrypt|sign|verify|key|list     GPG crypto",
-            "  /tor on|off|status                            Tor SOCKS5 proxy",
+            "  /tor on|off|strict|nostrict|status            Tor SOCKS5; strict=onion only",
             "── Interface ──────────────────────────────────────────────",
             "  /win <n>  /close (/wc)  /clear  /links  /list [pat]  /lf <kw|min=n>",
             "  /alias [name] [expansion]  list/set/remove command aliases",
             "  /chain [nick]  message tree for current window  /jitsi  video call",
-            "  /theme <1-5>  /userlist  Ctrl+N next window  /dcc send|tsend|resume|trust|status",
+            "  /theme <1-5>  /userlist  Ctrl+N next window  /dcc send|tsend|resume|trust|chat|status",
             "  Tab/Shift+Tab nick-complete  PgUp/Dn scroll",
             "  Left-click a highlighted URL line to open it in the browser",
             "  Left-click a nick in userlist or chat to open a DM /query",
@@ -9545,7 +9915,7 @@ class TUI:
         """Manage DCC file transfers."""
         parts = (args + " " + extra).strip().split()
         if not parts:
-            await self.ui_queue.put(("status", "Usage: /dcc <send|tsend|resume|trust|untrust|trusted|status> ..."))
+            await self.ui_queue.put(("status", "Usage: /dcc <send|tsend|resume|chat|trust|untrust|trusted|status> ..."))
             return
         sub = parts[0].lower()
         if sub in ("send", "tsend"):
@@ -9575,6 +9945,21 @@ class TUI:
                 return
             client.cmd_dcc_resume(tid)
             await self.ui_queue.put(("status", f"DCC: resume requested for {tid}"))
+        elif sub == "chat":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /dcc chat <nick>"))
+                return
+            nick = parts[1]
+            client = self._active_client()
+            tid = client.cmd_dcc_chat(nick)
+            if tid:
+                win_name = self._dcc_chat_window_name(nick)
+                self.ensure_window(win_name, is_channel=False)
+                w = self.window_by_name[win_name]
+                w.add_line(f"* DCC CHAT initiating with {nick}...")
+                self.current_window_index = self.windows.index(w)
+                self._sync_draw_ctx()
+                await self.ui_queue.put(("status", f"DCC CHAT: offering chat to {nick}"))
         elif sub == "trust":
             if len(parts) < 2:
                 await self.ui_queue.put(("status", "Usage: /dcc trust <nick>"))
@@ -9607,13 +9992,47 @@ class TUI:
                     active.append(f"{tid}: {entry['nick']} {entry['sent']}/{entry['total']}")
                 for tid, entry in getattr(client, "_dcc_in", {}).items():
                     active.append(f"{tid}: {entry['nick']} {entry.get('sent',0)}/{entry['total']}")
+                for tid, entry in getattr(client, "_dcc_chats", {}).items():
+                    s = "connected" if entry.get("writer") else "waiting"
+                    active.append(f"{tid}: CHAT {entry['nick']} ({s})")
             if active:
                 for s in active:
                     await self.ui_queue.put(("status", f"  {s}"))
             else:
                 await self.ui_queue.put(("status", "No active DCC transfers"))
         else:
-            await self.ui_queue.put(("status", "Subcommands: send, trust, untrust, trusted, status"))
+            await self.ui_queue.put(("status", "Subcommands: send, tsend, resume, chat, trust, untrust, trusted, status"))
+
+    async def _slash_dccchat(self, args, extra, line):
+        """Manage DCC CHAT connections."""
+        parts = (args + " " + extra).strip().split()
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /dccchat close <nick>"))
+            return
+        sub = parts[0].lower()
+        if sub == "close":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /dccchat close <nick>"))
+                return
+            nick = parts[1]
+            client = self._active_client()
+            for tid, entry in list(client._dcc_chats.items()):
+                if entry["nick"] == nick:
+                    client.dcc_chat_close(tid)
+                    await self.ui_queue.put(("status", f"DCC CHAT with {nick} closed"))
+                    break
+            else:
+                await self.ui_queue.put(("status", f"No active DCC CHAT with {nick}"))
+        elif sub == "list":
+            client = self._active_client()
+            if not client._dcc_chats:
+                await self.ui_queue.put(("status", "No active DCC CHAT connections"))
+            else:
+                for tid, entry in client._dcc_chats.items():
+                    status = "connected" if entry.get("writer") else "waiting"
+                    await self.ui_queue.put(("status", f"DCC CHAT {tid}: {entry['nick']} ({status})"))
+        else:
+            await self.ui_queue.put(("status", "Usage: /dccchat close <nick> | list"))
 
     async def _slash_list(self, args, extra, line):
         """Fetch and display the server's channel list (RPL_LIST 322/323)."""
@@ -10551,9 +10970,12 @@ async def main_curses(stdscr, ai_detector: EnsembleAIDetector):
 
     ui_queue: asyncio.Queue = asyncio.Queue()
     scoring_engine = ScoringEngine(ai_detector)
-    _use_tor = load_irc_config().get("tor", {}).get("enabled", False)
+    _tor_cfg = load_irc_config().get("tor", {})
+    _use_tor = _tor_cfg.get("enabled", False)
+    _tor_strict = _tor_cfg.get("strict", False)
     client = IRCClient(DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, ui_queue, scoring_engine,
                        use_tor=_use_tor)
+    client.tor_strict = _tor_strict
     tui = TUI(stdscr, ui_queue, client)
 
     # Initial dashboard
