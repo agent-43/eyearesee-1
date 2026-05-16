@@ -28,7 +28,7 @@ import warnings
 from collections import Counter, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 from math import log, log2
-from typing import Optional, Dict, List, Tuple, Callable
+from typing import Optional, Dict, List, Tuple, Callable, Any
 
 # =========================
 # CLI flags — parsed before any optional imports or install code runs
@@ -2972,6 +2972,10 @@ class IRCClient:
         self.tor_strict: bool = False
         self._own_umodes: set = set()      # user modes (+i, +o, +w, etc.)
         self._ircop_nicks: set = set()     # nicks known to be IRC operators
+        self._ctcp_mode: str = "normal"    # normal, off, spoof
+        self._resume_token: str = ""       # IRCv3 draft/resume token
+        self._resume_ts: str = ""          # IRCv3 draft/resume timestamp
+        self._resumed_session: bool = False  # True after successful RESUME
         self._sts_policies: dict = self._load_sts_policies()
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
@@ -3150,9 +3154,10 @@ class IRCClient:
         # CAP LS must come before NICK/USER so the server holds registration
         # open until we send CAP END (or complete SASL).
         self.send_raw("CAP LS 302")
-        self.send_raw(f"NICK {self.nick}")
-        self.send_raw(f"USER {self.nick} 0 * :{self.nick}")
-        await self.ui_queue.put(("status", "Sent NICK and USER commands"))
+        # NICK/USER are deferred — they are sent after CAP END
+        # via _finish_registration() (which may send RESUME instead if
+        # draft/resume token is available).
+        await self.ui_queue.put(("status", "Sent CAP LS — awaiting registration"))
 
     def send_raw(self, line: str) -> None:
         """Enqueue a raw IRC line for delivery by the rate-limited writer task.
@@ -3520,6 +3525,10 @@ class IRCClient:
         "draft/multiline", "draft/format",
         "message-redaction", "read-marker",
         "draft/account-registration",
+        "draft/reply", "draft/react", "draft/typing",
+        "draft/mention", "draft/event-playback",
+        "draft/channel-rename", "draft/persistent-channel",
+        "draft/resume",
     )
 
     async def _irc_cap(self, nick, params, prefix):
@@ -3560,6 +3569,8 @@ class IRCClient:
                 if "sasl" in self._cap_ls_caps and _sasl_creds_ok:
                     want.append("sasl")
                 self.send_raw(f"CAP REQ :{' '.join(want)}" if want else "CAP END")
+                if not want:
+                    self._finish_registration()
                 self._cap_ls_caps.clear()
         elif subcmd == "ACK":
             acked = set((params[-1] if params else "").lower().split())
@@ -3568,6 +3579,7 @@ class IRCClient:
                 self.send_raw(f"AUTHENTICATE {SASL_MECHANISM}")
             else:
                 self.send_raw("CAP END")
+                self._finish_registration()
         elif subcmd == "NAK":
             # Server rejected a batched REQ. Retry each cap
             # individually so we still get whichever subset the
@@ -3783,12 +3795,42 @@ class IRCClient:
         await self.ui_queue.put(("status", "SASL authentication successful — ident set"))
         self._identified = True
         self.send_raw("CAP END")
+        self._finish_registration()
 
     async def _irc_sasl_fail(self, nick, params, prefix):  # 904
         await self.ui_queue.put(("status", "SASL authentication failed — falling back to NickServ"))
         # Abort the SASL session cleanly before ending CAP.
         self.send_raw("AUTHENTICATE *")
         self.send_raw("CAP END")
+        self._finish_registration()
+
+    async def _irc_resumed(self, nick, params, prefix):  # 740 RPL_RESUMED
+        if len(params) >= 3:
+            self._resume_token = params[1]
+            self._resume_ts = params[2]
+        self._resumed_session = True
+        self._save_resume_config()
+        await self.ui_queue.put(("status",
+            f"[resume] Session resumed (token: {self._resume_token[:16]}...)"))
+        await self.ui_queue.put(("resumed",))
+
+    async def _irc_resumeack(self, nick, params, prefix):  # 741 RPL_RESUMEACK
+        if len(params) >= 2:
+            self._resume_token = params[1]
+        self._resumed_session = True
+        self._save_resume_config()
+        await self.ui_queue.put(("status",
+            f"[resume] Resumed on another server (token: {self._resume_token[:16]}...)"))
+        await self.ui_queue.put(("resumed",))
+
+    def _save_resume_config(self) -> None:
+        """Persist resume token to irc_config.json."""
+        try:
+            cfg = load_irc_config()
+            cfg["resume"] = {"token": self._resume_token, "ts": self._resume_ts}
+            save_irc_config(cfg)
+        except Exception:
+            pass
 
     def _irc_lower(self, s: str) -> str:
         r"""Casefold *s* per the server's CASEMAPPING ISUPPORT token.
@@ -3819,6 +3861,7 @@ class IRCClient:
             self.send_raw(f"CAP REQ :{cap}")
         elif "sasl" not in self._active_caps:
             self.send_raw("CAP END")
+            self._finish_registration()
 
     def _handle_sts(self, sts_value: str) -> None:
         """Parse Strict Transport Security CAP value and warn if TLS upgrade needed.
@@ -3895,20 +3938,41 @@ class IRCClient:
 
     async def _irc_welcome(self, nick, params, prefix):  # 001
         await self.ui_queue.put(("clear_users",))
-        await self.ui_queue.put(("status", "Successfully logged in to IRC"))
-        if not self._identified and NICKSERV_PASSWORD:
-            asyncio.create_task(self._delayed_nickserv_identify())
-        for ch in sorted(self.joined_channels):
-            self.send_raw(f"JOIN {ch}")
-            await self.ui_queue.put(("status", f"Joining {ch}..."))
-        for ch in sorted(_AUTOJOIN_CHANNELS):
-            if self._irc_lower(ch) not in (self._irc_lower(c) for c in self.joined_channels):
+        if self._resumed_session:
+            await self.ui_queue.put(("status",
+                "Session resumed — server will replay channel state"))
+            self._resumed_session = False
+        else:
+            await self.ui_queue.put(("status", "Successfully logged in to IRC"))
+            if not self._identified and NICKSERV_PASSWORD:
+                asyncio.create_task(self._delayed_nickserv_identify())
+            for ch in sorted(self.joined_channels):
                 self.send_raw(f"JOIN {ch}")
                 await self.ui_queue.put(("status", f"Joining {ch}..."))
+            for ch in sorted(_AUTOJOIN_CHANNELS):
+                if self._irc_lower(ch) not in (self._irc_lower(c) for c in self.joined_channels):
+                    self.send_raw(f"JOIN {ch}")
+                    await self.ui_queue.put(("status", f"Joining {ch}..."))
         if not self.current_channel and DEFAULT_CHANNEL:
             self.current_channel = DEFAULT_CHANNEL
         # Query own user modes (triggers 221 RPL_UMODEIS)
         self.send_raw(f"MODE {self.nick}")
+
+    def _finish_registration(self) -> None:
+        """Send NICK/USER or RESUME after CAP negotiation completes."""
+        if self._resume_token and "draft/resume" in self._active_caps:
+            self.send_raw(f"RESUME {self._resume_token}")
+            try:
+                self.ui_queue.put_nowait(("status", f"[resume] Attempting resume with token {self._resume_token[:16]}..."))
+            except Exception:
+                pass
+        else:
+            self.send_raw(f"NICK {self.nick}")
+            self.send_raw(f"USER {self.nick} 0 * :{self.nick}")
+            try:
+                self.ui_queue.put_nowait(("status", "Sent NICK and USER commands"))
+            except Exception:
+                pass
 
     async def _irc_join(self, nick, params, prefix):
         if not params:
@@ -4035,73 +4099,13 @@ class IRCClient:
         if is_action:
             msg = msg[len("\x01ACTION "):-1]
         elif msg.startswith("\x01") and msg.endswith("\x01"):
-            # Generic CTCP request
-            ctcp = msg[1:-1].split(" ", 1)
-            ctcp_cmd  = ctcp[0].upper()
-            ctcp_args = ctcp[1] if len(ctcp) > 1 else ""
-            if not self._ctcp_allowed(nick):
-                return
-            if ctcp_cmd == "PING":
-                safe_args = ctcp_args.replace("\x01", "")[:100]
-                self.send_raw(f"NOTICE {nick} :\x01PING {safe_args}\x01")
-            elif ctcp_cmd == "VERSION":
-                self.send_raw(f"NOTICE {nick} :\x01VERSION eyearesee IRC client v3.0\x01")
-                await self.ui_queue.put(("status", f"-!- CTCP VERSION from {nick}"))
-            elif ctcp_cmd == "TIME":
-                self.send_raw(
-                    f"NOTICE {nick} :\x01TIME "
-                    f"{time.strftime('%a, %d %b %Y %H:%M:%S %Z', time.localtime())}\x01")
-                await self.ui_queue.put(("status", f"-!- CTCP TIME from {nick}"))
-            elif ctcp_cmd == "CLIENTINFO":
-                self.send_raw(
-                    f"NOTICE {nick} :\x01CLIENTINFO "
-                    f"PING VERSION TIME CLIENTINFO USERINFO SOURCE FINGER\x01")
-            elif ctcp_cmd == "USERINFO":
-                self.send_raw(f"NOTICE {nick} :\x01USERINFO {self.nick} is using eyearesee\x01")
-            elif ctcp_cmd == "SOURCE":
-                self.send_raw(f"NOTICE {nick} :\x01SOURCE https://github.com (custom eyearesee)\x01")
-            elif ctcp_cmd == "FINGER":
-                self.send_raw(f"NOTICE {nick} :\x01FINGER No finger info\x01")
-            elif ctcp_cmd == "DCC":
-                # DCC SEND / TSEND / RESUME / ACCEPT
-                dcc_parts = ctcp_args.split()
-                if len(dcc_parts) >= 4 and dcc_parts[0] in ("SEND", "TSEND"):
-                    is_turbo = dcc_parts[0] == "TSEND"
-                    filename = dcc_parts[1]
-                    try:
-                        ip_int = int(dcc_parts[2])
-                        port   = int(dcc_parts[3])
-                    except ValueError:
-                        return
-                    filesize = int(dcc_parts[4]) if len(dcc_parts) > 4 else 0
-                    await self.ui_queue.put(("dcc_offer", nick, filename, ip_int, port, filesize, is_turbo))
-                elif len(dcc_parts) == 4 and dcc_parts[0] == "RESUME":
-                    await self.ui_queue.put(("dcc_resume_req", nick, dcc_parts[1], int(dcc_parts[2]), int(dcc_parts[3])))
-                elif len(dcc_parts) == 4 and dcc_parts[0] == "ACCEPT":
-                    await self.ui_queue.put(("dcc_resume_ack", nick, dcc_parts[1], int(dcc_parts[2]), int(dcc_parts[3])))
-                elif len(dcc_parts) >= 4 and dcc_parts[0] == "CHAT":
-                    try:
-                        ip_int = int(dcc_parts[2])
-                        port   = int(dcc_parts[3])
-                    except ValueError:
-                        return
-                    await self.ui_queue.put(("dcc_chat_offer", nick, ip_int, port))
-            return  # CTCP — never treat as normal message
-
-        if nick not in self.users:
-            u = UserState(nick)
-            if nick in _NICK_AI_HISTORY:
-                u.seed_ai_history(_NICK_AI_HISTORY[nick])
-            self.users[nick] = u
-        u_state = self.users[nick]
-        u_score = self.scoring.score_user(u_state)
-        m_score = self.scoring.score_message(None, u_state)
-        # Display immediately with a placeholder AI score (0); a background task
-        # scores the message and sends an "ai_score" update once ML inference finishes.
-        # Extra fields: ts_str (server-time or None), account (account-tag or ""),
-        #               is_replay (True when delivered inside a chathistory batch).
+            # Generic CTCP request (handled above — this path is dead for CTCP)
+            return
+        # mention tag: server indicates this message mentions our nick
+        mention = tags.get("mention", "")
         await self.ui_queue.put(("msg", nick, target, msg, u_score, m_score, 0, 0,
-                                 is_action, ts_str, account, is_replay, msgid, reply_to))
+                                 is_action, ts_str, account, is_replay, msgid, reply_to,
+                                 mention))
         if is_replay:
             return  # don't score replayed history; it's already been seen
         _t = asyncio.create_task(self._score_msg_bg(nick, target, msg, u_state, u_score, m_score))
@@ -4256,7 +4260,7 @@ class IRCClient:
             if batch_type == "draft/multiline":
                 await self._handle_multiline_batch(buffered, open_params)
                 return
-            is_replay = batch_type in ("chathistory", "draft/chathistory")
+            is_replay = batch_type in ("chathistory", "draft/chathistory", "draft/event-playback")
             prev_replay = self._current_batch_is_replay
             self._current_batch_is_replay = is_replay
             try:
@@ -4330,6 +4334,19 @@ class IRCClient:
         if react and reply_to:
             await self.ui_queue.put(("react", nick, target, reply_to, react))
 
+    async def _irc_channelrename(self, nick, params, prefix):
+        if len(params) >= 2:
+            old_ch = params[0]
+            new_ch = params[1]
+            # Update joined_channels
+            old_lower = self._irc_lower(old_ch)
+            new_lower = self._irc_lower(new_ch)
+            self.joined_channels.discard(old_ch)
+            self.joined_channels.add(new_ch)
+            await self.ui_queue.put(("status",
+                f"*** Channel renamed: {old_ch} → {new_ch}"))
+            await self.ui_queue.put(("channel_rename", old_ch, new_ch))
+
     async def _irc_invite(self, nick, params, prefix):
         if len(params) < 2:
             return
@@ -4342,7 +4359,16 @@ class IRCClient:
             await self.ui_queue.put(("status", f"*** {nick} invited {invitee} to {channel}"))
 
     async def _irc_fail(self, nick, params, prefix):
-        await self.ui_queue.put(("status", f"[FAIL] {' '.join(params)}"))
+        text = " ".join(params)
+        if "RESUME" in text.upper() and self._resume_token:
+            await self.ui_queue.put(("status",
+                "[resume] Resume failed — connecting fresh"))
+            self._resume_token = ""
+            self._resume_ts = ""
+            self.send_raw(f"NICK {self.nick}")
+            self.send_raw(f"USER {self.nick} 0 * :{self.nick}")
+        else:
+            await self.ui_queue.put(("status", f"[FAIL] {text}"))
 
     async def _irc_warn(self, nick, params, prefix):
         await self.ui_queue.put(("status", f"[WARN] {' '.join(params)}"))
@@ -4481,6 +4507,8 @@ class IRCClient:
         h["001"]          = self._irc_welcome
         h["221"]          = self._irc_umodeis
         h["381"]          = self._irc_youreoper
+        h["740"]          = self._irc_resumed
+        h["741"]          = self._irc_resumeack
         h["JOIN"]         = self._irc_join
         h["PART"]         = self._irc_part
         h["KICK"]         = self._irc_kick
@@ -4490,6 +4518,7 @@ class IRCClient:
         h["NICK"]         = self._irc_nick_change
         h["NOTICE"]       = self._irc_notice
         h["INVITE"]       = self._irc_invite
+        h["CHANNELRENAME"] = self._irc_channelrename
         h["QUIT"]         = self._irc_quit
         h["353"]          = self._irc_names
         h["301"]          = self._irc_away_reply
@@ -6978,6 +7007,7 @@ class TUI:
         h["ircop_status"] = self._ev_ircop_status
         h["list_results"]  = self._ev_list_results
         h["chanmode"]      = self._ev_chanmode
+        h["resumed"]       = self._ev_resumed
         h["banlist"]       = self._ev_banlist
         h["dcc_progress"]  = self._ev_dcc_progress
         h["dcc_offer"]     = self._ev_dcc_offer
@@ -6986,6 +7016,7 @@ class TUI:
         h["dcc_chat_offer"]  = self._ev_dcc_chat_offer
         h["dcc_chat_msg"]    = self._ev_dcc_chat_msg
         h["dcc_chat_closed"] = self._ev_dcc_chat_closed
+        h["channel_rename"]  = self._ev_channel_rename
         for k in ("whois", "status"):
             h[k] = self._ev_status_line
 
@@ -7020,6 +7051,7 @@ class TUI:
         is_replay = _extra[2] if len(_extra) > 2 else False
         msgid     = _extra[3] if len(_extra) > 3 else ""
         reply_to  = _extra[4] if len(_extra) > 4 else ""
+        mention   = _extra[5] if len(_extra) > 5 else ""
         if nick.lower() in self.ignored_nicks:
             return
         if target.startswith("#"):
@@ -7057,9 +7089,10 @@ class TUI:
             win._msg_store[msgid] = (nick, preview)
             win._last_msgid = msgid
         our_nick = self._active_client().nick
-        if (our_nick and nick.lower() != our_nick.lower()
-                and not self.mention_beep_muted
-                and re.search(r'\b' + re.escape(our_nick) + r'\b', msg, re.IGNORECASE)):
+        is_mention = bool(mention) or (
+            our_nick and nick.lower() != our_nick.lower()
+            and re.search(r'\b' + re.escape(our_nick) + r'\b', msg, re.IGNORECASE))
+        if is_mention and not self.mention_beep_muted:
             try:
                 curses.beep()
             except Exception:
@@ -7289,8 +7322,8 @@ class TUI:
     async def _ev_clear_users(self, event):
         for users in self.channel_users.values():
             users.clear()
-        for modes in self.channel_user_modes.values():
-            modes.clear()
+        for cm in self.channel_user_modes.values():
+            cm.clear()
         self._sorted_users.clear()
         self._userlist_dirty = True
         self.dirty = True
@@ -7299,9 +7332,8 @@ class TUI:
         _, channel, topic_text = event
         text = (f"* Topic for {channel}: {topic_text}"
                 if topic_text else f"* No topic set for {channel}")
-        wk = self._wk(self._active_server_id, channel)
-        target_win = self.window_by_name.get(wk) or self._status_win()
-        target_win.add_line(text)
+        win = self.ensure_window(channel)
+        win.add_line(text)
         self._chat_dirty = True
         self.dirty = True
 
@@ -7317,38 +7349,18 @@ class TUI:
                 self.channel_users[channel].add(nick)
                 self.channel_user_modes.setdefault(channel, {})[nick] = set()
                 self._sorted_users.pop(channel, None)
-            win.add_line(f"* {nick} has joined {channel}")
+            mark = "◈" if nick.lower() in self._ircop_nicks else "*"
+            win.add_line(f"{mark} {nick} has joined {channel}")
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
         await self.plugin_manager.dispatch("on_join", nick=nick, channel=channel)
         await self.script_engine.dispatch("on_join", nick=nick, channel=channel)
 
-    async def _ev_self_join(self, event):
-        _, channel = event
-        self.channel_user_modes.setdefault(channel, {})
-        win = self.ensure_window(channel)
-        win.add_line(f"* You have joined {channel}")
-        self.current_channel = channel
-        self.current_window_index = self.windows.index(win)
-        self._unread_windows.discard(channel)
-        # Fetch stored read marker from server if supported
-        client = self._active_client()
-        if "read-marker" in client._active_caps:
-            client.send_raw(f"MARKREAD {channel} *")
-        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
-        self.dirty = True
-
     async def _ev_join_error(self, event):
         _, channel, msg = event
-        if channel:
-            win = self.ensure_window(channel)
-            win.add_line(msg)
-            self.current_channel = channel
-            self.current_window_index = self.windows.index(win)
-            self._unread_windows.discard(channel)
-        else:
-            self._status_win().add_line(msg)
-        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        win = self.ensure_window(channel)
+        win.add_line(msg)
+        self._chat_dirty = True
         self.dirty = True
 
     async def _ev_part(self, event):
@@ -7357,19 +7369,18 @@ class TUI:
             self.channel_users[channel].discard(nick)
             self.channel_user_modes.get(channel, {}).pop(nick, None)
             self._sorted_users.pop(channel, None)
-        self._suspect_nicks.discard(nick)
-        ch_win = self.window_by_name.get(self._wk(self._active_server_id, channel))
-        if ch_win:
-            ch_win.add_line(f"* {nick} has left {channel}")
-            if ch_win is not self.get_current_window():
-                self._unread_windows.add(ch_win.name)
-                self._input_dirty = True
+        win = self.ensure_window(channel)
+        win.add_line(f"* {nick} has left {channel}")
+        if win is not self.get_current_window():
+            self._unread_windows.add(channel)
+            self._input_dirty = True
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
 
     async def _ev_quit(self, event):
         _, nick, reason = event
-        quit_msg = f"* {nick} has quit" + (f" ({reason})" if reason else "")
+        mark = "◈" if nick.lower() in self._ircop_nicks else "*"
+        quit_msg = f"{mark} {nick} has quit" + (f" ({reason})" if reason else "")
         for ch, users in self.channel_users.items():
             if nick in users:
                 users.discard(nick)
@@ -7387,16 +7398,6 @@ class TUI:
         self.user_ai_scores.pop(nick, None)
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
-
-    _PREFIX_BY_LETTER = {"q": "~", "a": "&", "o": "@", "h": "%", "v": "+"}
-    _MODE_ARGS_CHARS: set = set("qaohvbeIkl")
-
-    @staticmethod
-    def _highest_prefix(mode_set: set) -> str:
-        for letter in ("q", "a", "o", "h", "v"):
-            if letter in mode_set:
-                return TUI._PREFIX_BY_LETTER[letter]
-        return ""
 
     async def _ev_mode(self, event):
         _, nick, params = event
@@ -7429,6 +7430,25 @@ class TUI:
                 arg_idx += 1
         self._sorted_users.pop(target, None)
         self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_channel_rename(self, event):
+        _, old_ch, new_ch = event
+        # Migrate channel state
+        if old_ch in self.channel_users:
+            self.channel_users[new_ch] = self.channel_users.pop(old_ch)
+        if old_ch in self.channel_user_modes:
+            self.channel_user_modes[new_ch] = self.channel_user_modes.pop(old_ch)
+        if old_ch in self._sorted_users:
+            self._sorted_users[new_ch] = self._sorted_users.pop(old_ch)
+        # Rename window if it exists
+        wk_old = self._wk(self._active_server_id, old_ch)
+        win = self.window_by_name.get(wk_old)
+        if win:
+            win.name = new_ch
+            self.window_by_name[self._wk(self._active_server_id, new_ch)] = win
+            del self.window_by_name[wk_old]
+        self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
 
     async def _ev_kick(self, event):
@@ -7480,6 +7500,28 @@ class TUI:
                 sw.add_line(f"  {ch:<20} {users:>4}  {short_topic}")
             sw.add_line(f"  ... ({ch_count - limit} more — use /lf <keyword> or /lf min=<n> to filter)")
         sw.add_line(f"── End of channel list ──")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _ev_self_join(self, event):
+        _, channel = event
+        if channel not in self.channel_users:
+            self.channel_users[channel] = set()
+            self.channel_user_modes[channel] = {}
+        win = self.ensure_window(channel)
+        win.add_line(f"* You have joined {channel}")
+        self.current_channel = channel
+        self.current_window_index = self.windows.index(win)
+        self._unread_windows.discard(channel)
+        # Fetch stored read marker from server if supported
+        client = self._active_client()
+        if "read-marker" in client._active_caps:
+            client.send_raw(f"MARKREAD {channel} *")
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self.dirty = True
+
+    async def _ev_resumed(self, event):
+        self._status_win().add_line("Session resumed — not rejoining channels")
         self._chat_dirty = True
         self.dirty = True
 
@@ -7732,6 +7774,7 @@ class TUI:
         h["attach"]       = self._slash_attach
         h["pgp"]          = self._slash_pgp
         h["tor"]          = self._slash_tor
+        h["ctcpmode"]     = self._slash_ctcpmode
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -9205,6 +9248,19 @@ class TUI:
         cfg.setdefault("tor", {})["strict"] = self._tor_strict
         save_irc_config(cfg)
 
+    async def _slash_ctcpmode(self, args, extra, line):
+        mode = (args + " " + extra).strip().lower()
+        if mode not in ("normal", "off", "spoof"):
+            await self.ui_queue.put(("status", "Usage: /ctcpmode normal|off|spoof"))
+            return
+        self._active_client()._ctcp_mode = mode
+        for ctx in self.servers.values():
+            ctx.client._ctcp_mode = mode
+        cfg = load_irc_config()
+        cfg["ctcp_mode"] = mode
+        save_irc_config(cfg)
+        await self.ui_queue.put(("status", f"CTCP reply mode set to: {mode}"))
+
     async def _slash_jitsi(self, args, extra, line):
         win = self.get_current_window()
         if win.is_channel or win.name in ("*status*", "*dashboard*"):
@@ -9728,6 +9784,7 @@ class TUI:
         _E("/ns <command>",                 "Send command to NickServ  (e.g. /ns identify pw)")
         _E("/cs <command>",                 "Send command to ChanServ")
         _E("/ctcp <nick> <cmd> [args]",     "Send a CTCP request  (PING VERSION TIME …)")
+        _E("/ctcpmode normal|off|spoof",   "CTCP leak protection: off=silent, spoof=fake replies")
         _C("")
         _H("AI Detection")
         _E("/ai <nick>",                    "Full AI profile: score, idle, sparkline, verdict")
@@ -9757,7 +9814,7 @@ class TUI:
         _C("")
         _H("Connection")
         _E("/server [-ssl] <host> [port]", "Add a parallel server connection (SSL with -ssl, else plain)")
-        _E("/reconnect",                   "Drop and re-establish the current connection")
+        _E("/reconnect",                   "Drop and re-establish (uses draft/resume token if available)")
         _E("/tor on|off|strict|nostrict|status", "Route IRC through Tor; strict = .onion only")
         _E("/replay [on|off|n]",           "Request chat history replay via CHATHISTORY (needs /replay on)")
         _E("/register <account|*> <email> <pw>","Register an account via draft/account-registration")
@@ -9835,6 +9892,7 @@ class TUI:
             "  /ignore <nick>  /unignore <nick>  /away [msg]  /back",
             "── Services ──────────────────────────────────────────────",
             "  /ns <cmd>  /cs <cmd>  /ctcp <nick> <cmd> [args]",
+            "  /ctcpmode normal|off|spoof       CTCP leak protection",
             "── AI Detection ──────────────────────────────────────────",
             "  /ai <nick>  full profile    /topai  channel ranking by AI%",
             "  /aitoggle  enable/disable scoring    /logtoggle  toggle log",
@@ -10973,9 +11031,14 @@ async def main_curses(stdscr, ai_detector: EnsembleAIDetector):
     _tor_cfg = load_irc_config().get("tor", {})
     _use_tor = _tor_cfg.get("enabled", False)
     _tor_strict = _tor_cfg.get("strict", False)
+    _ctcp_mode = load_irc_config().get("ctcp_mode", "normal")
+    _resume_cfg = load_irc_config().get("resume", {})
     client = IRCClient(DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, ui_queue, scoring_engine,
                        use_tor=_use_tor)
     client.tor_strict = _tor_strict
+    client._ctcp_mode = _ctcp_mode
+    client._resume_token = _resume_cfg.get("token", "")
+    client._resume_ts = _resume_cfg.get("ts", "")
     tui = TUI(stdscr, ui_queue, client)
 
     # Initial dashboard
