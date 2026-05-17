@@ -3937,6 +3937,228 @@ def start_web_server(port: int = 8088, daemon: bool = True) -> HTTPServer:
     t.start()
     return server
 
+# ---------- NEW: Web Portal (#30) ----------------------------------------------
+
+_PORTAL_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>analyzelog portal</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#000;color:#0f0;font-family:'Courier New',monospace;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+  #header{padding:6px 10px;border-bottom:1px solid #030;font-size:12px;color:#080;display:flex;justify-content:space-between}
+  #header span{color:#0f0}
+  #messages{flex:1;overflow-y:auto;padding:6px 10px;font-size:13px;line-height:1.5}
+  #messages .msg{padding:1px 0;border-bottom:1px solid #001a00;animation:fadeIn .15s}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+  .ts{color:#060}
+  .user{color:#0f0;font-weight:bold}
+  .lvl{color:#0a0}
+  .txt{color:#0c0}
+  .highlight{background:#0f01;border-left:2px solid #0f0;padding-left:6px}
+  .cmd{color:#ff0;font-weight:bold;border-left:2px solid #ff0;padding-left:6px;margin-top:4px}
+  .out{color:#0f0;white-space:pre-wrap;padding-left:6px;margin-bottom:4px;border-left:2px solid #060}
+  .sep{color:#030;text-align:center;font-size:10px;padding:4px 0}
+  #footer{display:flex;align-items:center;border-top:1px solid #030;padding:6px 10px;gap:6px;background:#000}
+  #footer .prompt{color:#0f0;font-weight:bold}
+  #footer input{flex:1;background:#000;color:#0f0;border:1px solid #030;padding:7px 10px;font-family:'Courier New',monospace;font-size:13px;outline:none}
+  #footer input:focus{border-color:#0f0}
+  #footer input::placeholder{color:#060}
+  #status{font-size:11px;color:#060;margin-left:auto}
+  ::-webkit-scrollbar{width:6px}
+  ::-webkit-scrollbar-track{background:#000}
+  ::-webkit-scrollbar-thumb{background:#030;border-radius:3px}
+</style>
+</head>
+<body>
+<div id="header">analyzelog portal <span id="count">0</span> entries <span id="info"></span></div>
+<div id="messages"></div>
+<div id="footer">
+  <span class="prompt">$</span>
+  <input id="input" type="text" placeholder="type a command and press Enter" autofocus spellcheck="false">
+  <span id="status">ready</span>
+</div>
+<script>
+const el=document.getElementById.bind(document);
+const msg=el('messages'), inp=el('input'), cnt=el('count'), sts=el('status'), inf=el('info');
+let lastId=0;
+
+function addEntry(e){
+  const d=document.createElement('div');d.className='msg';
+  if(e._type==='cmd'){
+    d.className='msg cmd';d.textContent='$ '+e.text;
+  }else if(e._type==='out'){
+    d.className='msg out';d.textContent=e.text;
+  }else if(e._type==='sep'){
+    d.className='msg sep';d.textContent=e.text||'\u2500'+'\u2500'.repeat(40);
+  }else{
+    const ts=document.createElement('span');ts.className='ts';ts.textContent=(e.ts||'').slice(0,19)+' ';
+    const us=document.createElement('span');us.className='user';us.textContent=(e.user||'?')+' ';
+    const lv=document.createElement('span');lv.className='lvl';lv.textContent=(e.level||e.event||'')?'['+(e.level||e.event||'')+'] ':'';
+    const tx=document.createElement('span');tx.className='txt';tx.textContent=(e.text||e.raw||'').slice(0,300);
+    d.append(ts,us,lv,tx);
+  }
+  msg.append(d);
+  msg.scrollTop=msg.scrollHeight;
+}
+
+function fetchLog(){
+  fetch('/api/log').then(r=>r.json()).then(data=>{
+    cnt.textContent=data.length;
+    const startFrom=lastId?data.findIndex(e=>e.id===lastId)+1:0;
+    if(startFrom>0&&startFrom<data.length){
+      data.slice(startFrom).forEach(addEntry);
+    }else if(!lastId&&data.length){
+      msg.innerHTML='';data.forEach(addEntry);
+    }
+    if(data.length)lastId=data[data.length-1].id;
+    msg.scrollTop=msg.scrollHeight;
+  }).catch(()=>{});
+}
+
+function sendCmd(cmd){
+  sts.textContent='executing...';
+  const sep={_type:'sep',id:Date.now(),text:'\u2500 cmd: '+cmd+' \u2500'+'\u2500'.repeat(Math.max(0,40-cmd.length-8))};
+  addEntry(sep);
+  const cmdEntry={_type:'cmd',id:Date.now()+1,text:cmd};
+  addEntry(cmdEntry);
+  fetch('/api/command',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({command:cmd})
+  }).then(r=>r.json()).then(data=>{
+    if(data.output&&data.output.trim()){
+      const lines=data.output.split('\n');
+      const maxLines=80;
+      const show=lines.length>maxLines?lines.slice(0,maxLines):lines;
+      const outEntry={_type:'out',id:Date.now()+2,text:show.join('\n')};
+      addEntry(outEntry);
+      if(lines.length>maxLines){
+        const trunc={_type:'out',id:Date.now()+3,text:'... ('+(lines.length-maxLines)+' more lines truncated)'};
+        addEntry(trunc);
+      }
+    }else{
+      const outEntry={_type:'out',id:Date.now()+2,text:'(no output)'};
+      addEntry(outEntry);
+    }
+    sts.textContent='ready';
+    msg.scrollTop=msg.scrollHeight;
+  }).catch(()=>{
+    const err={_type:'out',id:Date.now()+2,text:'Error: command failed or portal disconnected'};
+    addEntry(err);
+    sts.textContent='error';
+  });
+}
+
+inp.addEventListener('keydown',function(e){
+  if(e.key==='Enter'){
+    const cmd=this.value.trim();
+    this.value='';
+    if(!cmd)return;
+    sendCmd(cmd);
+  }
+});
+
+fetchLog();setInterval(fetchLog,3000);
+</script>
+</body>
+</html>"""
+
+_portal_entries: list[Entry] = []
+
+class WebPortalHandler(BaseHTTPRequestHandler):
+    _id_counter: int = 0
+
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/" or parsed.path == "/index.html":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(_PORTAL_HTML.encode("utf-8"))
+        elif parsed.path == "/api/log":
+            n_str = urllib.parse.parse_qs(parsed.query).get("n", ["200"])[0]
+            try:
+                n = int(n_str)
+            except ValueError:
+                n = 200
+            recent = []
+            for e in _portal_entries[-n:]:
+                WebPortalHandler._id_counter += 1
+                recent.append({
+                    "id": WebPortalHandler._id_counter,
+                    "ts": e.ts.isoformat() if e.ts else None,
+                    "user": e.user,
+                    "target": e.target,
+                    "level": e.level,
+                    "event": e.event,
+                    "text": (e.text or e.raw)[:300],
+                })
+            self._json_list(recent)
+        else:
+            self.send_error(404)
+
+    def do_POST(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/command":
+            length = int(self.headers.get("Content-Length", 0))
+            if length == 0:
+                self._json_dict({"output": "", "error": "empty body"})
+                return
+            body = self.rfile.read(length).decode("utf-8", errors="replace")
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                self._json_dict({"output": "", "error": "bad json"})
+                return
+            command = data.get("command", "").strip()
+            if not command:
+                self._json_dict({"output": "", "error": "empty command"})
+                return
+            shell = _current_shell.get("shell")
+            if shell is None:
+                self._json_dict({"output": "", "error": "shell not available"})
+                return
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    shell.onecmd(command)
+                output = buf.getvalue()
+                if not output:
+                    output = shell.state.last_output or ""
+                self._json_dict({"output": output, "error": ""})
+            except Exception as exc:
+                self._json_dict({"output": "", "error": str(exc)})
+        else:
+            self.send_error(404)
+
+    def _json_dict(self, d: dict) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(d, indent=2, default=str).encode())
+
+    def _json_list(self, lst: list) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(lst, indent=2, default=str).encode())
+
+    def log_message(self, format, *args) -> None:
+        pass
+
+
+def start_portal_server(entries: list[Entry], port: int = 80,
+                        daemon: bool = True) -> HTTPServer:
+    global _portal_entries  # noqa: PLW0603
+    _portal_entries = entries
+    server = HTTPServer(("127.0.0.1", port), WebPortalHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=daemon)
+    t.start()
+    return server
+
+
 # ---------- Slack/Discord webhook (#25) ---------------------------------------
 
 def send_webhook(url: str, message: str, webhook_type: str = "slack") -> bool:
@@ -4029,6 +4251,7 @@ class ShellState:
     profile_dir: str = ""
     template_filter: str = ""
     saved_profiles: dict[str, str] = field(default_factory=dict)
+    portal_server: "HTTPServer | None" = None
 
 
 class LogShell(cmd.Cmd):
@@ -4038,7 +4261,7 @@ class LogShell(cmd.Cmd):
     )
     prompt = "(log) "
 
-    NO_CAPTURE_CMDS = {"watch"}
+    NO_CAPTURE_CMDS = {"watch", "webportal"}
     _REDIRECT_RE = re.compile(r"^(.*?)\s+(>>|>)\s+(\S+)\s*$")
 
     def __init__(self, state: ShellState) -> None:
@@ -5074,6 +5297,10 @@ class LogShell(cmd.Cmd):
         print(f"  multi_sources   = {len(st.multi_log_sources)} sources")
         if st.web_server:
             print(f"  web_server      = running (:{st.web_server.server_port})")
+        if st.portal_server:
+            print(f"  webportal       = running (:{st.portal_server.server_port})")
+        else:
+            print(f"  webportal       = (off)")
         print(f"  back/fwd        = {len(st.focus_back)}/{len(st.focus_forward)}")
 
     def do_commands(self, arg: str) -> None:
@@ -5154,6 +5381,8 @@ class LogShell(cmd.Cmd):
             ("auto_report", "auto_report", "LLM-generated narrative report."),
             ("plugin", "plugin {load|list|reload} [dir]", "Manage analysis plugins."),
             ("web", "web {start|stop|status} [port]", "Start/stop the web API server."),
+            ("webportal", "webportal {start|stop|status} [port]",
+             "Start/stop the portal (black+green chat UI, default :80)."),
             ("webhook", "webhook {set|test|clear} ...", "Configure Slack/Discord webhook."),
             ("cron", "cron [--output <path>] [--webhook-url <url>]", "Run analysis in cron mode."),
             ("templates", "templates [N]", "Extract common log line templates."),
@@ -5686,6 +5915,36 @@ class LogShell(cmd.Cmd):
             else:
                 print("(not running)")
 
+    def do_webportal(self, arg: str) -> None:
+        """webportal {start | stop | status}   Start/stop the web portal (black+green chat UI on :80)."""
+        parts = self._split(arg)
+        sub = parts[0].lower() if parts else "status"
+        if sub == "status":
+            if self.state.portal_server:
+                print(f"Web portal running at http://127.0.0.1:{self.state.portal_server.server_port}")
+            else:
+                print("(web portal not running)")
+        elif sub == "start":
+            if self.state.portal_server:
+                print("(web portal already running)")
+                return
+            port = int(parts[1]) if len(parts) > 1 else 80
+            try:
+                self.state.portal_server = start_portal_server(self.state.entries, port)
+                print(f"Web portal started at http://127.0.0.1:{port}  (black background, green text)")
+            except OSError as exc:
+                print(f"Could not start portal on port {port}: {exc}")
+                self.state.portal_server = None
+        elif sub == "stop":
+            if self.state.portal_server:
+                self.state.portal_server.shutdown()
+                self.state.portal_server = None
+                print("Web portal stopped.")
+            else:
+                print("(not running)")
+        else:
+            print("Usage: webportal {start [port] | stop | status}")
+
     # --- NEW: webhook (#25) --------------------------------------------------
     def do_webhook(self, arg: str) -> None:
         """webhook {set <url> [slack|discord] | test <message> | clear}   Configure webhook."""
@@ -6140,6 +6399,9 @@ class LogShell(cmd.Cmd):
         if self.state.web_server:
             self.state.web_server.shutdown()
             self.state.web_server = None
+        if self.state.portal_server:
+            self.state.portal_server.shutdown()
+            self.state.portal_server = None
         if self.state.llm_cache:
             self.state.llm_cache.save()
         self._save_history()
@@ -6569,6 +6831,11 @@ class LogShell(cmd.Cmd):
         return []
     def complete_web(self, text, line, begidx, endidx):
         return self._complete_prefix(text, ["start", "stop", "status"])
+    def complete_webportal(self, text, line, begidx, endidx):
+        prev = line[:begidx].split()
+        if len(prev) <= 1:
+            return self._complete_prefix(text, ["start", "stop", "status"])
+        return []
     def complete_webhook(self, text, line, begidx, endidx):
         prev = line[:begidx].split()
         if len(prev) <= 1:
