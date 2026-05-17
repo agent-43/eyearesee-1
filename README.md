@@ -1,12 +1,13 @@
-# eyearesee: IRCv3 Client with AI Detection
+# eyearesee: IRCv3 Client with AI Detection & Analysis Suite
 
-eyearesee is a sophisticated, single-file terminal-based IRC client featuring an integrated seven-signal AI text detection ensemble. It combines a robust IRCv3-compliant stack with advanced linguistic analysis to identify automated messages in real-time.
+eyearesee is a sophisticated terminal-based IRC suite featuring an integrated seven-signal AI text detection ensemble. It combines a robust IRCv3-compliant client with advanced linguistic analysis tools to identify and audit automated messages in real-time.
 
 ## Table of Contents
 - [Quick Start](#quick-start)
 - [Architecture and AI Composition](#architecture-and-ai-composition)
 - [Core IRC Features](#core-irc-features)
 - [AI Detection System](#ai-detection-system)
+- [Analysis & Monitoring (analyzelog.py)](#analysis--monitoring-analyzelogpy)
 - [Comprehensive Command Reference](#comprehensive-command-reference)
 - [Keyboard and Mouse Interactions](#keyboard-and-mouse-interactions)
 - [Dependencies](#dependencies)
@@ -48,9 +49,8 @@ The remaining **71%** comprises the core IRC protocol stack (IRCv3), curses TUI,
 
 - **Multi-Server Support:** SSL/TLS support and extensive SASL mechanisms (PLAIN, SCRAM-SHA-256, EXTERNAL, ECDSA-NIST256P-CHALLENGE).
 - **IRCv3 Compliance:** Labeled-response, message-tags (server-time, msgid), chathistory replay, multiline, monitor, WHOX, and draft extensions (react, redact, reply, mention).
-- **Protocol Handling:** Full CTCP support (VERSION, PING, TIME, CLIENTINFO, ACTION).
-- **TUI Interface:** A curses-based split-pane layout featuring a main chat window, user list, input line, and a scrollable dashboard for AI profiles and information visualization.
-- **Persistence:** Local logging of chat and AI scores (JSONL), input history, and JSON-based configuration with autojoin support.
+- **TUI Interface & Themes:** A curses-based split-pane layout with 5 built-in color themes (Classic, Hacker, Ocean, Sunset, Neon). Toggle via `/theme`.
+- **Session Persistence:** Automatic loading of historical chat logs and per-nick AI scores at startup. Persistent input history and JSON configuration.
 - **Advanced Utilities:** Auto-translation via Google Translate, link previews, inline help, plugin system, vim-style command chaining (`/chain`), and behavioural analysis.
 
 ---
@@ -69,6 +69,30 @@ The detector computes eight distinct signals for every incoming message to deter
 | **Embedding Drift**| `_embedding_variance_score()` | Sentence-BERT embedding variance against a user's recent history. |
 | **Watermark** | `watermark_score()` | Analysis of token spacing regularity and "green-red" list bias. |
 | **Timing** | `timing_anomaly_score()` | Log-normal modeling of inter-message intervals to detect automation. |
+
+---
+
+## Bouncer & Connectivity
+
+eyearesee provides advanced features for maintaining persistent connections and ensuring privacy.
+
+- **Built-in Bouncer (BNC):** Detach the TUI while keeping the IRC session alive. Incoming messages are buffered to disk (`bouncer_buffer.jsonl`) and automatically replayed when you reattach. Use `/bouncer detach` and `/bouncer attach`.
+- **ZNC Support:** Dedicated `/znc` command for seamless interaction with remote ZNC bouncers (e.g., `/znc play *chan 100`).
+- **SOCKS5 / Tor Proxy:** Native support for connecting via a SOCKS5 proxy (configured via `IRC_TOR_PROXY_HOST` and `IRC_TOR_PROXY_PORT` environment variables) for enhanced anonymity.
+- **SASL Support:** Robust implementation of modern SASL mechanisms including `ECDSA-NIST256P-CHALLENGE` for secure authentication.
+
+---
+
+## Analysis & Monitoring (analyzelog.py)
+
+The companion `analyzelog.py` utility provides professional-grade log auditing and real-time monitoring of AI scores.
+
+- **Web Portal:** A full-featured web interface (default port 80) with a retro "Hacker" aesthetic, real-time updates, and command execution.
+- **Web API:** A JSON-based API (port 8088) for log retrieval, summarization, and Prometheus-compatible metrics.
+- **Real-time Dashboard:** A terminal-based curses dashboard (`/dashboard` command) for live log monitoring and user drill-down.
+- **Alerting & Webhooks:** Automated Slack and Discord notifications for high AI detection scores.
+- **Batch Analysis:** Filter logs by time range (`--since`/`--until`), complex flags, or user similarity.
+- **Watch Mode:** Tail logs in real-time with integrated alert-engine evaluation.
 
 ---
 
@@ -96,7 +120,10 @@ The detector computes eight distinct signals for every incoming message to deter
 - `/autotranslate`, `/linkpreview`, `/dcc` (send/trust/untrust/trusted/status)
 
 ### Windows & Navigation
-- `/win`, `/close` (`/wc`), `/clear`, `/alias`, `/links`, `/list`, `/lf`, `/theme`, `/userlist`, `/znc`
+- `/win`, `/close` (`/wc`), `/clear`, `/alias`, `/links`, `/list`, `/lf`, `/theme`, `/userlist`
+
+### Bouncer & Connectivity (BNC / ZNC)
+- `/bouncer` (on|off|status|detach|attach|replay|clear), `/detach`, `/attach`, `/znc`
 
 ### Connection & Services
 - `/server`, `/reconnect`, `/replay`, `/register`, `/pem`, `/ns`, `/cs`, `/ctcp`
@@ -128,9 +155,11 @@ Required dependencies are automatically installed via pip on startup unless `--n
 - **transformers / torch:** Powers the AI detection ensemble.
 - **anthropic / openai:** Required for LLM-based features like `/askai` and `/summarize`.
 - **cryptography:** (Optional) Required for SASL ECDSA-NIST256P-CHALLENGE support.
+- **matplotlib / pandas:** (Optional) Used by `analyzelog.py` for advanced visualization and analysis.
 
 ---
 
 ## Summary
 
-eyearesee is an ambitious single-file project that bridges the gap between traditional IRC communication and modern AI analysis. It provides a polished, feature-rich IRCv3 experience alongside powerful tools for auditing and interacting with AI-generated content in real-time.
+eyearesee is an ambitious IRC suite that bridges the gap between traditional communication and modern AI analysis. It provides a polished, feature-rich IRCv3 experience alongside powerful tools for auditing and interacting with AI-generated content in real-time.
+
