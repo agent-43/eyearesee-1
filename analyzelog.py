@@ -4016,16 +4016,16 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   #tabs button.active{color:#0f0;border-color:#0f0;background:#001a00}
   #main{display:flex;flex:1;overflow:hidden}
   #left{flex:1;display:flex;flex-direction:column;overflow:hidden;border-right:1px solid #030}
-  #right{width:420px;display:flex;flex-direction:column;overflow:hidden;flex-shrink:0}
+  #right{min-width:380px;flex:0 0 40%;display:flex;flex-direction:column;overflow:hidden}
   .tab-content{display:none;flex-direction:column;flex:1;overflow:hidden}
   .tab-content.active{display:flex}
   #messages{flex:1;overflow-y:auto;padding:6px 10px;font-size:13px;line-height:1.5}
-  #messages .msg{padding:1px 0;border-bottom:1px solid #001a00;animation:fadeIn .15s}
+  #messages .msg{padding:2px 0;border-bottom:1px solid #001a00;animation:fadeIn .15s;display:flex;align-items:baseline;gap:4px;overflow:hidden}
   @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
-  .ts{color:#060}
-  .user{color:#0f0;font-weight:bold}
-  .lvl{color:#0a0}
-  .txt{color:#0c0}
+  .ts{color:#060;white-space:nowrap;flex-shrink:0;font-size:11px}
+  .user{color:#0f0;font-weight:bold;white-space:nowrap;flex-shrink:0;max-width:30%;overflow:hidden;text-overflow:ellipsis}
+  .lvl{color:#0a0;white-space:nowrap;flex-shrink:0;max-width:20%;overflow:hidden;text-overflow:ellipsis}
+  .txt{color:#0c0;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .highlight{background:#0f01;border-left:2px solid #0f0;padding-left:6px}
   .cmd{color:#ff0;font-weight:bold;border-left:2px solid #ff0;padding-left:6px;margin-top:4px}
   .out{color:#0f0;white-space:pre-wrap;padding-left:6px;margin-bottom:4px;border-left:2px solid #060}
@@ -4033,9 +4033,9 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   #menu{flex:1;overflow-y:auto;padding:10px 14px;font-size:12px;line-height:1.5}
   #menu .mc{color:#060;font-size:11px;margin-bottom:6px;padding-bottom:3px;border-bottom:1px solid #030}
   #menu .mr{display:flex;padding:1px 0}
-  #menu .mr .mn{color:#0f0;width:110px;flex-shrink:0;font-weight:bold}
-  #menu .mr .mu{color:#080;width:160px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  #menu .mr .md{color:#0a0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #menu .mr .mn{color:#0f0;width:110px;flex-shrink:0;font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #menu .mr .mu{color:#080;width:140px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #menu .mr .md{color:#0a0;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #menu .mr:hover{background:#0f01}
   #dash{flex:1;overflow-y:auto;padding:10px 14px;font-size:13px;line-height:1.6}
   #dash .dg{margin-bottom:14px}
@@ -4046,9 +4046,9 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   #dash .dg .row .k{color:#080}
   #dash .dg .row .v{color:#0f0}
   #dash .bar{display:flex;align-items:center;gap:6px;margin:1px 0}
-  #dash .bar .bk{color:#060;width:20px;text-align:right;font-size:11px;flex-shrink:0}
+  #dash .bar .bk{color:#0f0;width:90px;text-align:right;font-size:11px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:bold}
   #dash .bar .bf{height:12px;background:#0f0;border-radius:1px;min-width:2px;transition:width .3s}
-  #dash .bar .bv{color:#0f0;font-size:11px;flex-shrink:0}
+  #dash .bar .bv{color:#060;font-size:11px;flex-shrink:0;width:30px;text-align:right}
   #dash .dp{color:#030;font-size:10px}
   #dash .dph{display:flex;align-items:flex-end;gap:2px;padding:4px 0;height:50px}
   #dash .dph .hb{width:20px;background:#0f0;border-radius:1px 1px 0 0;min-height:1px;transition:height .3s}
@@ -4381,6 +4381,16 @@ class WebPortalHandler(BaseHTTPRequestHandler):
 def start_portal_server(entries: list[Entry], port: int = 80,
                         daemon: bool = True) -> HTTPServer:
     global _portal_entries  # noqa: PLW0603
+    if not entries:
+        log_path = os.path.join(os.getcwd(), "ai_scores.log")
+        if os.path.isfile(log_path):
+            try:
+                entries = list(iter_entries(log_path))
+                print(f"Auto-loaded {len(entries)} entries from {log_path}")
+            except Exception as exc:
+                print(f"Could not auto-load {log_path}: {exc}", file=sys.stderr)
+        else:
+            print(f"(no entries provided and {log_path} not found; portal will be empty)")
     _portal_entries = entries
     server = HTTPServer(("127.0.0.1", port), WebPortalHandler)
     t = threading.Thread(target=server.serve_forever, daemon=daemon)
