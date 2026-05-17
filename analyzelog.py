@@ -3939,6 +3939,67 @@ def start_web_server(port: int = 8088, daemon: bool = True) -> HTTPServer:
 
 # ---------- NEW: Web Portal (#30) ----------------------------------------------
 
+PORTAL_COMMANDS: list[tuple[str, str, str]] = [
+    ("report", "report [user]", "Full stats report."),
+    ("users", "users [N]", "Top N users by activity."),
+    ("events", "events [N]", "Top N event types."),
+    ("focus", "focus <nick>", "Filter view to a user."),
+    ("target", "target <chan>", "Filter view to a channel."),
+    ("since", "since <when>", "Lower time bound (ISO / '5h ago')."),
+    ("until", "until <when>", "Upper time bound."),
+    ("top", "top <what> [N]", "Show a top-N ranking."),
+    ("hours", "hours [compact]", "Hour-of-day histogram."),
+    ("days", "days [compact]", "Date histogram."),
+    ("errors", "errors", "Error-like entries."),
+    ("grep", "grep <regex>", "Regex search (cap 50)."),
+    ("search", "search <text>", "Free-text search."),
+    ("show", "show [nick] [N]", "Print raw lines for user."),
+    ("pick", "pick <N>", "Focus Nth item from last listing."),
+    ("inspect", "inspect <N>", "Full details for Nth entry."),
+    ("last", "last", "Re-print last output."),
+    ("info", "info [user]", "One-line user summary."),
+    ("settings", "settings", "Show current settings."),
+    ("set", "set <key> <val>", "Set config (top, llm_url, ...)."),
+    ("alias", "alias [<name>=<cmd>]", "Define/list/remove aliases."),
+    ("ignore", "ignore [add|drop|list]", "Manage ignore list."),
+    ("note", "note <user> [text]", "Attach/del user note."),
+    ("analyze", "analyze [nick]", "LLM behavior analysis."),
+    ("ask", 'ask [nick] "Q"', "Free-form LLM question."),
+    ("interact", "interact <A> <B>", "User interaction analysis."),
+    ("compare", "compare <A> <B>...", "Multi-user comparison."),
+    ("similar", "similar [threshold]", "Find similar user pairs."),
+    ("bursts", "bursts [user]", "Detect activity bursts."),
+    ("threads", "threads [user]", "Reply/mention reconstruction."),
+    ("edges", "edges [N]", "Top interaction edges."),
+    ("sessions", "sessions [user]", "Detect user sessions."),
+    ("dist", "dist [user]", "Score distributions."),
+    ("zscores", "zscores [user]", "Per-score z-scores."),
+    ("flagged", "flagged <expr>", "Lines matching score expr."),
+    ("diff", "diff <other.log>", "Diff against another log."),
+    ("export", "export <type> <path>", "Serialize data."),
+    ("view", "view {save|load|drop|show}", "Named filter sets."),
+    ("script", "script <path>", "Run commands from file."),
+    ("entities", "entities [user]", "Forensic entity extraction."),
+    ("gaps", "gaps [user]", "Detect timeline gaps."),
+    ("reconstruct", "reconstruct [user]", "Chronological timeline."),
+    ("forensic_report", "forensic_report <user>", "LLM forensic report."),
+    ("timeline_narrative", "timeline_narrative <user>", "LLM timeline story."),
+    ("evidence", "evidence <user>", "LLM evidence extraction."),
+    ("web", "web {start|stop|status}", "Web API server."),
+    ("webportal", "webportal {start|stop|status}", "Portal server."),
+    ("webhook", "webhook {set|test|clear}", "Slack/Discord webhook."),
+    ("cron", "cron [--output <path>]", "Cron mode analysis."),
+    ("dashboard", "dashboard", "Curses real-time dashboard."),
+    ("watch", "watch [poll_sec]", "Tail log file."),
+    ("chart", "chart <type> <path>", "Generate matplotlib chart."),
+    ("rules", "rules [add|remove|toggle]", "Alert rules."),
+    ("save_config", "save_config", "Persist config to disk."),
+    ("load_config", "load_config", "Reload config from disk."),
+    ("commands", "commands", "Print this reference."),
+    ("help", "help [name]", "Built-in help."),
+    ("quit", "quit", "Exit the shell."),
+]
+
 _PORTAL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3947,8 +4008,17 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   body{background:#000;color:#0f0;font-family:'Courier New',monospace;height:100vh;display:flex;flex-direction:column;overflow:hidden}
-  #header{padding:6px 10px;border-bottom:1px solid #030;font-size:12px;color:#080;display:flex;justify-content:space-between}
+  #header{padding:6px 10px;border-bottom:1px solid #030;font-size:12px;color:#080;display:flex;justify-content:space-between;align-items:center;flex-shrink:0}
   #header span{color:#0f0}
+  #tabs{display:flex;gap:0;border-bottom:1px solid #030;flex-shrink:0}
+  #tabs button{background:#000;color:#060;border:1px solid #030;border-bottom:none;padding:5px 16px;font-family:'Courier New',monospace;font-size:12px;cursor:pointer;border-radius:3px 3px 0 0}
+  #tabs button:hover{color:#0f0;border-color:#060}
+  #tabs button.active{color:#0f0;border-color:#0f0;background:#001a00}
+  #main{display:flex;flex:1;overflow:hidden}
+  #left{flex:1;display:flex;flex-direction:column;overflow:hidden;border-right:1px solid #030}
+  #right{width:420px;display:flex;flex-direction:column;overflow:hidden;flex-shrink:0}
+  .tab-content{display:none;flex-direction:column;flex:1;overflow:hidden}
+  .tab-content.active{display:flex}
   #messages{flex:1;overflow-y:auto;padding:6px 10px;font-size:13px;line-height:1.5}
   #messages .msg{padding:1px 0;border-bottom:1px solid #001a00;animation:fadeIn .15s}
   @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
@@ -3960,7 +4030,34 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   .cmd{color:#ff0;font-weight:bold;border-left:2px solid #ff0;padding-left:6px;margin-top:4px}
   .out{color:#0f0;white-space:pre-wrap;padding-left:6px;margin-bottom:4px;border-left:2px solid #060}
   .sep{color:#030;text-align:center;font-size:10px;padding:4px 0}
-  #footer{display:flex;align-items:center;border-top:1px solid #030;padding:6px 10px;gap:6px;background:#000}
+  #menu{flex:1;overflow-y:auto;padding:10px 14px;font-size:12px;line-height:1.5}
+  #menu .mc{color:#060;font-size:11px;margin-bottom:6px;padding-bottom:3px;border-bottom:1px solid #030}
+  #menu .mr{display:flex;padding:1px 0}
+  #menu .mr .mn{color:#0f0;width:110px;flex-shrink:0;font-weight:bold}
+  #menu .mr .mu{color:#080;width:160px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #menu .mr .md{color:#0a0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #menu .mr:hover{background:#0f01}
+  #dash{flex:1;overflow-y:auto;padding:10px 14px;font-size:13px;line-height:1.6}
+  #dash .dg{margin-bottom:14px}
+  #dash .dg h3{color:#0f0;font-size:13px;margin-bottom:4px;border-bottom:1px solid #030;padding-bottom:2px}
+  #dash .dg .num{color:#0f0;font-size:22px;font-weight:bold}
+  #dash .dg .lbl{color:#060;font-size:11px}
+  #dash .dg .row{display:flex;justify-content:space-between;padding:1px 0}
+  #dash .dg .row .k{color:#080}
+  #dash .dg .row .v{color:#0f0}
+  #dash .bar{display:flex;align-items:center;gap:6px;margin:1px 0}
+  #dash .bar .bk{color:#060;width:20px;text-align:right;font-size:11px;flex-shrink:0}
+  #dash .bar .bf{height:12px;background:#0f0;border-radius:1px;min-width:2px;transition:width .3s}
+  #dash .bar .bv{color:#0f0;font-size:11px;flex-shrink:0}
+  #dash .dp{color:#030;font-size:10px}
+  #dash .dph{display:flex;align-items:flex-end;gap:2px;padding:4px 0;height:50px}
+  #dash .dph .hb{width:20px;background:#0f0;border-radius:1px 1px 0 0;min-height:1px;transition:height .3s}
+  #dash .dph .hbl{color:#060;font-size:9px;text-align:center;width:20px;padding-top:2px}
+  #dash .dpd{display:flex;align-items:flex-end;gap:1px;padding:4px 0;height:36px;overflow-x:auto}
+  #dash .dpd .db{width:8px;background:#0f0;border-radius:1px 1px 0 0;min-height:1px;flex-shrink:0;transition:height .15s}
+  #dash .errs{color:#f00;font-size:11px}
+  #dash .errs .er{color:#f44;padding:1px 0;border-bottom:1px solid #300;white-space:pre-wrap;overflow:hidden;text-overflow:ellipsis;max-height:40px}
+  #footer{display:flex;align-items:center;border-top:1px solid #030;padding:6px 10px;gap:6px;background:#000;flex-shrink:0}
   #footer .prompt{color:#0f0;font-weight:bold}
   #footer input{flex:1;background:#000;color:#0f0;border:1px solid #030;padding:7px 10px;font-family:'Courier New',monospace;font-size:13px;outline:none}
   #footer input:focus{border-color:#0f0}
@@ -3972,17 +4069,42 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<div id="header">analyzelog portal <span id="count">0</span> entries <span id="info"></span></div>
-<div id="messages"></div>
-<div id="footer">
-  <span class="prompt">$</span>
-  <input id="input" type="text" placeholder="type a command and press Enter" autofocus spellcheck="false">
-  <span id="status">ready</span>
+<div id="header">analyzelog portal <span id="count">0</span> entries</div>
+<div id="tabs">
+  <button id="tabMenu" class="active" onclick="switchTab('menu')">Main Menu</button>
+  <button id="tabDash" onclick="switchTab('dash')">Dashboard</button>
+</div>
+<div id="main">
+  <div id="left">
+    <div id="tabMenuView" class="tab-content active"><div id="menu"></div></div>
+    <div id="tabDashView" class="tab-content"><div id="dash"></div></div>
+  </div>
+  <div id="right">
+    <div id="messages"></div>
+    <div id="footer">
+      <span class="prompt">$</span>
+      <input id="input" type="text" placeholder="type a command and press Enter" autofocus spellcheck="false">
+      <span id="status">ready</span>
+    </div>
+  </div>
 </div>
 <script>
 const el=document.getElementById.bind(document);
-const msg=el('messages'), inp=el('input'), cnt=el('count'), sts=el('status'), inf=el('info');
-let lastId=0;
+const msg=el('messages'), menu=el('menu'), dash=el('dash'), inp=el('input'), cnt=el('count'), sts=el('status');
+let lastId=0, activeTab='menu', cmds=null;
+
+function switchTab(tab){
+  activeTab=tab;
+  el('tabMenu').className=tab==='menu'?'active':'';
+  el('tabDash').className=tab==='dash'?'active':'';
+  el('tabMenuView').className='tab-content'+(tab==='menu'?' active':'');
+  el('tabDashView').className='tab-content'+(tab==='dash'?' active':'');
+  if(tab==='menu'&&!cmds)fetchCmds();
+  if(tab==='dash'&&!dash.dataset.loaded)fetchDash();
+}
+
+let nearBottom=true;
+msg.addEventListener('scroll',function(){nearBottom=msg.scrollHeight-msg.scrollTop-msg.clientHeight<60;});
 
 function addEntry(e){
   const d=document.createElement('div');d.className='msg';
@@ -4000,7 +4122,7 @@ function addEntry(e){
     d.append(ts,us,lv,tx);
   }
   msg.append(d);
-  msg.scrollTop=msg.scrollHeight;
+  if(nearBottom)msg.scrollTop=msg.scrollHeight;
 }
 
 function fetchLog(){
@@ -4010,12 +4132,102 @@ function fetchLog(){
     if(startFrom>0&&startFrom<data.length){
       data.slice(startFrom).forEach(addEntry);
     }else if(!lastId&&data.length){
+      const wasNear=nearBottom;
       msg.innerHTML='';data.forEach(addEntry);
+      if(wasNear)msg.scrollTop=msg.scrollHeight;
     }
     if(data.length)lastId=data[data.length-1].id;
-    msg.scrollTop=msg.scrollHeight;
+    if(nearBottom)msg.scrollTop=msg.scrollHeight;
   }).catch(()=>{});
 }
+
+function renderMenu(data){
+  cmds=data;
+  var html='<div class="mc">available commands — '+data.length+' total</div>';
+  var cat='';var order=['analysis','viewing','filters','forensic','config','system'];
+  var cats={'analysis':['report','users','events','top','hours','days','errors','dist','zscores','flagged','sessions','bursts','edges','threads','similar','diff','chart'],
+            'viewing':['show','pick','inspect','last','info','grep','search'],
+            'filters':['focus','target','since','until','view','ignore'],
+            'forensic':['entities','gaps','reconstruct','forensic_report','timeline_narrative','evidence'],
+            'config':['settings','set','alias','note','save_config','load_config','rules','web','webportal','webhook'],
+            'llm':['analyze','ask','interact','compare'],
+            'system':['commands','help','quit','script','export','cron','dashboard','watch']};
+  var catLabel={'analysis':'analysis','viewing':'viewing','filters':'filters','forensic':'forensic','config':'config','llm':'llm','system':'system'};
+  var done={};
+  for(var ci=0;ci<order.length;ci++){
+    var g=order[ci];var items=cats[g];
+    if(!items)continue;
+    html+='<div class="mc">'+catLabel[g]+'</div>';
+    for(var ii=0;ii<items.length;ii++){
+      done[items[ii]]=true;
+      for(var di=0;di<data.length;di++){
+        if(data[di][0]===items[ii]){
+          html+='<div class="mr"><span class="mn">'+esc(data[di][0])+'</span><span class="mu">'+esc(data[di][1])+'</span><span class="md">'+esc(data[di][2])+'</span></div>';
+          break;
+        }
+      }
+    }
+  }
+  menu.innerHTML=html;
+}
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+function fetchCmds(){fetch('/api/commands').then(r=>r.json()).then(function(d){renderMenu(d);}).catch(function(){});}
+
+function renderDash(d){
+  dash.dataset.loaded='1';
+  var html='';
+  html+='<div class="dg"><div class="num">'+d.total+'</div><div class="lbl">total entries</div></div>';
+  html+='<div class="dg"><span class="lbl">'+(d.first_ts||'?')+'</span> &rarr; <span class="lbl">'+(d.last_ts||'?')+'</span></div>';
+  var maxUser=d.top_users&&d.top_users.length?d.top_users[0][1]:1;
+  html+='<div class="dg"><h3>top users</h3>';
+  if(d.top_users)for(var i=0;i<d.top_users.length;i++){
+    var u=d.top_users[i],pct=Math.round(u[1]/maxUser*100);
+    html+='<div class="bar"><span class="bk">'+esc(u[0])+'</span><div class="bf" style="width:'+pct+'%"></div><span class="bv">'+u[1]+'</span></div>';
+  }
+  html+='</div>';
+  var maxHour=1;
+  if(d.by_hour)for(var k in d.by_hour)if(d.by_hour[k]>maxHour)maxHour=d.by_hour[k];
+  html+='<div class="dg"><h3>activity by hour</h3><div class="dph">';
+  for(var h=0;h<24;h++){
+    var hv=d.by_hour&&d.by_hour[h]?d.by_hour[h]:0;
+    var ht=Math.round(hv/maxHour*44)+1;
+    html+='<div><div class="hb" style="height:'+ht+'px" title="'+h+':00 = '+hv+'"></div><div class="hbl">'+h+'</div></div>';
+  }
+  html+='</div></div>';
+  var maxDay=1,dayKeys=[];
+  if(d.by_day){for(var k in d.by_day){dayKeys.push(k);if(d.by_day[k]>maxDay)maxDay=d.by_day[k];}}
+  dayKeys.sort();var showDays=dayKeys.slice(-60);
+  html+='<div class="dg"><h3>daily activity (last 60 days)</h3><div class="dpd">';
+  for(var i=0;i<showDays.length;i++){
+    var dv=d.by_day[showDays[i]],dt=Math.round(dv/maxDay*30)+1;
+    html+='<div class="db" style="height:'+dt+'px" title="'+showDays[i]+' = '+dv+'"></div>';
+  }
+  html+='</div></div>';
+  html+='<div class="dg"><h3>top events</h3>';
+  if(d.top_events)for(var i=0;i<d.top_events.length;i++){
+    html+='<div class="row"><span class="k">'+esc(d.top_events[i][0])+'</span><span class="v">'+d.top_events[i][1]+'</span></div>';
+  }
+  html+='</div>';
+  html+='<div class="dg"><h3>levels</h3>';
+  if(d.levels)for(var k in d.levels){
+    html+='<div class="row"><span class="k">'+k+'</span><span class="v">'+d.levels[k]+'</span></div>';
+  }
+  html+='</div>';
+  if(d.errors&&d.errors.length){
+    html+='<div class="dg"><h3>errors &amp; warnings ('+d.errors.length+')</h3><div class="errs">';
+    for(var i=0;i<Math.min(d.errors.length,10);i++){
+      html+='<div class="er">'+esc(d.errors[i])+'</div>';
+    }
+    if(d.errors.length>10)html+='<div class="dp">... and '+(d.errors.length-10)+' more</div>';
+    html+='</div></div>';
+  }
+  html+='<div class="dg" style="margin-top:10px"><span class="lbl">last updated: '+new Date().toLocaleTimeString()+'</span></div>';
+  dash.innerHTML=html;
+}
+
+function fetchDash(){fetch('/api/dashboard').then(r=>r.json()).then(function(d){renderDash(d);}).catch(function(){});}
 
 function sendCmd(cmd){
   sts.textContent='executing...';
@@ -4043,7 +4255,7 @@ function sendCmd(cmd){
       addEntry(outEntry);
     }
     sts.textContent='ready';
-    msg.scrollTop=msg.scrollHeight;
+    if(nearBottom)msg.scrollTop=msg.scrollHeight;
   }).catch(()=>{
     const err={_type:'out',id:Date.now()+2,text:'Error: command failed or portal disconnected'};
     addEntry(err);
@@ -4061,6 +4273,8 @@ inp.addEventListener('keydown',function(e){
 });
 
 fetchLog();setInterval(fetchLog,3000);
+fetchCmds();
+setInterval(function(){if(activeTab==='dash')fetchDash();},5000);
 </script>
 </body>
 </html>"""
@@ -4096,6 +4310,21 @@ class WebPortalHandler(BaseHTTPRequestHandler):
                     "text": (e.text or e.raw)[:300],
                 })
             self._json_list(recent)
+        elif parsed.path == "/api/dashboard":
+            s = summarize(_portal_entries, 10)
+            self._json_dict({
+                "total": s["total"],
+                "first_ts": s["first_ts"].isoformat() if s["first_ts"] else None,
+                "last_ts": s["last_ts"].isoformat() if s["last_ts"] else None,
+                "top_users": s["top_users"],
+                "top_events": s["top_events"],
+                "levels": s["levels"],
+                "by_hour": s["by_hour"],
+                "by_day": s["by_day"],
+                "errors": s["errors"],
+            })
+        elif parsed.path == "/api/commands":
+            self._json_list(PORTAL_COMMANDS)
         else:
             self.send_error(404)
 
