@@ -58,6 +58,16 @@ except ImportError:
     OPENAI_AVAILABLE = False
 
 # =========================
+# Google Gemini (optional)
+# =========================
+try:
+    from google import genai as _gemini_mod
+    GEMINI_AVAILABLE = True
+except ImportError:
+    _gemini_mod = None  # type: ignore
+    GEMINI_AVAILABLE = False
+
+# =========================
 # cryptography (optional — needed for SASL ECDSA-NIST256P-CHALLENGE)
 # =========================
 try:
@@ -105,7 +115,13 @@ except ModuleNotFoundError:
             sys.exit("windows-curses not found and --no-install is set. "
                      "Run without --no-install or: pip install windows-curses")
         print("windows-curses not found — installing...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "windows-curses"])
+        import shutil
+        _pip_cmd: list = []
+        if shutil.which("uv"):
+            _pip_cmd = ["uv", "pip", "install", "windows-curses"]
+        else:
+            _pip_cmd = [sys.executable, "-m", "pip", "install", "windows-curses"]
+        subprocess.check_call(_pip_cmd)
     import curses
 
 # =========================
@@ -165,6 +181,7 @@ STS_POLICY_PATH    = os.path.join(_SCRIPT_DIR, "sts_policies.json")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
 DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY", "")
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
 # Ollama: local/offline LLM server.  Override with OLLAMA_URL env var if running elsewhere.
 OLLAMA_URL: str    = os.environ.get("OLLAMA_URL",    "http://127.0.0.1:11434")
@@ -192,6 +209,10 @@ AI_MODELS: Dict[str, Dict[str, str]] = {
     # ── Cloud: DeepSeek ──────────────────────────────────────────────────
     "deepseek": {"provider": "deepseek", "id": "deepseek-chat",     "label": "DeepSeek-V3"},
     "dsr1":     {"provider": "deepseek", "id": "deepseek-reasoner", "label": "DeepSeek-R1"},
+    # ── Cloud: Google Gemini ────────────────────────────────────────────
+    "gemini-flash": {"provider": "gemini", "id": "gemini-2.0-flash",  "label": "Gemini 2.0 Flash"},
+    "gemini-pro":   {"provider": "gemini", "id": "gemini-2.0-pro",    "label": "Gemini 2.0 Pro"},
+    "gemini-15p":   {"provider": "gemini", "id": "gemini-1.5-pro",    "label": "Gemini 1.5 Pro"},
     # ── Cloud: GitHub Copilot ────────────────────────────────────────────
     "copilot":  {"provider": "copilot",  "id": "gpt-4o",            "label": "Copilot GPT-4o"},
     "copilot-mini": {"provider": "copilot", "id": "gpt-4o-mini",    "label": "Copilot GPT-4o-mini"},
@@ -1598,6 +1619,28 @@ def _llamacpp_blocking_call(model_id: str, prompt: str, max_tokens: int) -> Tupl
         return f"[error] llama.cpp call failed: {exc}", "?"
 
 
+def _gemini_blocking_call(model_id: str, prompt: str, max_tokens: int) -> Tuple[str, str]:
+    """Synchronous call to the Gemini API via google.genai SDK (run via executor).
+
+    Requires the google-genai package and GEMINI_API_KEY env var.
+    """
+    if not GEMINI_AVAILABLE:
+        return "[error] google-genai package not installed — run: pip install google-genai", "?"
+    try:
+        client  = _gemini_mod.Client(api_key=GEMINI_API_KEY)
+        from google.genai import types as _gemini_types
+        resp = client.models.generate_content(
+            model=model_id,
+            contents=prompt,
+            config=_gemini_types.GenerateContentConfig(max_output_tokens=max_tokens),
+        )
+        answer = resp.text if resp.text else "(empty response)"
+        # Gemini does not expose usage in the sync client easily; report "?"
+        return answer, "?"
+    except Exception as exc:
+        return f"[error] Gemini call failed: {exc}", "?"
+
+
 async def _llm_classify_ai(text: str, model_key: str) -> float:
     """Ask the active /model to classify *text* as AI- or human-written.
 
@@ -1668,6 +1711,12 @@ async def _llm_classify_ai(text: str, model_key: str) -> float:
             loop   = asyncio.get_running_loop()
             answer, _ = await loop.run_in_executor(
                 _IO_EXECUTOR, _llamacpp_blocking_call, model_id, prompt, 10)
+        elif provider == "gemini":
+            if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
+                return 0.0
+            loop   = asyncio.get_running_loop()
+            answer, _ = await loop.run_in_executor(
+                _IO_EXECUTOR, _gemini_blocking_call, model_id, prompt, 10)
         else:
             return 0.0
 
@@ -3905,9 +3954,9 @@ class IRCClient:
             "port": port_int, "duration": duration_int, "timestamp": now,
         }
         self._save_sts_policies()
+        _expires = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now + duration_int))
         msg = (f"[STS] Pinned policy for {self.server}: SSL port {port}, "
-               f"duration={duration_int}s (expires {time.strftime('%Y-%m-%d %H:%M:%S',
-                     time.localtime(now + duration_int))})")
+               f"duration={duration_int}s (expires {_expires})")
         try:
             self.ui_queue.put_nowait(("status", msg))
         except Exception:
@@ -5717,6 +5766,7 @@ class TUI:
         self._anthropic_client = None                    # reuse HTTP connection pool
         self._openai_client    = None
         self._deepseek_client  = None
+        self._gemini_client    = None
         self._copilot_client   = None
 
         # Pre-compute curses attributes (avoids repeated function calls every frame)
@@ -6385,6 +6435,32 @@ class TUI:
                 return answer, tokens
             except Exception as exc:
                 self._copilot_client = None
+                return f"[error] {exc}", "?"
+
+        if provider == "gemini":
+            if not GEMINI_AVAILABLE:
+                return ("[error] google-genai package not installed — "
+                        "run: pip install google-genai"), "?"
+            if not GEMINI_API_KEY:
+                return ("[error] GEMINI_API_KEY not set — "
+                        "set the environment variable and restart"), "?"
+            try:
+                if self._gemini_client is None:
+                    self._gemini_client = _gemini_mod.aio.Client(
+                        api_key=GEMINI_API_KEY)
+                from google.genai import types as _gemini_types
+                resp = await self._gemini_client.models.generate_content(
+                    model=model_id,
+                    contents=prompt,
+                    config=_gemini_types.GenerateContentConfig(max_output_tokens=max_tokens),
+                )
+                answer = resp.text if resp.text else "(empty response)"
+                # Gemini usage metadata available via resp.usage_metadata
+                usage  = getattr(resp, "usage_metadata", None)
+                tokens = str(usage.total_token_count) if usage else "?"
+                return answer, tokens
+            except Exception as exc:
+                self._gemini_client = None
                 return f"[error] {exc}", "?"
 
         if provider == "ollama":
@@ -9005,6 +9081,8 @@ class TUI:
                     avail = "  (OPENAI_API_KEY not set)"
                 elif spec["provider"] == "deepseek" and not DEEPSEEK_API_KEY:
                     avail = "  (DEEPSEEK_API_KEY not set)"
+                elif spec["provider"] == "gemini" and not GEMINI_API_KEY:
+                    avail = "  (GEMINI_API_KEY not set)"
                 elif spec["provider"] == "copilot" and not GITHUB_TOKEN:
                     avail = "  (GITHUB_TOKEN not set)"
                 sw.add_line(f"  {chat_mark}{det_mark} {k:<8} {spec['label']:<22} [{spec['provider']}]{avail}")
@@ -9026,8 +9104,8 @@ class TUI:
                 f"Unknown model '{key}'. Available: {keys}  (current: {self.ai_chat_model})"))
 
     async def _slash_api(self, args, extra, line):
-        global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GITHUB_TOKEN, OLLAMA_URL, LLAMACPP_URL
-        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "GITHUB_TOKEN", "OLLAMA_URL", "LLAMACPP_URL"}
+        global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, GITHUB_TOKEN, OLLAMA_URL, LLAMACPP_URL
+        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY", "GITHUB_TOKEN", "OLLAMA_URL", "LLAMACPP_URL"}
 
         if not args:
             sw = self._status_win()
@@ -9045,6 +9123,7 @@ class TUI:
                 ("Claude",    "ANTHROPIC_API_KEY", ANTHROPIC_API_KEY, "console.anthropic.com"),
                 ("OpenAI",    "OPENAI_API_KEY",    OPENAI_API_KEY,    "platform.openai.com"),
                 ("DeepSeek",  "DEEPSEEK_API_KEY",  DEEPSEEK_API_KEY,  "platform.deepseek.com"),
+                ("Gemini",    "GEMINI_API_KEY",     GEMINI_API_KEY,    "aistudio.google.com/apikey"),
                 ("Copilot",   "GITHUB_TOKEN",       GITHUB_TOKEN,      "github.com/settings/tokens"),
                 ("Ollama",    "OLLAMA_URL",         OLLAMA_URL,        "local server — no key needed"),
                 ("llama.cpp", "LLAMACPP_URL",       LLAMACPP_URL,      "local server — no key needed"),
@@ -9056,6 +9135,7 @@ class TUI:
             sw.add_line("  Set a key:  /api <VAR_NAME> <value>")
             sw.add_line("    /api ANTHROPIC_API_KEY  sk-ant-api03-...")
             sw.add_line("    /api OPENAI_API_KEY     sk-proj-...")
+            sw.add_line("    /api GEMINI_API_KEY     AIzaSy...")
             sw.add_line("    /api OLLAMA_URL         http://192.168.1.10:11434")
             sw.add_line("    /api LLAMACPP_URL       http://192.168.1.10:8033")
             sw.add_line("")
@@ -9079,6 +9159,9 @@ class TUI:
             elif var_name == "DEEPSEEK_API_KEY":
                 DEEPSEEK_API_KEY = value
                 self._deepseek_client = None   # force reconnect with new key
+            elif var_name == "GEMINI_API_KEY":
+                GEMINI_API_KEY = value
+                self._gemini_client = None     # force reconnect with new key
             elif var_name == "GITHUB_TOKEN":
                 GITHUB_TOKEN = value
                 self._copilot_client = None    # force reconnect with new key
@@ -9092,7 +9175,7 @@ class TUI:
             return
 
         await self.ui_queue.put(("status",
-            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  DEEPSEEK_API_KEY  GITHUB_TOKEN  OLLAMA_URL  LLAMACPP_URL"))
+            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  DEEPSEEK_API_KEY  GEMINI_API_KEY  GITHUB_TOKEN  OLLAMA_URL  LLAMACPP_URL"))
 
     async def _slash_znc(self, args, extra, line):
         text = (args + " " + extra).strip()
@@ -9570,8 +9653,9 @@ class TUI:
             sw.add_line("  No similar users found" +
                         (f"  (min similarity: {min_sim:.2f})" if min_sim > 0 else ""))
         else:
+            _hr = '\u2500'
             sw.add_line(f"  {'Nick':<20} {'Sim':>6}  {'Msgs':>5}")
-            sw.add_line(f"  {'\u2500'*20} {'\u2500'*6}  {'\u2500'*5}")
+            sw.add_line(f"  {_hr*20} {_hr*6}  {_hr*5}")
             for sim, nick_l, msg_count in results[:20]:
                 sw.add_line(f"  {nick_l:<20} {sim*100:5.1f}%  {msg_count:>5}")
         sw.add_line(f"\u2500\u2500 {len(results)} matches, showing top 20 \u2500\u2500")
@@ -9637,8 +9721,9 @@ class TUI:
         if not connections:
             sw.add_line("  No social connections found.")
         else:
+            _hr = '\u2500'
             sw.add_line(f"  {'Nick':<20} {'Str':>5}  {'Adj':>4} {'Tgt':>4} {'Inv':>4}")
-            sw.add_line(f"  {'\u2500'*20} {'\u2500'*5}  {'\u2500'*4} {'\u2500'*4} {'\u2500'*4}")
+            sw.add_line(f"  {_hr*20} {_hr*5}  {_hr*4} {_hr*4} {_hr*4}")
             for combined, other, adj_score, tgt_score, inv_score in connections[:20]:
                 sw.add_line(
                     f"  {other:<20} {combined:4.0f}%  "
@@ -11251,7 +11336,7 @@ def main():
 
     global DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, DEFAULT_CHANNEL
     global NICKSERV_PASSWORD, SASL_MECHANISM, SASL_CERT, SASL_KEY
-    global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GITHUB_TOKEN
+    global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, GITHUB_TOKEN
     global OLLAMA_URL, LLAMACPP_URL
 
     # Ensure the pre-curses terminal output can render Unicode box-drawing
@@ -11374,6 +11459,7 @@ def main():
     ANTHROPIC_API_KEY = _prompt_key("Anthropic API key", ANTHROPIC_API_KEY)
     OPENAI_API_KEY    = _prompt_key("OpenAI API key",    OPENAI_API_KEY)
     DEEPSEEK_API_KEY  = _prompt_key("DeepSeek API key",  DEEPSEEK_API_KEY)
+    GEMINI_API_KEY    = _prompt_key("Gemini API key",     GEMINI_API_KEY)
     GITHUB_TOKEN      = _prompt_key("GitHub token",      GITHUB_TOKEN)
 
     print()
