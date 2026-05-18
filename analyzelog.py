@@ -4014,9 +4014,7 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   #tabs button{background:#000;color:#060;border:1px solid #030;border-bottom:none;padding:5px 16px;font-family:'Courier New',monospace;font-size:12px;cursor:pointer;border-radius:3px 3px 0 0}
   #tabs button:hover{color:#0f0;border-color:#060}
   #tabs button.active{color:#0f0;border-color:#0f0;background:#001a00}
-  #main{display:flex;flex:1;overflow:hidden}
-  #left{flex:1;display:flex;flex-direction:column;overflow:hidden;border-right:1px solid #030}
-  #right{min-width:380px;flex:0 0 40%;display:flex;flex-direction:column;overflow:hidden}
+  #main{flex:1;overflow:hidden;display:flex;flex-direction:column}
   .tab-content{display:none;flex-direction:column;flex:1;overflow:hidden}
   .tab-content.active{display:flex}
   #messages{flex:1;overflow-y:auto;padding:6px 10px;font-size:13px;line-height:1.5}
@@ -4030,13 +4028,18 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   .cmd{color:#ff0;font-weight:bold;border-left:2px solid #ff0;padding-left:6px;margin-top:4px}
   .out{color:#0f0;white-space:pre-wrap;padding-left:6px;margin-bottom:4px;border-left:2px solid #060}
   .sep{color:#030;text-align:center;font-size:10px;padding:4px 0}
-  #menu{flex:1;overflow-y:auto;padding:10px 14px;font-size:12px;line-height:1.5}
+  #menu{flex:1;overflow-y:auto;padding:10px 14px;font-size:12px;line-height:1.5;max-width:420px}
   #menu .mc{color:#060;font-size:11px;margin-bottom:6px;padding-bottom:3px;border-bottom:1px solid #030}
   #menu .mr{display:flex;padding:1px 0}
   #menu .mr .mn{color:#0f0;width:110px;flex-shrink:0;font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #menu .mr .mu{color:#080;width:140px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #menu .mr .md{color:#0a0;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #menu .mr:hover{background:#0f01}
+  #tabMenuView{flex-direction:row!important}
+  #output{flex:1;overflow-y:auto;padding:6px 10px;font-size:13px;line-height:1.5;min-width:0;border-right:1px solid #030}
+  #output .cmd{color:#ff0;font-weight:bold;border-left:2px solid #ff0;padding-left:6px;margin-top:4px}
+  #output .out{color:#0f0;white-space:pre-wrap;padding-left:6px;margin-bottom:4px;border-left:2px solid #060}
+  #output .sep{color:#030;text-align:center;font-size:10px;padding:4px 0}
   #dash{flex:1;overflow-y:auto;padding:10px 14px;font-size:13px;line-height:1.6}
   #dash .dg{margin-bottom:14px}
   #dash .dg h3{color:#0f0;font-size:13px;margin-bottom:4px;border-bottom:1px solid #030;padding-bottom:2px}
@@ -4073,32 +4076,31 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
 <div id="tabs">
   <button id="tabMenu" class="active" onclick="switchTab('menu')">Main Menu</button>
   <button id="tabDash" onclick="switchTab('dash')">Dashboard</button>
+  <button id="tabLogs" onclick="switchTab('logs')">Logs</button>
 </div>
 <div id="main">
-  <div id="left">
-    <div id="tabMenuView" class="tab-content active"><div id="menu"></div></div>
-    <div id="tabDashView" class="tab-content"><div id="dash"></div></div>
-  </div>
-  <div id="right">
-    <div id="messages"></div>
-    <div id="footer">
-      <span class="prompt">$</span>
-      <input id="input" type="text" placeholder="type a command and press Enter" autofocus spellcheck="false">
-      <span id="status">ready</span>
-    </div>
-  </div>
+  <div id="tabMenuView" class="tab-content active"><div id="output"></div><div id="menu"></div></div>
+  <div id="tabDashView" class="tab-content"><div id="dash"></div></div>
+  <div id="tabLogsView" class="tab-content"><div id="messages"></div></div>
+</div>
+<div id="footer">
+  <span class="prompt">$</span>
+  <input id="input" type="text" placeholder="type a command and press Enter" autofocus spellcheck="false">
+  <span id="status">ready</span>
 </div>
 <script>
 const el=document.getElementById.bind(document);
-const msg=el('messages'), menu=el('menu'), dash=el('dash'), inp=el('input'), cnt=el('count'), sts=el('status');
+const msg=el('messages'), menu=el('menu'), dash=el('dash'), inp=el('input'), cnt=el('count'), sts=el('status'), output=el('output');
 let lastId=0, activeTab='menu', cmds=null;
 
 function switchTab(tab){
   activeTab=tab;
   el('tabMenu').className=tab==='menu'?'active':'';
   el('tabDash').className=tab==='dash'?'active':'';
+  el('tabLogs').className=tab==='logs'?'active':'';
   el('tabMenuView').className='tab-content'+(tab==='menu'?' active':'');
   el('tabDashView').className='tab-content'+(tab==='dash'?' active':'');
+  el('tabLogsView').className='tab-content'+(tab==='logs'?' active':'');
   if(tab==='menu'&&!cmds)fetchCmds();
   if(tab==='dash'&&!dash.dataset.loaded)fetchDash();
 }
@@ -4123,6 +4125,26 @@ function addEntry(e){
   }
   msg.append(d);
   if(nearBottom)msg.scrollTop=msg.scrollHeight;
+}
+
+function addOutput(e){
+  const d=document.createElement('div');d.className='msg';
+  if(e._type==='cmd'){
+    d.className='msg cmd';d.textContent='$ '+e.text;
+  }else if(e._type==='out'){
+    d.className='msg out';d.textContent=e.text;
+  }else if(e._type==='sep'){
+    d.className='msg sep';d.textContent=e.text||'\u2500'+'\u2500'.repeat(40);
+  }else{
+    d.className='msg';
+    const ts=document.createElement('span');ts.className='ts';ts.textContent=(e.ts||'').slice(0,19)+' ';
+    const us=document.createElement('span');us.className='user';us.textContent=(e.user||'?')+' ';
+    const lv=document.createElement('span');lv.className='lvl';lv.textContent=(e.level||e.event||'')?'['+(e.level||e.event||'')+'] ':'';
+    const tx=document.createElement('span');tx.className='txt';tx.textContent=(e.text||e.raw||'').slice(0,300);
+    d.append(ts,us,lv,tx);
+  }
+  output.append(d);
+  output.scrollTop=output.scrollHeight;
 }
 
 function fetchLog(){
@@ -4232,9 +4254,9 @@ function fetchDash(){fetch('/api/dashboard').then(r=>r.json()).then(function(d){
 function sendCmd(cmd){
   sts.textContent='executing...';
   const sep={_type:'sep',id:Date.now(),text:'\u2500 cmd: '+cmd+' \u2500'+'\u2500'.repeat(Math.max(0,40-cmd.length-8))};
-  addEntry(sep);
+  addOutput(sep);
   const cmdEntry={_type:'cmd',id:Date.now()+1,text:cmd};
-  addEntry(cmdEntry);
+  addOutput(cmdEntry);
   fetch('/api/command',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
@@ -4245,20 +4267,20 @@ function sendCmd(cmd){
       const maxLines=80;
       const show=lines.length>maxLines?lines.slice(0,maxLines):lines;
       const outEntry={_type:'out',id:Date.now()+2,text:show.join('\n')};
-      addEntry(outEntry);
+      addOutput(outEntry);
       if(lines.length>maxLines){
         const trunc={_type:'out',id:Date.now()+3,text:'... ('+(lines.length-maxLines)+' more lines truncated)'};
-        addEntry(trunc);
+        addOutput(trunc);
       }
     }else{
       const outEntry={_type:'out',id:Date.now()+2,text:'(no output)'};
-      addEntry(outEntry);
+      addOutput(outEntry);
     }
     sts.textContent='ready';
-    if(nearBottom)msg.scrollTop=msg.scrollHeight;
+    if(nearBottom)output.scrollTop=output.scrollHeight;
   }).catch(()=>{
     const err={_type:'out',id:Date.now()+2,text:'Error: command failed or portal disconnected'};
-    addEntry(err);
+    addOutput(err);
     sts.textContent='error';
   });
 }
