@@ -100,11 +100,17 @@ except ImportError:
 
 # ---------- parsing ----------------------------------------------------------
 
-IRC_MSG_RE = re.compile(r"^\[(?P<ts>\d{1,2}:\d{2}(?::\d{2})?)\]\s+<(?P<nick>[^>]+)>\s+(?P<msg>.*)$")
-IRC_ACT_RE = re.compile(r"^\[(?P<ts>\d{1,2}:\d{2}(?::\d{2})?)\]\s+\*\s+(?P<rest>.*)$")
+IRC_MSG_RE = re.compile(r"^\[?(?P<ts>(?:\d{4}-\d{2}-\d{2} )?\d{1,2}:\d{2}(?::\d{2})?)\]?\s+<(?P<nick>[^>]+)>\s+(?P<msg>.*)$")
+IRC_ACT_RE = re.compile(r"^\[?(?P<ts>(?:\d{4}-\d{2}-\d{2} )?\d{1,2}:\d{2}(?::\d{2})?)\]?\s+\*\s+(?P<rest>.*)$")
 SYSLOG_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:[+-]\d{2}:?\d{2}|Z)?)"
     r"\s+\[?(?P<level>[A-Z]{3,8})\]?\s+(?P<comp>[\w.\-/:]+):\s*(?P<msg>.*)$"
+)
+SYSLOG_BSD_RE = re.compile(
+    r"^(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<host>[\w.\-]+)\s+(?P<comp>[\w.\-/]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<msg>.*)$"
+)
+GENERIC_TIME_RE = re.compile(
+    r"^\[?(?P<ts>\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\]?\s*(?P<msg>.*)$"
 )
 ERROR_TOKENS = re.compile(r"\b(error|exception|failed|failure|critical|fatal|traceback|denied)\b", re.I)
 
@@ -129,6 +135,28 @@ def _parse_iso(ts: str) -> datetime | None:
         return datetime.fromisoformat(ts)
     except ValueError:
         return None
+
+
+def _parse_timestamp(ts: str) -> datetime | None:
+    if not ts: return None
+    # 1. Try ISO
+    d = _parse_iso(ts)
+    if d: return d
+    
+    # 2. Try varied formats
+    # Note: %b %d %H:%M:%S is for BSD syslog
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%H:%M:%S", "%H:%M", "%b %d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(ts, fmt)
+            now = datetime.now()
+            if "%H:%M" in fmt and "%Y" not in fmt:
+                dt = dt.replace(year=now.year, month=now.month, day=now.day)
+            elif "%b" in fmt and "%Y" not in fmt:
+                dt = dt.replace(year=now.year)
+            return dt
+        except ValueError:
+            continue
+    return None
 
 
 def _compact_json_text(obj: dict) -> str:
@@ -177,71 +205,94 @@ def _flatten_json_user(obj) -> str | None:
     return None
 
 
+def _try_json(line: str) -> dict | None:
+    if "{" not in line: return None
+    start = line.find("{")
+    end = line.rfind("}")
+    if end > start:
+        try:
+            return json.loads(line[start:end+1])
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return None
+
+
 def parse_line(line: str) -> Entry | None:
     line = line.rstrip("\r\n")
     if not line.strip():
         return None
 
+    # 1. Try JSON (Strict then Fuzzy)
+    obj = None
     if line.lstrip().startswith("{"):
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
-            obj = None
-        if isinstance(obj, dict):
-            ts_str = obj.get("timestamp") or obj.get("dt") or obj.get("ts") or obj.get("time")
-            ts = None
-            if isinstance(ts_str, str):
-                ts = _parse_iso(ts_str)
-            elif isinstance(obj.get("ts"), (int, float)):
-                try:
-                    ts = datetime.fromtimestamp(float(obj["ts"]))
-                except (OSError, OverflowError, ValueError):
-                    ts = None
-            user = _flatten_json_user(obj)
-            level = obj.get("severity") or obj.get("level") or obj.get("flag")
-            event = obj.get("event_type") or obj.get("event") or obj.get("type")
-            payload = obj.get("payload")
-            if event is None and isinstance(payload, dict):
-                event = payload.get("type") or payload.get("action")
-            target = obj.get("target") or obj.get("channel")
-            text = _compact_json_text(obj)
-            return Entry(line, ts, user, str(level) if level else None,
-                         str(event) if event else None,
-                         str(target) if target else None, text, "json")
+            pass
+    
+    if obj is None:
+        obj = _try_json(line)
+        
+    if isinstance(obj, dict):
+        ts_str = obj.get("timestamp") or obj.get("dt") or obj.get("ts") or obj.get("time")
+        ts = None
+        if isinstance(ts_str, str):
+            ts = _parse_timestamp(ts_str)
+        elif isinstance(obj.get("ts"), (int, float)):
+            try:
+                ts = datetime.fromtimestamp(float(obj["ts"]))
+            except (OSError, OverflowError, ValueError):
+                ts = None
+        user = _flatten_json_user(obj)
+        level = obj.get("severity") or obj.get("level") or obj.get("flag")
+        event = obj.get("event_type") or obj.get("event") or obj.get("type")
+        payload = obj.get("payload")
+        if event is None and isinstance(payload, dict):
+            event = payload.get("type") or payload.get("action")
+        target = obj.get("target") or obj.get("channel")
+        text = _compact_json_text(obj)
+        return Entry(line, ts, user, str(level) if level else None,
+                     str(event) if event else None,
+                     str(target) if target else None, text, "json")
 
+    # 2. Try Standard Syslog
     m = SYSLOG_RE.match(line)
     if m:
-        ts = _parse_iso(m["ts"])
+        ts = _parse_timestamp(m["ts"])
         return Entry(line, ts, m["comp"], m["level"], None, None, m["msg"], "syslog")
 
+    # 3. Try BSD Syslog
+    m = SYSLOG_BSD_RE.match(line)
+    if m:
+        ts = _parse_timestamp(m["ts"])
+        return Entry(line, ts, f"{m['host']}/{m['comp']}", None, None, None, m["msg"], "syslog_bsd")
+
+    # 4. Try IRC Msg
     m = IRC_MSG_RE.match(line)
     if m:
-        ts = _parse_irc_time(m["ts"])
+        ts = _parse_timestamp(m["ts"])
         return Entry(line, ts, m["nick"], None, "msg", None, m["msg"], "irc")
 
+    # 5. Try IRC Action
     m = IRC_ACT_RE.match(line)
     if m:
-        ts = _parse_irc_time(m["ts"])
+        ts = _parse_timestamp(m["ts"])
         rest = m["rest"]
-        nick = rest.split(" ", 1)[0] if rest else None
+        user = rest.split()[0] if rest.split() else "???"
         event = "action"
         for kw in ("joined", "left", "quit", "is now known", "kicked", "set mode", "Topic"):
             if kw in rest:
                 event = kw.split()[0].lower()
                 break
-        return Entry(line, ts, nick, None, event, None, rest, "irc")
+        return Entry(line, ts, user, None, event, None, rest, "irc")
+
+    # 6. Try Generic Fallback
+    m = GENERIC_TIME_RE.match(line)
+    if m:
+        ts = _parse_timestamp(m["ts"])
+        return Entry(line, ts, None, None, None, None, m["msg"], "generic")
 
     return Entry(line, None, None, None, None, None, line, "raw")
-
-
-def _parse_irc_time(ts: str) -> datetime | None:
-    parts = ts.split(":")
-    try:
-        h, mi = int(parts[0]), int(parts[1])
-        s = int(parts[2]) if len(parts) > 2 else 0
-        return datetime(1970, 1, 1, h, mi, s)
-    except (ValueError, IndexError):
-        return None
 
 
 def iter_entries(path: str) -> Iterator[Entry]:
@@ -941,10 +992,30 @@ def compute_response_times(entries: list[Entry], window_seconds: int = 300) -> l
 
 # ---------- NEW: Sentiment analysis (#4) -------------------------------------
 
-SENTIMENT_POS = re.compile(r"\b(good|great|awesome|thanks|nice|love|perfect|helpful|excellent|amazing|beautiful|wonderful|fantastic|brilliant|outstanding|superb|glad|happy|correct|agree|works|fixed|solved|appreciate|thank|please|yes|ok|okay)\b", re.I)
-SENTIMENT_NEG = re.compile(r"\b(bad|terrible|awful|hate|ugly|horrible|wrong|broken|fails|failed|error|crash|stupid|annoying|useless|worst|sucks|horrible|crap|damn|bug|issue|problem|disaster|fault|never|refuse|reject|no|not|can't|cannot|won't)\b", re.I)
-SENTIMENT_AGREE = re.compile(r"\b(agree|yes|correct|right|indeed|exactly|true|same)\b", re.I)
-SENTIMENT_DISAGREE = re.compile(r"\b(disagree|no|wrong|incorrect|false|nonsense|dispute|reject)\b", re.I)
+SENTIMENT_POS = {
+    "good", "great", "awesome", "thanks", "nice", "love", "perfect", "helpful",
+    "excellent", "amazing", "beautiful", "wonderful", "fantastic", "brilliant",
+    "outstanding", "superb", "glad", "happy", "correct", "agree", "works",
+    "fixed", "solved", "appreciate", "thank", "please", "yes", "ok", "okay",
+    "impressive", "cool", "wow", "delightful", "best", "legendary", "sweet",
+    "neat", "fabulous", "bravo", "cheers", "recommend", "satisfied"
+}
+
+SENTIMENT_NEG = {
+    "bad", "terrible", "awful", "hate", "ugly", "horrible", "wrong", "broken",
+    "fails", "failed", "error", "crash", "stupid", "annoying", "useless",
+    "worst", "sucks", "crap", "damn", "bug", "issue", "problem", "disaster",
+    "fault", "never", "refuse", "reject", "no", "not", "can't", "cannot",
+    "won't", "poor", "difficult", "hard", "slow", "expensive", "boring",
+    "weird", "strange", "confusing", "frustrating", "waste", "garbage",
+    "trash", "nonsense", "ridiculous", "shame", "unfortunate", "sad", "angry"
+}
+
+SENTIMENT_AGREE = {"agree", "yes", "correct", "right", "indeed", "exactly", "true", "same", "yep", "affirmative"}
+SENTIMENT_DISAGREE = {"disagree", "no", "wrong", "incorrect", "false", "nonsense", "dispute", "reject", "nope", "negative"}
+
+SENTIMENT_NEGATORS = {"not", "never", "no", "neither", "nor", "none", "cannot", "can't", "don't", "doesn't", "won't", "wasn't", "shouldn't", "couldn't", "hardly", "scarcely", "barely"}
+SENTIMENT_INTENSIFIERS = {"very", "extremely", "really", "so", "too", "quite", "super", "highly", "absolutely", "totally", "utterly"}
 
 @dataclass
 class SentimentScore:
@@ -955,17 +1026,67 @@ class SentimentScore:
     compound: float
 
 def score_sentiment(text: str) -> SentimentScore:
-    pos = len(SENTIMENT_POS.findall(text))
-    neg = len(SENTIMENT_NEG.findall(text))
-    agr = len(SENTIMENT_AGREE.findall(text))
-    dagr = len(SENTIMENT_DISAGREE.findall(text))
-    total = pos + neg + 1
+    tokens = re.findall(r"\b\w+\b", text.lower())
+    pos_score = 0.0
+    neg_score = 0.0
+    agr_score = 0.0
+    dagr_score = 0.0
+    
+    negated = False
+    negation_window = 0
+    
+    for i, tok in enumerate(tokens):
+        # Intensity multiplier
+        multiplier = 1.0
+        if i > 0 and tokens[i-1] in SENTIMENT_INTENSIFIERS:
+            multiplier = 2.0
+            
+        # Check for negation
+        if tok in SENTIMENT_NEGATORS:
+            negated = True
+            negation_window = 3
+            continue
+            
+        is_pos = tok in SENTIMENT_POS
+        is_neg = tok in SENTIMENT_NEG
+        is_agr = tok in SENTIMENT_AGREE
+        is_dagr = tok in SENTIMENT_DISAGREE
+        
+        val = 1.0 * multiplier
+        
+        if negated and negation_window > 0:
+            # Flip sentiment
+            if is_pos:
+                neg_score += val
+            elif is_neg:
+                pos_score += val
+            # For agreement, we usually don't flip as easily in simple logic, but let's be consistent
+            if is_agr:
+                dagr_score += val
+            elif is_dagr:
+                agr_score += val
+            negation_window -= 1
+            if negation_window == 0:
+                negated = False
+        else:
+            if is_pos:
+                pos_score += val
+            if is_neg:
+                neg_score += val
+            if is_agr:
+                agr_score += val
+            if is_dagr:
+                dagr_score += val
+                
+    total = pos_score + neg_score + 1.0
+    total_agr = agr_score + dagr_score + 1.0
+    
     return SentimentScore(
-        positive=pos / total,
-        negative=neg / total,
-        agreement=agr / (agr + dagr + 1),
-        disagreement=dagr / (agr + dagr + 1),
-        compound=(pos - neg) / total,
+        positive=pos_score / total,
+        negative=neg_score / total,
+        agreement=agr_score / total_agr,
+        disagreement=dagr_score / total_agr,
+        compound=(pos_score - neg_score) / total,
     )
 
 def user_sentiment(entries: list[Entry], user: str) -> dict:
@@ -977,7 +1098,8 @@ def user_sentiment(entries: list[Entry], user: str) -> dict:
     return {
         "user": user,
         "n": len(scores),
-        "mean_positive": statistics.mean(s.compound for s in scores),
+        "mean_positive": statistics.mean(s.positive for s in scores),
+        "mean_negative": statistics.mean(s.negative for s in scores),
         "mean_compound": statistics.mean(s.compound for s in scores),
         "pos_rate": sum(1 for s in scores if s.compound > 0) / len(scores),
         "neg_rate": sum(1 for s in scores if s.compound < 0) / len(scores),
@@ -986,15 +1108,21 @@ def user_sentiment(entries: list[Entry], user: str) -> dict:
 
 # ---------- NEW: Topic/keyword extraction (#3) --------------------------------
 
-STOPWORDS = set("the a an is in to of and it you that on for with as at by this are be has have had not was were will can its or do if from they what which who " "all about but just like so up no out one also get would could".split())
+STOPWORDS = {
+    "the", "a", "an", "is", "in", "to", "of", "and", "it", "you", "that", "on", "for", "with", "as", "at", "by", "this", "are", "be", "has", "have", "had", "not", "was", "were", "will", "can", "its", "or", "do", "if", "from", "they", "what", "which", "who", "all", "about", "but", "just", "like", "so", "up", "no", "out", "one", "also", "get", "would", "could", "there", "their", "more", "some", "my", "your", "we", "he", "she", "it's", "they're", "can't", "don't", "we're", "you're", "about", "did", "does", "been", "being", "should", "would", "could", "than", "then", "them", "these", "those", "when", "where", "how", "why"
+}
 
 def extract_keywords(texts: list[str], top_n: int = 20) -> list[tuple[str, int]]:
     counter: Counter = Counter()
+    # Handle contractions better by including apostrophes
     token_re = re.compile(r"[A-Za-z][A-Za-z0-9_\-']{2,}")
     for t in texts:
         for tok in token_re.findall(t.lower()):
             if tok not in STOPWORDS and len(tok) > 2:
-                counter[tok] += 1
+                # Remove trailing apostrophes or common short forms
+                tok = tok.strip("'")
+                if tok not in STOPWORDS and len(tok) > 2:
+                    counter[tok] += 1
     return counter.most_common(top_n)
 
 def extract_ngrams(texts: list[str], n: int = 2, top_n: int = 20) -> list[tuple[str, int]]:
@@ -1010,11 +1138,44 @@ def extract_ngrams(texts: list[str], n: int = 2, top_n: int = 20) -> list[tuple[
 def user_topics(entries: list[Entry], user: str, top_n: int = 15) -> dict:
     u = user.lower()
     texts = [e.text or e.raw for e in entries if e.user and e.user.lower() == u and (e.text or e.raw)]
+    
+    # Dynamically expand stopwords for this user to filter out common metadata
+    local_stopwords = set(STOPWORDS)
+    local_stopwords.add(u)
+    # Filter out common channel names if they appear in text
+    for e in entries:
+        if e.target:
+            local_stopwords.add(e.target.lower().lstrip("#"))
+            local_stopwords.add(e.target.lower())
+    # Filter out common scoring terms seen in _compact_json_text
+    local_stopwords.update({"heu", "bino", "cls", "llama", "normal", "suspect", "msg", "message", "timestamp", "dt"})
+
+    def extract_keywords_local(txts: list[str], n: int) -> list[tuple[str, int]]:
+        counter: Counter = Counter()
+        token_re = re.compile(r"[A-Za-z][A-Za-z0-9_\-']{2,}")
+        for t in txts:
+            for tok in token_re.findall(t.lower()):
+                if tok not in local_stopwords and len(tok) > 2:
+                    tok = tok.strip("'")
+                    if tok not in local_stopwords and len(tok) > 2:
+                        counter[tok] += 1
+        return counter.most_common(n)
+
+    def extract_ngrams_local(txts: list[str], n: int, top_n_local: int) -> list[tuple[str, int]]:
+        counter: Counter = Counter()
+        token_re = re.compile(r"[A-Za-z][A-Za-z0-9_\-']{2,}")
+        for t in txts:
+            tokens = [tok for tok in token_re.findall(t.lower()) if tok not in local_stopwords and len(tok) > 2]
+            for i in range(len(tokens) - n + 1):
+                gram = " ".join(tokens[i:i + n])
+                counter[gram] += 1
+        return counter.most_common(top_n_local)
+
     return {
         "user": user,
-        "keywords": extract_keywords(texts, top_n),
-        "bigrams": extract_ngrams(texts, 2, top_n),
-        "trigrams": extract_ngrams(texts, 3, top_n),
+        "keywords": extract_keywords_local(texts, top_n),
+        "bigrams": extract_ngrams_local(texts, 2, top_n),
+        "trigrams": extract_ngrams_local(texts, 3, top_n),
     }
 
 # ---------- NEW: Forensic analysis (#28) ---------------------------------------
@@ -1249,6 +1410,67 @@ class Anomaly:
     zscore: float
     day: str | None = None
     hour: int | None = None
+
+def detect_behavioral_anomalies(entries: list[Entry], user: str, 
+                               z_threshold: float = 3.0) -> list[Anomaly]:
+    u = user.lower()
+    user_entries = [e for e in entries if e.user and e.user.lower() == u]
+    if len(user_entries) < 10:
+        return []
+
+    results: list[Anomaly] = []
+    
+    # 1. Score Anomaly Detection (using existing _scores_from_raw)
+    user_scores = {k: [] for k in SCORE_KEYS}
+    for e in user_entries:
+        s = _scores_from_raw(e.raw)
+        for k in SCORE_KEYS:
+            if k in s and isinstance(s[k], (int, float)):
+                user_scores[k].append((e, s[k]))
+                
+    for k in SCORE_KEYS:
+        vals = [v for e, v in user_scores[k]]
+        if len(vals) > 5:
+            mean = statistics.mean(vals)
+            sd = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+            if sd > 0:
+                for e, v in user_scores[k]:
+                    z = (v - mean) / sd
+                    if z >= z_threshold:
+                        results.append(Anomaly(user, f"score_{k}", float(v), mean, z, 
+                                               day=e.ts.date().isoformat() if e.ts else None,
+                                               hour=e.ts.hour if e.ts else None))
+
+    # 2. Length Anomaly Detection
+    lengths = [(e, len(e.text or "")) for e in user_entries]
+    l_vals = [v for e, v in lengths]
+    if len(l_vals) > 5:
+        mean_l = statistics.mean(l_vals)
+        sd_l = statistics.pstdev(l_vals) if len(l_vals) > 1 else 0.0
+        if sd_l > 0:
+            for e, l in lengths:
+                z = (l - mean_l) / sd_l
+                if abs(z) >= z_threshold:
+                     results.append(Anomaly(user, "msg_length", float(l), mean_l, z,
+                                            day=e.ts.date().isoformat() if e.ts else None,
+                                            hour=e.ts.hour if e.ts else None))
+
+    # 3. Pattern-of-Life (PoL) Anomaly Detection
+    # Detect if user is active at an hour they are usually NOT active in.
+    hour_counts = Counter(e.ts.hour for e in user_entries if e.ts)
+    total_active = sum(hour_counts.values())
+    if total_active > 20:
+        for e in user_entries:
+            if not e.ts: continue
+            h = e.ts.hour
+            # If this hour represents < 2% of their total activity, it's a PoL anomaly
+            if (hour_counts[h] / total_active) < 0.02:
+                # We'll use a fixed z of 5.0 to flag it
+                results.append(Anomaly(user, "pol_hour_mismatch", float(h), 0.0, 5.0,
+                                       day=e.ts.date().isoformat(),
+                                       hour=h))
+                                       
+    return results
 
 def detect_anomalies(entries: list[Entry], user: str, z_threshold: float = 2.5) -> list[Anomaly]:
     u = user.lower()
@@ -3347,7 +3569,7 @@ def llm_auto_report(summary: dict, top_profiles: list[dict], llm_url: str, model
 # ---------- NEW: LLM forensic features (#29) -----------------------------------
 
 def llm_forensic_report(entries: list[Entry], user: str, llm_url: str, model: str,
-                        max_chars: int = 12000, cache: LLMCache | None = None) -> None:
+                        max_chars: int = 15000, cache: LLMCache | None = None) -> None:
     user_entries = [e for e in entries if line_matches_user(e, user)]
     if not user_entries:
         print(f"(no data for {user})")
@@ -3358,65 +3580,76 @@ def llm_forensic_report(entries: list[Entry], user: str, llm_url: str, model: st
     gaps = detect_timeline_gaps(user_entries, user, 30)
     profile = build_profile(user_entries, user)
     sentiment = user_sentiment(user_entries, user)
+    anomalies = detect_behavioral_anomalies(entries, user)
 
     evidence_sections: list[str] = [
         f"FORENSIC REPORT FOR USER: {user}",
         "",
-        f"=== PROFILE ===",
+        "=== PROFILE ===",
         f"Total authored lines: {profile['authored']}",
         f"First seen: {_fmt_dt(profile['first_ts'])}",
         f"Last seen: {_fmt_dt(profile['last_ts'])}",
         f"Active days: {len(profile['by_day'])}",
         f"Peak hours: {_peak_hours(profile['by_hour'])}",
         f"Top channels: {_top_str(profile['channels'], 5) or '(none)'}",
+        f"Mean scores: {json.dumps(profile['score_means'])}",
         "",
-        f"=== SENTIMENT ===",
+        "=== SENTIMENT ===",
     ]
     comp = sentiment.get("mean_compound")
     if comp is not None:
-        evidence_sections.append(f"Mean compound: {comp:.3f}")
-    pr = sentiment.get("pos_rate")
-    if pr is not None:
-        evidence_sections.append(f"Positive rate: {pr:.1%}")
-    nr = sentiment.get("neg_rate")
-    if nr is not None:
-        evidence_sections.append(f"Negative rate: {nr:.1%}")
+        evidence_sections.append(f"Mean compound: {comp:.3f} (Rate: {sentiment.get('pos_rate',0):.1%} pos, {sentiment.get('neg_rate',0):.1%} neg)")
+        evidence_sections.append(f"Agreement Rate: {sentiment.get('agree_rate',0):.1%}")
+
+    if anomalies:
+        evidence_sections.append("\n=== BEHAVIORAL ANOMALIES ===")
+        for a in sorted(anomalies, key=lambda x: abs(x.zscore), reverse=True)[:15]:
+            evidence_sections.append(f"  {a.metric}: z={a.zscore:+.2f} val={a.value:.1f} exp={a.expected:.1f} ({a.day} h{a.hour})")
 
     if entity_catalog:
-        evidence_sections.append(f"\n=== ENTITIES ===")
+        evidence_sections.append("\n=== ENTITY EXTRACTION ===")
         for etype, entities in entity_catalog.items():
             if entities:
-                top = sorted(entities, key=lambda x: -x.count)[:5]
+                top = sorted(entities, key=lambda x: -x.count)[:8]
                 vals = ", ".join(f"{e.value}({e.count}x)" for e in top)
                 evidence_sections.append(f"  {etype}: {vals}")
 
-    evidence_sections.append(f"\n=== TIMELINE GAPS ===")
+    evidence_sections.append("\n=== TIMELINE GAPS ===")
     if gaps:
         for g in gaps[:10]:
             evidence_sections.append(f"  {g.start} -> {g.end} ({g.duration_minutes:.0f}min)")
-    else:
-        evidence_sections.append(f"  (no significant gaps)")
 
-    evidence_sections.append(f"\n=== RECENT ACTIVITY (last 30 lines) ===")
-    for e in user_entries[-30:]:
-        evidence_sections.append(f"  [{e.ts}] {e.user}: {(e.text or e.raw)[:160]}")
+    evidence_sections.append("\n=== RECENT CHAT LOGS (tail) ===")
+    for e in user_entries[-50:]:
+        evidence_sections.append(f"  [{e.ts}] {e.user}: {(e.text or e.raw)[:200]}")
 
     evidence_text = "\n".join(evidence_sections)
     if len(evidence_text) > max_chars:
-        evidence_text = evidence_text[-max_chars:]
+        # Keep stats and tail
+        evidence_text = evidence_text[:max_chars//3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2*max_chars//3):]
 
     system = (
-        "You are a forensic log analyst. Given the evidence below, produce a "
-        "structured forensic report covering: 1) Entity summary (IPs, domains, hashes, files), "
-        "2) Behavioral timeline and pattern of life, 3) Anomalies and suspicious indicators, "
-        "4) Risk assessment, 5) Recommendations for further investigation. "
-        "Cite specific evidence. Be concise and factual."
+        "You are an expert forensic log analyst and behavioral profiler. "
+        "Your goal is to analyze the provided evidence and build a comprehensive "
+        "forensic profile of the user. Focus on identifying intent, operational security (OPSEC) "
+        "patterns, potential automation/botting, and behavioral shifts. "
+        "Use a professional, investigative tone."
     )
-    prompt = f"Forensic evidence for user '{user}':\n\n{evidence_text}\n\nGenerate a structured forensic report."
-
+    prompt = (
+        f"DATASET FOR ANALYSIS:\n{evidence_text}\n\n"
+        "Please provide a structured report with the following sections:\n"
+        "1. EXECUTIVE SUMMARY: High-level overview of activity and suspicious indicators.\n"
+        "2. BEHAVIORAL PROFILE: Analysis of communication style, sentiment, and 'Pattern of Life'.\n"
+        "3. ANOMALY ANALYSIS: Deep dive into detected anomalies (Z-scores, time shifts, score spikes).\n"
+        "4. ENTITY & NETWORK ANALYSIS: Interpretation of mentioned IPs, URLs, and associates.\n"
+        "5. RISK ASSESSMENT: Categorize risk level (Low/Medium/High/Critical) with justification.\n"
+        "6. RECOMMENDATIONS: Suggested follow-up actions for investigators."
+    )
     try:
-        out = call_llm_cached(llm_url, model, system, prompt, cache=cache,
-                              spinner_msg="LLM generating forensic report")
+        out = call_llm_cached(llm_url, model, system, prompt, cache=cache, spinner_msg=f"Generating forensic report for {user}")
+        print(f"\n{'='*80}\nFORENSIC ANALYSIS: {user}\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Forensic report generation failed: {exc}")
         print(f"\n{'='*60}\nFORENSIC REPORT: {user}\n{'='*60}\n{out}")
     except Exception as exc:
         print(f"Forensic report failed: {exc}")
@@ -5878,11 +6111,21 @@ class LogShell(cmd.Cmd):
         if not user:
             return
         anoms = detect_anomalies(self._active_entries(), user, z)
+        anoms += detect_behavioral_anomalies(self._active_entries(), user, z)
         if not anoms:
             print(f"(no anomalies for '{user}' at z>={z})")
             return
         print(f"\nAnomalies for '{user}' (z>={z}):")
+        # Deduplicate and sort by Z-score
+        seen = set()
+        unique_anoms = []
         for a in anoms:
+            key = (a.metric, a.day, a.hour)
+            if key not in seen:
+                seen.add(key)
+                unique_anoms.append(a)
+        unique_anoms.sort(key=lambda x: abs(x.zscore), reverse=True)
+        for a in unique_anoms:
             dir_ = "HIGH" if a.value > a.expected else "LOW"
             print(f"  {dir_:>4}  {a.metric:<20s} value={a.value:.1f} expected={a.expected:.1f} z={a.zscore:.2f}  {a.day or ''} h{a.hour or ''}")
 
@@ -7529,12 +7772,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--evidence", help="With --batch, LLM evidence extraction for user")
     args = p.parse_args(argv)
 
-    try:
-        all_entries = list(iter_entries(args.log))
-    except FileNotFoundError:
-        print(f"File not found: {args.log}", file=sys.stderr)
-        return 1
-
     since = parse_iso_arg(args.since) if args.since else None
     until = parse_iso_arg(args.until) if args.until else None
     if args.since and not since:
@@ -7542,7 +7779,32 @@ def main(argv: list[str] | None = None) -> int:
     if args.until and not until:
         print(f"Could not parse --until {args.until!r}", file=sys.stderr); return 2
 
-    active = apply_time_filter(all_entries, since, until)
+    # PERFORMANCE OPTIMIZATION:
+    # If we are doing a focused batch operation on a specific user, we stream the file
+    # and only load that user's entries into memory. This allows processing 10GB+ logs.
+    is_focused_batch = args.batch and args.user and not any([
+        args.export_html, args.export_sql, args.prometheus, args.diff, args.similar
+    ])
+
+    if is_focused_batch:
+        u = args.user.lower()
+        active = []
+        try:
+            for e in iter_entries(args.log):
+                if in_time_range(e.ts, since, until):
+                    if e.user and e.user.lower() == u:
+                        active.append(e)
+            all_entries = active # For focused batch, population == focused set
+        except FileNotFoundError:
+            print(f"File not found: {args.log}", file=sys.stderr)
+            return 1
+    else:
+        try:
+            all_entries = list(iter_entries(args.log))
+        except FileNotFoundError:
+            print(f"File not found: {args.log}", file=sys.stderr)
+            return 1
+        active = apply_time_filter(all_entries, since, until)
 
     cache_path = args.llm_cache
     if cache_path and cache_path.lower() in {"none", "off", ""}:
@@ -7633,9 +7895,19 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.anomalies:
             anoms = detect_anomalies(active, args.anomalies, args.anomalies_z)
+            anoms += detect_behavioral_anomalies(active, args.anomalies, args.anomalies_z)
+            # Deduplicate and sort
+            seen = set()
+            unique = []
             for a in anoms:
-                print(f"  {a.metric} z={a.zscore:.2f} value={a.value:.1f} expected={a.expected:.1f}")
-            if not anoms:
+                k = (a.metric, a.day, a.hour)
+                if k not in seen:
+                    seen.add(k)
+                    unique.append(a)
+            unique.sort(key=lambda x: abs(x.zscore), reverse=True)
+            for a in unique:
+                print(f"  {a.metric:<20s} z={a.zscore:+.2f} value={a.value:.1f} expected={a.expected:.1f}  {a.day or ''} h{a.hour or ''}")
+            if not unique:
                 print("(no anomalies)")
             return 0
 
