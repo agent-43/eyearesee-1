@@ -115,13 +115,7 @@ except ModuleNotFoundError:
             sys.exit("windows-curses not found and --no-install is set. "
                      "Run without --no-install or: pip install windows-curses")
         print("windows-curses not found — installing...")
-        import shutil
-        _pip_cmd: list = []
-        if shutil.which("uv"):
-            _pip_cmd = ["uv", "pip", "install", "windows-curses"]
-        else:
-            _pip_cmd = [sys.executable, "-m", "pip", "install", "windows-curses"]
-        subprocess.check_call(_pip_cmd)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "windows-curses"])
     import curses
 
 # =========================
@@ -181,8 +175,8 @@ STS_POLICY_PATH    = os.path.join(_SCRIPT_DIR, "sts_policies.json")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
 DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY", "")
-GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 # Ollama: local/offline LLM server.  Override with OLLAMA_URL env var if running elsewhere.
 OLLAMA_URL: str    = os.environ.get("OLLAMA_URL",    "http://127.0.0.1:11434")
 # llama.cpp: local server with OpenAI-compatible API.  Override with LLAMACPP_URL env var.
@@ -193,7 +187,7 @@ LLAMACPP_URL: str  = os.environ.get("LLAMACPP_URL",  "http://127.0.0.1:8033")
 OBSERVER_MODEL_ID: str = os.environ.get("IRC_OBSERVER_MODEL", "distilgpt2")
 
 # Unified model registry — key is the short name used in /askai, /summarize, /model.
-# Each entry: provider ("claude"|"openai"|"ollama"|"llamacpp"), api model id, human label.
+# Each entry: provider ("claude"|"openai"|"ollama"|"llamacpp"|"gemini"), api model id, human label.
 # Ollama models require `ollama serve` running locally; no API key needed.
 # Pull models with e.g.:  ollama pull gemma3:4b   or   ollama pull llama3.2
 # llama.cpp models require `llama-server` running at LLAMACPP_URL; model field is advisory.
@@ -209,13 +203,12 @@ AI_MODELS: Dict[str, Dict[str, str]] = {
     # ── Cloud: DeepSeek ──────────────────────────────────────────────────
     "deepseek": {"provider": "deepseek", "id": "deepseek-chat",     "label": "DeepSeek-V3"},
     "dsr1":     {"provider": "deepseek", "id": "deepseek-reasoner", "label": "DeepSeek-R1"},
-    # ── Cloud: Google Gemini ────────────────────────────────────────────
-    "gemini-flash": {"provider": "gemini", "id": "gemini-2.0-flash",  "label": "Gemini 2.0 Flash"},
-    "gemini-pro":   {"provider": "gemini", "id": "gemini-2.0-pro",    "label": "Gemini 2.0 Pro"},
-    "gemini-15p":   {"provider": "gemini", "id": "gemini-1.5-pro",    "label": "Gemini 1.5 Pro"},
     # ── Cloud: GitHub Copilot ────────────────────────────────────────────
     "copilot":  {"provider": "copilot",  "id": "gpt-4o",            "label": "Copilot GPT-4o"},
     "copilot-mini": {"provider": "copilot", "id": "gpt-4o-mini",    "label": "Copilot GPT-4o-mini"},
+    # ── Cloud: Google Gemini ─────────────────────────────────────────────
+    "gemini":  {"provider": "gemini",   "id": "gemini-2.0-flash",           "label": "Gemini 2.0 Flash"},
+    "gpro":    {"provider": "gemini",   "id": "gemini-2.5-pro",             "label": "Gemini 2.5 Pro"},
     # ── Local/offline: Ollama ─────────────────────────────────────────────
     "gemma":   {"provider": "ollama",   "id": "gemma3:4b",   "label": "Gemma 3 4B   (Ollama/offline)"},
     "llama3":  {"provider": "ollama",   "id": "llama3.2",    "label": "Llama 3.2    (Ollama/offline)"},
@@ -1619,28 +1612,6 @@ def _llamacpp_blocking_call(model_id: str, prompt: str, max_tokens: int) -> Tupl
         return f"[error] llama.cpp call failed: {exc}", "?"
 
 
-def _gemini_blocking_call(model_id: str, prompt: str, max_tokens: int) -> Tuple[str, str]:
-    """Synchronous call to the Gemini API via google.genai SDK (run via executor).
-
-    Requires the google-genai package and GEMINI_API_KEY env var.
-    """
-    if not GEMINI_AVAILABLE:
-        return "[error] google-genai package not installed — run: pip install google-genai", "?"
-    try:
-        client  = _gemini_mod.Client(api_key=GEMINI_API_KEY)
-        from google.genai import types as _gemini_types
-        resp = client.models.generate_content(
-            model=model_id,
-            contents=prompt,
-            config=_gemini_types.GenerateContentConfig(max_output_tokens=max_tokens),
-        )
-        answer = resp.text if resp.text else "(empty response)"
-        # Gemini does not expose usage in the sync client easily; report "?"
-        return answer, "?"
-    except Exception as exc:
-        return f"[error] Gemini call failed: {exc}", "?"
-
-
 async def _llm_classify_ai(text: str, model_key: str) -> float:
     """Ask the active /model to classify *text* as AI- or human-written.
 
@@ -1703,6 +1674,18 @@ async def _llm_classify_ai(text: str, model_key: str) -> float:
                 _classify_oc = None
                 raise
             answer = resp.choices[0].message.content if resp.choices else ""
+        elif provider == "gemini":
+            if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
+                return 0.0
+            try:
+                gclient = _gemini_mod.aio.Client(api_key=GEMINI_API_KEY)
+                resp = await gclient.models.generate_content(
+                    model=model_id,
+                    contents=prompt,
+                    config=_gemini_mod.types.GenerateContentConfig(max_output_tokens=10))
+                answer = resp.text if resp.text else ""
+            except Exception:
+                return 0.0
         elif provider == "ollama":
             loop   = asyncio.get_running_loop()
             answer, _ = await loop.run_in_executor(
@@ -1711,12 +1694,6 @@ async def _llm_classify_ai(text: str, model_key: str) -> float:
             loop   = asyncio.get_running_loop()
             answer, _ = await loop.run_in_executor(
                 _IO_EXECUTOR, _llamacpp_blocking_call, model_id, prompt, 10)
-        elif provider == "gemini":
-            if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
-                return 0.0
-            loop   = asyncio.get_running_loop()
-            answer, _ = await loop.run_in_executor(
-                _IO_EXECUTOR, _gemini_blocking_call, model_id, prompt, 10)
         else:
             return 0.0
 
@@ -3025,6 +3002,8 @@ class IRCClient:
         self._resume_token: str = ""       # IRCv3 draft/resume token
         self._resume_ts: str = ""          # IRCv3 draft/resume timestamp
         self._resumed_session: bool = False  # True after successful RESUME
+        self._last_ping_ts: float = 0.0      # timestamp of last PING sent (draft/ping)
+        self._latency: float = 0.0           # latest round-trip latency in seconds
         self._sts_policies: dict = self._load_sts_policies()
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
@@ -3327,7 +3306,12 @@ class IRCClient:
         PONG_TIMEOUT  = 120.0
         while self.running and self.writer:
             try:
-                self.send_raw(f"PING :keepalive-{int(time.time())}")
+                ts = int(time.time())
+                self._last_ping_ts = ts
+                if "draft/ping" in self._active_caps:
+                    self.send_raw(f"PING {ts}")
+                else:
+                    self.send_raw(f"PING :keepalive-{ts}")
                 await asyncio.sleep(PING_INTERVAL)
                 if time.monotonic() - self._last_pong > PONG_TIMEOUT:
                     await self.ui_queue.put(("status", "Ping timeout — reconnecting"))
@@ -3563,16 +3547,24 @@ class IRCClient:
 
     async def _irc_pong(self, nick, params, prefix):
         self._last_pong = time.monotonic()
+        if params:
+            try:
+                echoed_ts = int(params[0].lstrip(":keepalive-"))
+                if echoed_ts > 0:
+                    self._latency = time.time() - echoed_ts
+            except (ValueError, IndexError):
+                pass
 
     # Capabilities we request whenever the server offers them.
     _WANT_CAPS = (
+        "cap-notify",
         "away-notify", "multi-prefix", "account-notify", "extended-join",
         "chghost", "server-time", "echo-message", "userhost-in-names",
         "message-tags", "batch", "labeled-response", "invite-notify",
         "account-tag", "standard-replies", "setname",
         "chathistory", "draft/chathistory",
-        "draft/multiline", "draft/format",
-        "message-redaction", "read-marker",
+        "draft/multiline", "draft/format", "draft/ping",
+        "message-redaction", "read-marker", "message-intents",
         "draft/account-registration",
         "draft/reply", "draft/react", "draft/typing",
         "draft/mention", "draft/event-playback",
@@ -4159,9 +4151,11 @@ class IRCClient:
         m_score = 50
         # mention tag: server indicates this message mentions our nick
         mention = tags.get("mention", "")
+        # message-intents: optional tag describing message purpose
+        intent = tags.get("+intent", "")
         await self.ui_queue.put(("msg", nick, target, msg, u_score, m_score, 0, 0,
                                  is_action, ts_str, account, is_replay, msgid, reply_to,
-                                 mention))
+                                 mention, intent))
         if is_replay:
             return  # don't score replayed history; it's already been seen
         _t = asyncio.create_task(self._score_msg_bg(nick, target, msg, u_state, u_score, m_score))
@@ -5748,7 +5742,6 @@ class TUI:
         self._dashboard_mode = "suspects"
         self._prev_on_dashboard = False           # edge-detect navigate-back-to-dashboard
         self._dashboard_profile_locked = False    # one-shot: skip reset on same-tick navigate
-        self._scrollbar_dragging = False          # is user currently dragging the scrollbar?
 
         # IRCv3 +typing client tag
         # Incoming: {target_lower: {nick_lower: [orig_nick, state, expiry_monotonic]}}
@@ -5766,8 +5759,8 @@ class TUI:
         self._anthropic_client = None                    # reuse HTTP connection pool
         self._openai_client    = None
         self._deepseek_client  = None
-        self._gemini_client    = None
         self._copilot_client   = None
+        self._gemini_client    = None
 
         # Pre-compute curses attributes (avoids repeated function calls every frame)
         try:
@@ -5795,6 +5788,9 @@ class TUI:
             curses.mousemask(curses.ALL_MOUSE_EVENTS | _mouse_extra)
         except curses.error:
             pass
+        # Resolve scroll-wheel bit masks — values differ between ncurses and PDCurses.
+        self._wheel_up   = getattr(curses, 'BUTTON4_PRESSED', 1 << 16)  # ncurses: 0x200000  PDCurses: 0x10000
+        self._wheel_down = getattr(curses, 'BUTTON5_PRESSED', 1 << 21)  # ncurses: 0x400000  PDCurses: 0x200000
 
         # Per-pane dirty flags — skip drawing panes that haven't changed
         self._chat_dirty    = True
@@ -6446,18 +6442,18 @@ class TUI:
                         "set the environment variable and restart"), "?"
             try:
                 if self._gemini_client is None:
-                    self._gemini_client = _gemini_mod.aio.Client(
-                        api_key=GEMINI_API_KEY)
-                from google.genai import types as _gemini_types
+                    self._gemini_client = _gemini_mod.aio.Client(api_key=GEMINI_API_KEY)
                 resp = await self._gemini_client.models.generate_content(
                     model=model_id,
                     contents=prompt,
-                    config=_gemini_types.GenerateContentConfig(max_output_tokens=max_tokens),
-                )
+                    config=_gemini_mod.types.GenerateContentConfig(
+                        max_output_tokens=max_tokens))
                 answer = resp.text if resp.text else "(empty response)"
-                # Gemini usage metadata available via resp.usage_metadata
                 usage  = getattr(resp, "usage_metadata", None)
-                tokens = str(usage.total_token_count) if usage else "?"
+                if usage:
+                    tokens = str(usage.prompt_token_count + usage.candidates_token_count)
+                else:
+                    tokens = "?"
                 return answer, tokens
             except Exception as exc:
                 self._gemini_client = None
@@ -6722,30 +6718,6 @@ class TUI:
             else:
                 base = attr_normal
             _render(i + 1, line, base, tw)  # +1: row 0 is reserved for the title bar
-
-        # ── Visual scrollbar on the right edge ──
-        if total > content_height:
-            bar_x = self.chat_win.getmaxyx()[1] - 1
-            # Handle height: proportional to visible fraction of total lines
-            handle_h = max(1, int(content_height * content_height / total))
-            # Position: offset=0 is bottom, offset=max_offset is top
-            # We want pct=0 at top (offset=max_offset), pct=1 at bottom (offset=0)
-            if max_offset > 0:
-                scroll_pct = (max_offset - offset) / max_offset
-            else:
-                scroll_pct = 0
-            available = content_height - handle_h
-            start_y = 1 + int(scroll_pct * available)
-
-            for r in range(1, content_height + 1):
-                is_handle = (start_y <= r < start_y + handle_h)
-                # Use a solid block for the handle, a dim vertical line for the track
-                char = "█" if is_handle else "│"
-                attr = curses.A_NORMAL if is_handle else curses.A_DIM
-                try:
-                    self.chat_win.addstr(r, bar_x, char, attr)
-                except curses.error:
-                    pass
 
         # Typing indicator — drawn on the row just below the last message row.
         if _typing_names:
@@ -7171,6 +7143,7 @@ class TUI:
         msgid     = _extra[3] if len(_extra) > 3 else ""
         reply_to  = _extra[4] if len(_extra) > 4 else ""
         mention   = _extra[5] if len(_extra) > 5 else ""
+        intent    = _extra[6] if len(_extra) > 6 else ""
         if nick.lower() in self.ignored_nicks:
             return
         if target.startswith("#"):
@@ -8706,7 +8679,7 @@ class TUI:
 
         Usage: /summarize [n] [model]
           n      – number of most-recent messages to include (default 50, max 200)
-          model  – any key from /model  (e.g. sonnet, gpt4o)
+          model  – any key from /model  (e.g. sonnet, gpt4o, gemini)
         """
         if _NO_AI:
             await self.ui_queue.put(("status", "[summarize] disabled by --no-ai")); return
@@ -8835,7 +8808,7 @@ class TUI:
 
         Usage: /vibe <channel> [n] [model]
           n      – number of most-recent messages to include (default 100, max 500)
-          model  – any key from /model  (e.g. sonnet, gpt4o)
+          model  – any key from /model  (e.g. sonnet, gpt4o, gemini)
         """
         if _NO_AI:
             await self.ui_queue.put(("status", "[vibe] disabled by --no-ai")); return
@@ -8952,7 +8925,7 @@ class TUI:
         """Analyze a user's behavior using AI.
 
         Usage: /explain <nick> [model]
-          model  – any key from /model  (e.g. sonnet, gpt4o)
+          model  – any key from /model  (e.g. sonnet, gpt4o, gemini)
         """
         if _NO_AI:
             await self.ui_queue.put(("status", "[explain] disabled by --no-ai")); return
@@ -9081,10 +9054,10 @@ class TUI:
                     avail = "  (OPENAI_API_KEY not set)"
                 elif spec["provider"] == "deepseek" and not DEEPSEEK_API_KEY:
                     avail = "  (DEEPSEEK_API_KEY not set)"
-                elif spec["provider"] == "gemini" and not GEMINI_API_KEY:
-                    avail = "  (GEMINI_API_KEY not set)"
                 elif spec["provider"] == "copilot" and not GITHUB_TOKEN:
                     avail = "  (GITHUB_TOKEN not set)"
+                elif spec["provider"] == "gemini" and not GEMINI_API_KEY:
+                    avail = "  (GEMINI_API_KEY not set)"
                 sw.add_line(f"  {chat_mark}{det_mark} {k:<8} {spec['label']:<22} [{spec['provider']}]{avail}")
             sw.add_line("  > = chat model   D = also used for AI detection")
             sw.add_line(f"  Usage: /model <key>   current: {self.ai_chat_model}")
@@ -9104,8 +9077,8 @@ class TUI:
                 f"Unknown model '{key}'. Available: {keys}  (current: {self.ai_chat_model})"))
 
     async def _slash_api(self, args, extra, line):
-        global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, GITHUB_TOKEN, OLLAMA_URL, LLAMACPP_URL
-        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY", "GITHUB_TOKEN", "OLLAMA_URL", "LLAMACPP_URL"}
+        global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GITHUB_TOKEN, GEMINI_API_KEY, OLLAMA_URL, LLAMACPP_URL
+        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "GITHUB_TOKEN", "GEMINI_API_KEY", "OLLAMA_URL", "LLAMACPP_URL"}
 
         if not args:
             sw = self._status_win()
@@ -9123,8 +9096,8 @@ class TUI:
                 ("Claude",    "ANTHROPIC_API_KEY", ANTHROPIC_API_KEY, "console.anthropic.com"),
                 ("OpenAI",    "OPENAI_API_KEY",    OPENAI_API_KEY,    "platform.openai.com"),
                 ("DeepSeek",  "DEEPSEEK_API_KEY",  DEEPSEEK_API_KEY,  "platform.deepseek.com"),
-                ("Gemini",    "GEMINI_API_KEY",     GEMINI_API_KEY,    "aistudio.google.com/apikey"),
                 ("Copilot",   "GITHUB_TOKEN",       GITHUB_TOKEN,      "github.com/settings/tokens"),
+                ("Gemini",    "GEMINI_API_KEY",     GEMINI_API_KEY,    "console.cloud.google.com"),
                 ("Ollama",    "OLLAMA_URL",         OLLAMA_URL,        "local server — no key needed"),
                 ("llama.cpp", "LLAMACPP_URL",       LLAMACPP_URL,      "local server — no key needed"),
             ]
@@ -9135,7 +9108,6 @@ class TUI:
             sw.add_line("  Set a key:  /api <VAR_NAME> <value>")
             sw.add_line("    /api ANTHROPIC_API_KEY  sk-ant-api03-...")
             sw.add_line("    /api OPENAI_API_KEY     sk-proj-...")
-            sw.add_line("    /api GEMINI_API_KEY     AIzaSy...")
             sw.add_line("    /api OLLAMA_URL         http://192.168.1.10:11434")
             sw.add_line("    /api LLAMACPP_URL       http://192.168.1.10:8033")
             sw.add_line("")
@@ -9159,12 +9131,12 @@ class TUI:
             elif var_name == "DEEPSEEK_API_KEY":
                 DEEPSEEK_API_KEY = value
                 self._deepseek_client = None   # force reconnect with new key
-            elif var_name == "GEMINI_API_KEY":
-                GEMINI_API_KEY = value
-                self._gemini_client = None     # force reconnect with new key
             elif var_name == "GITHUB_TOKEN":
                 GITHUB_TOKEN = value
                 self._copilot_client = None    # force reconnect with new key
+            elif var_name == "GEMINI_API_KEY":
+                GEMINI_API_KEY = value
+                self._gemini_client = None     # force reconnect with new key
             elif var_name == "OLLAMA_URL":
                 OLLAMA_URL = value
             elif var_name == "LLAMACPP_URL":
@@ -9175,7 +9147,7 @@ class TUI:
             return
 
         await self.ui_queue.put(("status",
-            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  DEEPSEEK_API_KEY  GEMINI_API_KEY  GITHUB_TOKEN  OLLAMA_URL  LLAMACPP_URL"))
+            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  DEEPSEEK_API_KEY  GITHUB_TOKEN  OLLAMA_URL  LLAMACPP_URL"))
 
     async def _slash_znc(self, args, extra, line):
         text = (args + " " + extra).strip()
@@ -9653,9 +9625,9 @@ class TUI:
             sw.add_line("  No similar users found" +
                         (f"  (min similarity: {min_sim:.2f})" if min_sim > 0 else ""))
         else:
-            _hr = '\u2500'
             sw.add_line(f"  {'Nick':<20} {'Sim':>6}  {'Msgs':>5}")
-            sw.add_line(f"  {_hr*20} {_hr*6}  {_hr*5}")
+            _h = "\u2500" * 20; _hs = "\u2500" * 6; _hs2 = "\u2500" * 5
+            sw.add_line(f"  {_h} {_hs}  {_hs2}")
             for sim, nick_l, msg_count in results[:20]:
                 sw.add_line(f"  {nick_l:<20} {sim*100:5.1f}%  {msg_count:>5}")
         sw.add_line(f"\u2500\u2500 {len(results)} matches, showing top 20 \u2500\u2500")
@@ -9721,9 +9693,9 @@ class TUI:
         if not connections:
             sw.add_line("  No social connections found.")
         else:
-            _hr = '\u2500'
             sw.add_line(f"  {'Nick':<20} {'Str':>5}  {'Adj':>4} {'Tgt':>4} {'Inv':>4}")
-            sw.add_line(f"  {_hr*20} {_hr*5}  {_hr*4} {_hr*4} {_hr*4}")
+            _h = "\u2500" * 20; _hs = "\u2500" * 5; _hs2 = "\u2500" * 4
+            sw.add_line(f"  {_h} {_hs}  {_hs2} {_hs2} {_hs2}")
             for combined, other, adj_score, tgt_score, inv_score in connections[:20]:
                 sw.add_line(
                     f"  {other:<20} {combined:4.0f}%  "
@@ -9926,14 +9898,14 @@ class TUI:
         _E("/scan_watermark [text]",        "Scan recent msgs or text for LLM watermark patterns")
         _E("/fingerprint <nick> [min_sim]", "Compare a nick's linguistic fingerprint against all others")
         _C("")
-        _H("AI Integration  (Claude + OpenAI + Ollama)")
+        _H("AI Integration  (Claude + OpenAI + Gemini + Ollama + llama.cpp)")
         _E("/askai [model] <question>",   "Ask AI a question; answer shown in dashboard")
         _E("/summarize [n] [model]",      "Summarize last n msgs in current window (default 50)")
-        _E("/model [key]",                "Set/list AI models: opus sonnet haiku gpt4o gpt4 gpt35")
+        _E("/model [key]",                "Set/list AI models: opus sonnet haiku gpt4o gpt4 gpt35 gemini gpro")
         _E("/vibe <channel> [n] [model]", "Analyze channel culture using AI")
         _E("/explain <nick> [model]",     "Analyze a user's behavior using AI")
-        _E("/api",                        "Show AI provider key status (Claude/OpenAI/Ollama)")
-        _E("/api <VAR_NAME> <value>",     "Set an API key in environment: ANTHROPIC_API_KEY OPENAI_API_KEY OLLAMA_URL")
+        _E("/api",                        "Show AI provider key status (Claude/OpenAI/Gemini/Ollama)")
+        _E("/api <VAR_NAME> <value>",     "Set an API key in environment: ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OLLAMA_URL")
         _spec = AI_MODELS.get(self.ai_chat_model, {})
         _C(f"  Current model: {self.ai_chat_model}  ({_spec.get('label','?')}  [{_spec.get('provider','?')}])")
         _C("")
@@ -10027,7 +9999,7 @@ class TUI:
             "── AI  (Claude / OpenAI) ─────────────────────────────────",
             "  /askai [model] <question>  (answer in dashboard)",
             "  /summarize [n] [model]  summarize last n msgs (default 50)",
-            "  /model [key]  set/list model  (opus sonnet haiku gpt4o gpt4 gpt35)",
+            "  /model [key]  set/list model  (opus sonnet haiku gpt4o gpt4 gpt35 gemini gpro)",
             "── Translation ───────────────────────────────────────────",
             "  /autotranslate  toggle CJK → English (default: on)",
             "── Connection ─────────────────────────────────────────────",
@@ -10858,68 +10830,22 @@ class TUI:
                 _, mx, my, _, bstate = curses.getmouse()
             except curses.error:
                 return False
-
-            # Mouse wheel support (ncurses/windows-curses bits)
-            # 0x10000 = BUTTON4_PRESSED (Up), 0x200000 = BUTTON5_PRESSED (Down)
-            if bstate & 0x10000:
+            # Scroll wheel: BUTTON4_PRESSED = up, BUTTON5_PRESSED = down.
+            # Bit values differ between ncurses and PDCurses — resolved at init.
+            if bstate & (self._wheel_up | self._wheel_down):
                 win = self.get_current_window()
-                self._wrap_window(win)
-                max_off = max(0, len(win.wrapped_cache) - self._content_height)
-                win.scroll_offset = min(win.scroll_offset + 3, max_off)
-                self._chat_dirty = True
-                self.dirty = True
-                return True
-            if bstate & 0x200000:
-                win = self.get_current_window()
-                win.scroll_offset = max(0, win.scroll_offset - 3)
-                self._chat_dirty = True
-                self.dirty = True
-                return True
-
-            # ── Interactive Scrollbar Detection ──
-            win = self.get_current_window()
-            self._wrap_window(win)
-            total = len(win.wrapped_cache)
-            content_height = self._content_height
-            max_off = max(0, total - content_height)
-            chat_h, chat_w = self.chat_win.getmaxyx()
-            bar_x = chat_w - 1
-
-            # Handle drag event (REPORT_MOUSE_POSITION = 0x8000000)
-            if self._scrollbar_dragging and (bstate & 0x8000000):
-                click_pct = (my - 1) / (content_height - 1) if content_height > 1 else 0
-                click_pct = max(0, min(1, click_pct))
-                win.scroll_offset = int((1 - click_pct) * max_off)
-                self._chat_dirty = True
-                self.dirty = True
-                return True
-
-            if mx == bar_x and 1 <= my <= content_height and total > content_height:
-                # BUTTON1_PRESSED = 0x2, BUTTON1_CLICKED = 0x4
-                if bstate & (0x2 | 0x4):
-                    self._scrollbar_dragging = True
-                    click_pct = (my - 1) / (content_height - 1) if content_height > 1 else 0
-                    click_pct = max(0, min(1, click_pct))
-                    win.scroll_offset = int((1 - click_pct) * max_off)
-                    self._chat_dirty = True
-                    self.dirty = True
-                    return True
-
-            # If any other mouse button/action happens, stop dragging
-            if not (bstate & (0x2 | 0x4 | 0x8000000)):
-                self._scrollbar_dragging = False
-
-            # my/mx are absolute screen coordinates. chat_win is at (0,0) in our layout.
-            if mx == bar_x and 1 <= my <= content_height and total > content_height:
-                # User clicked the scrollbar column in the chat window
-                # Click at y=1 is top (offset=max_off), y=content_height is bottom (offset=0)
-                click_pct = (my - 1) / (content_height - 1) if content_height > 1 else 0
-                click_pct = max(0, min(1, click_pct))
-                win.scroll_offset = int((1 - click_pct) * max_off)
+                if bstate & self._wheel_up:
+                    self._wrap_window(win)
+                    max_off = max(0, len(win.wrapped_cache) - self._content_height)
+                    win.scroll_offset = min(win.scroll_offset + 3, max_off)
+                elif bstate & self._wheel_down:
+                    win.scroll_offset = max(0, win.scroll_offset - 3)
                 self._chat_dirty = True
                 self.dirty = True
                 return True
             # Fire on any button-1 event (press or click) regardless of platform
+            # constant differences between ncurses and pdcurses/windows-curses.
+            # Values 1-16 cover: released, pressed, clicked, double, triple.
             if not (bstate & 0x001F):
                 return False
             chat_w = self.chat_win.getmaxyx()[1]
@@ -11288,34 +11214,72 @@ def _ensure_deps() -> bool:
 
     # (import_name, pip_package_name, description_for_display)
     wanted: List[Tuple[str, str, str]] = [
-        ("anthropic",    "anthropic",      "Claude API client  (/askai, /summarize)"),
-        ("openai",       "openai",         "OpenAI API client  (/askai, /summarize with GPT models)"),
+        ("anthropic",           "anthropic",              "Claude API client  (/askai, /summarize)"),
+        ("openai",              "openai",                 "OpenAI API client  (/askai, /summarize with GPT models)"),
+        ("google.genai", "google-genai",    "Google AI SDK  (/askai, /summarize with Gemini)"),
     ]
     if not _NO_AI:
         wanted += [
             ("transformers", "transformers",   "AI text detection  (HuggingFace)"),
             ("torch",        "torch",          "AI text detection  (PyTorch)"),
         ]
+    def _spec_missing(imp: str) -> bool:
+        try:
+            return importlib.util.find_spec(imp) is None
+        except ModuleNotFoundError:
+            return True
     missing = [
         (imp, pkg, desc) for imp, pkg, desc in wanted
-        if importlib.util.find_spec(imp) is None
+        if _spec_missing(imp)
     ]
     if not missing:
         return False
 
+    # ── Detect available package installer ──────────────────────────────────
+    def _check_installer() -> Optional[List[str]]:
+        """Return the install command prefix, or None if none found."""
+        # pip via python -m pip
+        try:
+            r = subprocess.run([sys.executable, "-m", "pip", "--version"],
+                               capture_output=True, timeout=5)
+            if r.returncode == 0:
+                return [sys.executable, "-m", "pip", "install"]
+        except Exception:
+            pass
+        # uv pip install
+        for _uv in ("uv", "uv.exe"):
+            try:
+                r = subprocess.run([_uv, "--version"], capture_output=True, timeout=5)
+                if r.returncode == 0:
+                    return [_uv, "pip", "install"]
+            except Exception:
+                pass
+        return None
+
+    installer = _check_installer()
     w = 44
     print("─" * w)
-    print("  Missing packages — installing via pip:")
+    if installer:
+        print(f"  Missing packages — installing via {' '.join(installer[:3])}:")
+    else:
+        print("  Missing packages — no installer found (pip/uv):")
     for _, pkg, desc in missing:
         print(f"    • {pkg:<20}  {desc}")
     print("─" * w)
     print()
 
+    if installer is None:
+        print("  No pip or uv available. Install packages manually:")
+        for _, pkg, desc in missing:
+            print(f"    pip install {pkg}")
+        print("  Then restart the script.")
+        return False
+
     installed_any = False
     for imp, pkg, desc in missing:
-        print(f"  ▸ pip install {pkg}")
+        print(f"  ▸ {' '.join(installer)} {pkg}")
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+            subprocess.check_call(installer + [pkg])
             print(f"  ✓  {pkg} installed\n")
             installed_any = True
         except subprocess.CalledProcessError:
@@ -11336,7 +11300,7 @@ def main():
 
     global DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, DEFAULT_CHANNEL
     global NICKSERV_PASSWORD, SASL_MECHANISM, SASL_CERT, SASL_KEY
-    global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, GITHUB_TOKEN
+    global ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GITHUB_TOKEN, GEMINI_API_KEY
     global OLLAMA_URL, LLAMACPP_URL
 
     # Ensure the pre-curses terminal output can render Unicode box-drawing
@@ -11377,17 +11341,22 @@ def main():
     if _saved.get("openai_api_key"):    OPENAI_API_KEY    = _saved["openai_api_key"]
     if _saved.get("deepseek_api_key"):  DEEPSEEK_API_KEY  = _saved["deepseek_api_key"]
     if _saved.get("github_token"):      GITHUB_TOKEN      = _saved["github_token"]
+    if _saved.get("gemini_api_key"):    GEMINI_API_KEY    = _saved["gemini_api_key"]
     if _saved.get("ollama_url"):        OLLAMA_URL        = _saved["ollama_url"]
     if _saved.get("llamacpp_url"):      LLAMACPP_URL      = _saved["llamacpp_url"]
     if _saved.get("autojoin"):
         _AUTOJOIN_CHANNELS.update(_saved["autojoin"])
 
-    # ── Safe input helper (returns "" on EOF so defaults are used) ─────────────
-    def _input(prompt: str) -> str:
-        try:
-            return input(prompt)
-        except EOFError:
-            return ""
+    # ── Safe input helper (returns "" on EOF / non-TTY so defaults are used) ──
+    if not sys.stdin.isatty():
+        # Double-clicked on Windows — no interactive console; use all defaults.
+        _input = lambda _: ""
+    else:
+        def _input(prompt: str) -> str:
+            try:
+                return input(prompt)
+            except EOFError:
+                return ""
 
     # ── IRC connection ───────────────────────────────────────────────────────────
 
@@ -11428,9 +11397,12 @@ def main():
 
     # NickServ / SASL password (PLAIN and SCRAM-SHA-256)
     _pw_hint = "[configured]" if NICKSERV_PASSWORD else "blank to skip"
-    raw = getpass.getpass(f"  Password ({_pw_hint}) : ")
-    if raw:
-        NICKSERV_PASSWORD = raw
+    try:
+        raw = getpass.getpass(f"  Password ({_pw_hint}) : ")
+        if raw:
+            NICKSERV_PASSWORD = raw
+    except EOFError:
+        pass
 
     # Cert/key paths — only relevant for EXTERNAL and ECDSA
     if SASL_MECHANISM in ("EXTERNAL", "ECDSA-NIST256P-CHALLENGE"):
@@ -11459,8 +11431,8 @@ def main():
     ANTHROPIC_API_KEY = _prompt_key("Anthropic API key", ANTHROPIC_API_KEY)
     OPENAI_API_KEY    = _prompt_key("OpenAI API key",    OPENAI_API_KEY)
     DEEPSEEK_API_KEY  = _prompt_key("DeepSeek API key",  DEEPSEEK_API_KEY)
-    GEMINI_API_KEY    = _prompt_key("Gemini API key",     GEMINI_API_KEY)
     GITHUB_TOKEN      = _prompt_key("GitHub token",      GITHUB_TOKEN)
+    GEMINI_API_KEY    = _prompt_key("Gemini API key",    GEMINI_API_KEY)
 
     print()
     print("  Local inference servers (press Enter to keep).")
@@ -11490,6 +11462,7 @@ def main():
     if OPENAI_API_KEY:    _cfg["openai_api_key"]    = OPENAI_API_KEY
     if DEEPSEEK_API_KEY:  _cfg["deepseek_api_key"]  = DEEPSEEK_API_KEY
     if GITHUB_TOKEN:      _cfg["github_token"]       = GITHUB_TOKEN
+    if GEMINI_API_KEY:    _cfg["gemini_api_key"]     = GEMINI_API_KEY
     save_irc_config(_cfg)
 
     print(f"\n  → {DEFAULT_SERVER}:{DEFAULT_PORT} (SSL)  nick={DEFAULT_NICK}"
@@ -11515,6 +11488,9 @@ def main():
         curses.wrapper(lambda stdscr: asyncio.run(main_curses(stdscr, ai_detector)))
     except (KeyboardInterrupt, SystemExit):
         pass
+
+    if not sys.stdin.isatty():
+        input("\nPress Enter to exit...")
 
 if __name__ == "__main__":
     main()
