@@ -259,9 +259,7 @@ SCORE_KEYS = ("heu", "bino", "cls", "llama")
 
 def line_matches_user(entry: Entry, user: str) -> bool:
     u = user.lower()
-    if entry.user and entry.user.lower() == u:
-        return True
-    return u in entry.raw.lower()
+    return bool(entry.user and entry.user.lower() == u)
 
 
 _NICK_BOUNDARY = re.compile(r"[A-Za-z0-9_\-\[\]\\^{}|`]")
@@ -2596,7 +2594,7 @@ def apply_view(entries: Iterable[Entry], view: View) -> list[Entry]:
         if not in_time_range(e.ts, view.since, view.until):
             continue
         if u:
-            ok = (e.user and e.user.lower() == u) or (u in (e.raw or "").lower())
+            ok = (e.user and e.user.lower() == u) or _mentions(e.raw or "", view.user)
             if not ok:
                 continue
         if t and not (e.target and e.target.lower() == t):
@@ -2994,7 +2992,7 @@ def analyze_user_with_llm(user: str, lines: list[str], llm_url: str,
     print(f"Sending {len(chunks)} chunk(s) to LLM at {llm_url} (model={model}).")
 
     system = (
-        "You are a log-analysis assistant. Given log lines that all relate to a "
+        "You are a log-analysis assistant. Given log lines authored by a "
         "single user/identifier, summarize that user's behavior: what they do, "
         "when they are active, who/what they interact with, anomalies, and any "
         "signs of trouble. Be concrete, cite line patterns, and keep it tight."
@@ -3004,7 +3002,7 @@ def analyze_user_with_llm(user: str, lines: list[str], llm_url: str,
     for i, chunk in enumerate(chunks, 1):
         prompt = (
             f"User of interest: {user}\n"
-            f"Chunk {i}/{len(chunks)} of log lines mentioning this user:\n\n"
+            f"Chunk {i}/{len(chunks)} of log lines authored by this user:\n\n"
             f"{chunk}\n\n"
             f"Summarize this chunk's evidence about {user}'s behavior."
         )
@@ -3940,6 +3938,12 @@ def start_web_server(port: int = 8088, daemon: bool = True) -> HTTPServer:
 # ---------- NEW: Web Portal (#30) ----------------------------------------------
 
 PORTAL_COMMANDS: list[tuple[str, str, str]] = [
+    ("load", "load <path>", "Load a different log file."),
+    ("reload", "reload", "Re-read the current log file from disk."),
+    ("user", "user <nick>", "Focus on a user (empty arg clears)."),
+    ("clear_filters", "clear_filters", "Clear all global filters."),
+    ("back", "back", "Restore previous focus state."),
+    ("forward", "forward", "Re-apply focus undone by 'back'."),
     ("report", "report [user]", "Full stats report."),
     ("users", "users [N]", "Top N users by activity."),
     ("events", "events [N]", "Top N event types."),
@@ -3963,10 +3967,51 @@ PORTAL_COMMANDS: list[tuple[str, str, str]] = [
     ("alias", "alias [<name>=<cmd>]", "Define/list/remove aliases."),
     ("ignore", "ignore [add|drop|list]", "Manage ignore list."),
     ("note", "note <user> [text]", "Attach/del user note."),
+    # --- user analysis ---
+    ("sentiment", "sentiment [user]", "Sentiment analysis for a user."),
+    ("topics", "topics [user]", "Keyword / n-gram extraction for a user."),
+    ("lifecycle", "lifecycle [user]", "User lifecycle analysis."),
+    ("churn", "churn [user]", "Predict churn risk for a user."),
+    ("pattern", "pattern [user]", "Pattern-of-life analysis for a user."),
+    ("anomalies", "anomalies [user] [z]", "Detect behavioral anomalies."),
+    ("changepoints", "changepoints [user] [days]", "Detect behavioral change points."),
+    ("multifactor", "multifactor [user]", "Multi-factor anomaly score."),
+    ("forecast", "forecast [user] [days]", "Forecast future activity."),
+    ("forecast_anomaly", "forecast_anomaly <user> [z] [days]", "Anomaly detection using forecast baseline."),
+    ("recurrence", "recurrence [user]", "Detect periodic patterns in a user's activity."),
+    ("recurrence_breach", "recurrence_breach <user> [days]", "Check if user breaks recurrence pattern."),
+    ("drift", "drift <user> [args]", "Detect behavioral drift across time windows."),
+    # --- interaction analysis ---
+    ("response_times", "response_times [user] [window]", "Response time analysis."),
+    ("session_times", "session_times <A> <B> [gap]", "Response times grouped by session."),
+    ("influence", "influence <seed> [hops] [window]", "Trace multi-hop reply chains."),
+    ("sequences", "sequences [min_support]", "Find common user interaction sequences."),
+    ("rootcause", "rootcause <user> [lookback]", "Root cause tracing for a user's activity."),
+    ("correlate", "correlate <path> [window]", "Cross-log event correlation."),
+    ("pareto", "pareto [users|events|targets|levels]", "Pareto analysis (80/20 rule)."),
+    # --- visualization ---
+    ("timeline", "timeline [user] [width]", "ASCII timeline visualization."),
+    ("heatmap", "heatmap [user] [months]", "Calendar activity heatmap."),
+    ("net", "net [N]", "ASCII network graph of top interaction edges."),
+    ("templates", "templates [N]", "Extract common log line templates."),
+    ("template_filter", "template_filter <id>", "Filter current view by template ID."),
+    ("prometheus", "prometheus", "Print Prometheus metrics."),
+    ("dataframe", "dataframe [expr]", "View entries as pandas DataFrame."),
+    # --- LLM ---
     ("analyze", "analyze [nick]", "LLM behavior analysis."),
     ("ask", 'ask [nick] "Q"', "Free-form LLM question."),
+    ("askall", 'askall "Q"', "Ask LLM a question about the entire log."),
     ("interact", "interact <A> <B>", "User interaction analysis."),
     ("compare", "compare <A> <B>...", "Multi-user comparison."),
+    ("compare-auto", "compare-auto <A> <B>", "Compare users then auto-explain with LLM."),
+    ("tag", "tag <user>", "LLM auto-tag a user with behavioral labels."),
+    ("tagall", "tagall [N]", "LLM auto-tag top N users."),
+    ("explain", "explain <user>", "LLM explains anomalies for a user."),
+    ("summarize", "summarize <A> <B>", "LLM conversation summarization."),
+    ("cluster", "cluster [min_lines] [N]", "LLM cluster users into behavioral groups."),
+    ("auto_report", "auto_report", "LLM-generated narrative report of the log."),
+    ("drift-explain", "drift-explain <user>", "Drift detection with LLM explanation."),
+    # --- analysis ---
     ("similar", "similar [threshold]", "Find similar user pairs."),
     ("bursts", "bursts [user]", "Detect activity bursts."),
     ("threads", "threads [user]", "Reply/mention reconstruction."),
@@ -3979,20 +4024,34 @@ PORTAL_COMMANDS: list[tuple[str, str, str]] = [
     ("export", "export <type> <path>", "Serialize data."),
     ("view", "view {save|load|drop|show}", "Named filter sets."),
     ("script", "script <path>", "Run commands from file."),
+    # --- forensic ---
     ("entities", "entities [user]", "Forensic entity extraction."),
     ("gaps", "gaps [user]", "Detect timeline gaps."),
     ("reconstruct", "reconstruct [user]", "Chronological timeline."),
     ("forensic_report", "forensic_report <user>", "LLM forensic report."),
     ("timeline_narrative", "timeline_narrative <user>", "LLM timeline story."),
     ("evidence", "evidence <user>", "LLM evidence extraction."),
+    # --- multi-log / export ---
+    ("multi", "multi {add|list|clear|report}", "Multi-log aggregation."),
+    ("aggregate", "aggregate", "Alias for multi report."),
+    ("export_html", "export_html <path> [user...]", "Generate HTML report."),
+    ("export_html_drilldown", "export_html_drilldown <path> [user...]", "Collapsible HTML report."),
+    ("export_sql", "export_sql <path>", "Export entries to SQLite."),
+    ("sql", "sql <db> <query>", "Query a SQLite export."),
+    ("save_profile", "save_profile <user> <path>", "Save user profile to JSON."),
+    ("load_profile", "load_profile <path>", "Load and display a saved profile."),
+    ("compare_profiles", "compare_profiles <path1> <path2> [...]", "Compare saved profiles."),
+    # --- system ---
     ("web", "web {start|stop|status}", "Web API server."),
     ("webportal", "webportal {start|stop|status}", "Portal server."),
     ("webhook", "webhook {set|test|clear}", "Slack/Discord webhook."),
     ("cron", "cron [--output <path>]", "Cron mode analysis."),
     ("dashboard", "dashboard", "Curses real-time dashboard."),
     ("watch", "watch [poll_sec]", "Tail log file."),
+    ("watch_alert", "watch_alert [poll_sec]", "Tail log with alert evaluation."),
     ("chart", "chart <type> <path>", "Generate matplotlib chart."),
     ("rules", "rules [add|remove|toggle]", "Alert rules."),
+    ("alert_fatigue", "alert_fatigue [hours]", "Compute alert fatigue scores."),
     ("save_config", "save_config", "Persist config to disk."),
     ("load_config", "load_config", "Reload config from disk."),
     ("commands", "commands", "Print this reference."),
@@ -4166,15 +4225,18 @@ function fetchLog(){
 function renderMenu(data){
   cmds=data;
   var html='<div class="mc">available commands — '+data.length+' total</div>';
-  var cat='';var order=['analysis','viewing','filters','forensic','config','system'];
-  var cats={'analysis':['report','users','events','top','hours','days','errors','dist','zscores','flagged','sessions','bursts','edges','threads','similar','diff','chart'],
-            'viewing':['show','pick','inspect','last','info','grep','search'],
+  var cat='';var order=['nav','analysis','viewing','filters','interaction','forensic','llm','multi','config','system'];
+  var cats={'nav':['user','clear_filters','back','forward'],
+            'analysis':['report','users','events','top','hours','days','errors','dist','zscores','flagged','sessions','bursts','edges','threads','similar','diff','sentiment','topics','lifecycle','churn','pattern','anomalies','changepoints','multifactor','forecast','forecast_anomaly','recurrence','recurrence_breach','drift','templates','pareto'],
+            'viewing':['show','pick','inspect','last','info','grep','search','timeline','heatmap','net','dataframe','template_filter','prometheus'],
             'filters':['focus','target','since','until','view','ignore'],
+            'interaction':['response_times','session_times','influence','sequences','rootcause','correlate'],
             'forensic':['entities','gaps','reconstruct','forensic_report','timeline_narrative','evidence'],
-            'config':['settings','set','alias','note','save_config','load_config','rules','web','webportal','webhook'],
-            'llm':['analyze','ask','interact','compare'],
-            'system':['commands','help','quit','script','export','cron','dashboard','watch']};
-  var catLabel={'analysis':'analysis','viewing':'viewing','filters':'filters','forensic':'forensic','config':'config','llm':'llm','system':'system'};
+            'llm':['analyze','ask','askall','interact','compare','compare-auto','tag','tagall','explain','summarize','cluster','auto_report','drift-explain'],
+            'multi':['multi','aggregate','export_html','export_html_drilldown','export_sql','sql','save_profile','load_profile','compare_profiles'],
+            'config':['settings','set','alias','note','load','reload','save_config','load_config','rules','web','webportal','webhook'],
+            'system':['commands','help','quit','script','export','cron','dashboard','watch','watch_alert','alert_fatigue']};
+  var catLabel={'nav':'navigation','analysis':'analysis','viewing':'viewing','filters':'filters','interaction':'interaction','forensic':'forensic','llm':'llm','multi':'multi-log / export','config':'config','system':'system'};
   var done={};
   for(var ci=0;ci<order.length;ci++){
     var g=order[ci];var items=cats[g];
@@ -4263,15 +4325,8 @@ function sendCmd(cmd){
     body:JSON.stringify({command:cmd})
   }).then(r=>r.json()).then(data=>{
     if(data.output&&data.output.trim()){
-      const lines=data.output.split('\n');
-      const maxLines=80;
-      const show=lines.length>maxLines?lines.slice(0,maxLines):lines;
-      const outEntry={_type:'out',id:Date.now()+2,text:show.join('\n')};
+      const outEntry={_type:'out',id:Date.now()+2,text:data.output};
       addOutput(outEntry);
-      if(lines.length>maxLines){
-        const trunc={_type:'out',id:Date.now()+3,text:'... ('+(lines.length-maxLines)+' more lines truncated)'};
-        addOutput(trunc);
-      }
     }else{
       const outEntry={_type:'out',id:Date.now()+2,text:'(no output)'};
       addOutput(outEntry);
@@ -4907,12 +4962,13 @@ class LogShell(cmd.Cmd):
         user = self._resolve_user(arg)
         if not user:
             return
-        matched = self._filtered(user)
-        if not matched:
-            print(f"No lines match '{user}'.")
+        u = user.lower()
+        authored = [e for e in self._time_filtered() if e.user and e.user.lower() == u]
+        if not authored:
+            print(f"No lines authored by '{user}'.")
             return
         analyze_user_with_llm(
-            user, [e.text for e in matched],
+            user, [e.raw for e in authored],
             self.state.llm_url, self.state.llm_model,
             self.state.max_chunk_chars, cache=self.state.llm_cache,
         )
@@ -4935,12 +4991,13 @@ class LogShell(cmd.Cmd):
         if not nick:
             print('Usage: ask <nick> "<question>"  (or set "user <nick>" first)')
             return
-        matched = self._filtered(nick)
-        if not matched:
-            print(f"No lines match '{nick}'.")
+        u = nick.lower()
+        authored = [e for e in self._time_filtered() if e.user and e.user.lower() == u]
+        if not authored:
+            print(f"No lines authored by '{nick}'.")
             return
         ask_about_user_with_llm(
-            nick, question, [e.text for e in matched],
+            nick, question, [e.raw for e in authored],
             self.state.llm_url, self.state.llm_model,
             self.state.max_chunk_chars, cache=self.state.llm_cache,
         )
@@ -5174,7 +5231,7 @@ class LogShell(cmd.Cmd):
         for e in self.state.entries:
             if not in_time_range(e.ts, since, until):
                 continue
-            if u_l and not (e.user and e.user.lower() == u_l) and u_l not in (e.raw or "").lower():
+            if u_l and not (e.user and e.user.lower() == u_l) and not _mentions(e.raw or "", user):
                 continue
             if t_l and not (e.target and e.target.lower() == t_l):
                 continue
@@ -6117,6 +6174,149 @@ class LogShell(cmd.Cmd):
         profiles = [build_profile(self._active_entries(), u) for u in top_users]
         llm_auto_report(s, profiles, self.state.llm_url, self.state.llm_model,
                         self.state.max_chunk_chars, cache=self.state.llm_cache)
+
+    # --- tag (#31) ------------------------------------------------------------
+    def do_tag(self, arg: str) -> None:
+        """tag <user>   LLM auto-tag a user with behavioral labels."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        matched = self._filtered(user)
+        if not matched:
+            print(f"No lines match '{user}'.")
+            return
+        result = auto_tag_user(matched, user, self.state.llm_url,
+                                self.state.llm_model, self.state.max_chunk_chars,
+                                cache=self.state.llm_cache)
+        print(f"\nTags for {user}: {result}")
+
+    def do_tagall(self, arg: str) -> None:
+        """tagall [N]   LLM auto-tag top N users."""
+        parts = self._split(arg)
+        n = 10
+        if parts and parts[0].isdigit():
+            n = int(parts[0])
+        results = auto_tag_bulk(self._active_entries(), self.state.llm_url,
+                                self.state.llm_model, self.state.max_chunk_chars,
+                                cache=self.state.llm_cache, top_n=n)
+        if not results:
+            print("(no users to tag)")
+            return
+        print(f"\nAuto-tags for top {len(results)} users:")
+        for user, tags in results.items():
+            print(f"  {user:<20s}  {tags}")
+
+    def do_explain(self, arg: str) -> None:
+        """explain <user>   LLM explains anomalies for a user."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        matched = self._filtered(user)
+        if len(matched) < 7:
+            print(f"Not enough data for '{user}' (need >=7 lines).")
+            return
+        anomalies = detect_anomalies(matched, user)
+        if not anomalies:
+            print(f"(no anomalies detected for {user})")
+            return
+        context = [e.text for e in matched[-30:]]
+        llm_explain_anomalies(anomalies, context, self.state.llm_url,
+                              self.state.llm_model, self.state.max_chunk_chars,
+                              cache=self.state.llm_cache)
+
+    def do_askall(self, arg: str) -> None:
+        """askall "<question>"   Ask LLM a free-form question about the entire log."""
+        if not arg.strip():
+            print('Usage: askall "<question>"')
+            return
+        question = arg.strip()
+        lines = [e.text for e in self._active_entries() if e.text]
+        if not lines:
+            print("(no text entries to analyze)")
+            return
+        chunks = chunk_lines(lines, self.state.max_chunk_chars)
+        print(f"\nAsking LLM about entire log ({len(chunks)} chunk(s)) at {self.state.llm_url} (model={self.state.llm_model}).")
+        system = (
+            "You are a log-analysis assistant. Given the complete set of log lines, "
+            "answer the operator's question concretely, citing evidence from the data. "
+            "If the data does not contain enough information to answer, say so."
+        )
+        partials = []
+        for i, chunk in enumerate(chunks, 1):
+            prompt = (
+                f"Chunk {i}/{len(chunks)} of the full log:\n\n{chunk}\n\n"
+                f"Question: {question}\n\n"
+                f"Answer for this chunk, citing specific lines when useful."
+            )
+            try:
+                out = call_llm_cached(self.state.llm_url, self.state.llm_model, system, prompt,
+                                      cache=self.state.llm_cache, spinner_msg=f"LLM chunk {i}/{len(chunks)}")
+            except Exception as exc:
+                print(f"  [chunk {i}] error: {exc}", file=sys.stderr)
+                return
+            partials.append(out)
+            print(f"\n--- Chunk {i}/{len(chunks)} answer ---\n{out}")
+        if len(partials) > 1:
+            merge = (
+                f"Question: {question}\n\n"
+                f"Combine the per-chunk answers below into one coherent response. "
+                f"Resolve contradictions and cite the strongest evidence.\n\n"
+                + "\n\n---\n\n".join(f"Chunk {i+1}:\n{p}" for i, p in enumerate(partials))
+            )
+            try:
+                final = call_llm_cached(self.state.llm_url, self.state.llm_model, system, merge,
+                                        cache=self.state.llm_cache, spinner_msg="LLM merging answers")
+                print(f"\n=== Final answer ===\n{final}")
+            except Exception as exc:
+                print(f"Merge failed: {exc}")
+
+    def do_compare_auto(self, arg: str) -> None:
+        """compare-auto <A> <B>   Compare two users then auto-explain differences with LLM."""
+        parts = self._split(arg)
+        if len(parts) < 2:
+            print("Usage: compare-auto <userA> <userB>")
+            return
+        a, b = parts[0], parts[1]
+        pa = build_profile(self._time_filtered(), a)
+        pb = build_profile(self._time_filtered(), b)
+        if not pa["authored"] and not pb["authored"]:
+            print(f"Neither '{a}' nor '{b}' authored lines in this log.")
+            return
+        # Print the comparison table then feed to LLM
+        print_compare_table(pa, pb)
+        print()
+        compare_n_users_with_llm([pa, pb], self.state.llm_url, self.state.llm_model,
+                                 self.state.max_chunk_chars, cache=self.state.llm_cache)
+
+    def do_drift_explain(self, arg: str) -> None:
+        """drift-explain <user>   Drift detection with LLM explanation."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        result = drift_detection(self._active_entries(), user)
+        if result.get("drift_detected"):
+            print(f"\nDrift detected for '{user}':")
+            print(f"  drift_score: {result.get('drift_score', '?')}")
+            print(f"  avg_hourly_delta: {result.get('avg_hourly_delta', '?')}")
+            print(f"  max_hourly_delta: {result.get('max_hourly_delta', '?')}")
+            lines = [e.text for e in self._filtered(user)[-50:] if e.text]
+            if lines and self.state.llm_url:
+                system = "You are a behavioral drift analyst. Explain the detected behavioral drift concisely."
+                prompt = (
+                    f"User '{user}' shows behavioral drift. drift_score={result.get('drift_score')}, "
+                    f"avg_hourly_delta={result.get('avg_hourly_delta')}, "
+                    f"max_hourly_delta={result.get('max_hourly_delta')}.\n\n"
+                    f"Recent lines from this user:\n" + "\n".join(lines) + "\n\n"
+                    f"Explain what might be causing this drift and whether it's concerning."
+                )
+                try:
+                    explanation = call_llm_cached(self.state.llm_url, self.state.llm_model, system, prompt,
+                                                  cache=self.state.llm_cache, spinner_msg="LLM explaining drift")
+                    print(f"\n=== LLM drift explanation ===\n{explanation}")
+                except Exception as exc:
+                    print(f"LLM drift explanation failed: {exc}")
+        else:
+            print(f"(no drift detected for '{user}' — {result.get('note', '')})")
 
     # --- NEW: plugin (#23) ---------------------------------------------------
     def do_plugin(self, arg: str) -> None:
