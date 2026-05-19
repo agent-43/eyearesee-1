@@ -222,17 +222,24 @@ CLAUDE_MODELS: Dict[str, str] = {
 }
 CLAUDE_DEFAULT_MODEL = "qwen3"    # default model key
 
-# 5 built-in UI colour themes
+# 12 built-in UI colour themes
 # Each row: (name, pair1_fg, pair1_bg, pair2_fg, pair2_bg, pair3_fg, pair3_bg, pair8_fg, pair8_bg)
 #   pair1 = chat title bar    pair2 = userlist header
 #   pair3 = suspect nick      pair8 = /me action line
 # Colours: 0=black 1=red 2=green 3=yellow 4=blue 5=magenta 6=cyan 7=white  -1=terminal default
 THEMES: List[Tuple] = [
-    ("Classic",  6, -1,  5, -1,  3, -1,  2, -1),  # cyan title / magenta users / yellow suspect / green action
-    ("Hacker",   2,  0,  2,  0,  2, -1,  2, -1),  # matrix-green on black
-    ("Ocean",    7,  4,  6,  4,  6, -1,  6, -1),  # white+cyan headers on blue
-    ("Sunset",   0,  3,  1, -1,  1, -1,  3, -1),  # black-on-yellow title / red suspects / yellow action
-    ("Neon",     0,  5,  5, -1,  5, -1,  6, -1),  # black-on-magenta title / magenta suspects / cyan action
+    ("Classic",   6, -1,  5, -1,  3, -1,  2, -1),  # cyan title / magenta users / yellow suspect / green action
+    ("Hacker",    2,  0,  2,  0,  2, -1,  2, -1),  # matrix-green on black
+    ("Ocean",     7,  4,  6,  4,  6, -1,  6, -1),  # white+cyan headers on blue
+    ("Sunset",    0,  3,  1, -1,  1, -1,  3, -1),  # black-on-yellow title / red suspects / yellow action
+    ("Neon",      0,  5,  5, -1,  5, -1,  6, -1),  # black-on-magenta title / magenta suspects / cyan action
+    ("Nord",      6,  0,  4,  0,  1, -1,  2, -1),  # nord-inspired: cyan title / blue users / red suspect
+    ("Dracula",   5,  0,  6,  0,  3, -1,  2, -1),  # dracula: magenta title / cyan users / yellow suspect
+    ("Monokai",   3,  0,  2,  0,  1, -1,  6, -1),  # monokai: yellow title / green users / red suspect
+    ("Solarized", 3,  0,  4,  0,  1, -1,  2, -1),  # solarized dark: yellow title / blue users / red suspect
+    ("Gruvbox",   3,  0,  2,  0,  1, -1,  6, -1),  # gruvbox dark: yellow title / green users / cyan action
+    ("Tokyo",     5,  0,  6,  0,  1, -1,  2, -1),  # tokyo night: magenta title / cyan users / red suspect
+    ("Catppuccin",5,  0,  6,  0,  3, -1,  2, -1),  # catppuccin mocha: mauve title / teal users / yellow suspect
 ]
 
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
@@ -1072,7 +1079,8 @@ def log_ai_event(nick: str, target: str, msg: str,
                  llama_score: float = 0.0,
                  adv_score: float = 0.0,
                  embed_score: float = 0.0,
-                 watermark_score_val: float = 0.0) -> None:
+                 watermark_score_val: float = 0.0,
+                 styl_score: float = 0.0) -> None:
     """Write one JSONL detection record to ai_scores.log.
 
     Every record contains the full signal breakdown so any line can be
@@ -1096,6 +1104,7 @@ def log_ai_event(nick: str, target: str, msg: str,
       adv       – adversarial-evasion sub-score (char n-gram entropy + spacing)
       embed     – embedding-variance sub-score (0 when no history)
       wm        – watermark-detection sub-score
+      styl      – stylometric sub-score (burstiness + lexical diversity + punctuation)
       msg       – raw message text (JSON-escaped)
     """
     if not _ai_logging_enabled:
@@ -1113,6 +1122,7 @@ def log_ai_event(nick: str, target: str, msg: str,
     adv_score   = max(0.0, min(1.0, float(adv_score)))
     embed_score = max(0.0, min(1.0, float(embed_score)))
     watermark_score_val = max(0.0, min(1.0, float(watermark_score_val)))
+    styl_score  = max(0.0, min(1.0, float(styl_score)))
     # Cap the stored message at the IRC protocol line length to bound record size.
     msg_logged  = msg[:512]
     global _log_seq
@@ -1137,6 +1147,7 @@ def log_ai_event(nick: str, target: str, msg: str,
         "adv":     round(adv_score,   4),
         "embed":   round(embed_score, 4),
         "wm":      round(watermark_score_val, 4),
+        "styl":    round(styl_score,  4),
         "msg":     msg_logged,
     }
     _ai_log_write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -1874,6 +1885,160 @@ class EnsembleAIDetector:
         return 1.0 - (len(set(words)) / len(words))
 
     @staticmethod
+    def _burstiness(text: str) -> float:
+        """Measure sentence-length variance (burstiness).
+
+        Human writing exhibits high burstiness — alternating short and long
+        sentences.  LLM output tends toward uniform sentence lengths.
+        Returns 0..1, higher = more human-like burstiness.
+        """
+        if not text:
+            return 0.0
+        sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+        if len(sentences) < 3:
+            return 0.0  # not enough data
+        lengths = [len(s.split()) for s in sentences]
+        mean_len = sum(lengths) / len(lengths)
+        if mean_len < 1:
+            return 0.0
+        variance = sum((l - mean_len) ** 2 for l in lengths) / len(lengths)
+        cv = (variance ** 0.5) / mean_len  # coefficient of variation
+        # Human text: CV typically 0.4–1.2; AI text: CV 0.1–0.4
+        return max(0.0, min(1.0, (cv - 0.15) / 0.85))
+
+    @staticmethod
+    def _lexical_diversity(text: str) -> float:
+        """Measure of Textual Lexical Diversity (MTLD-style approximation).
+
+        Humans use a wider variety of unique words relative to total word count.
+        LLMs tend to recycle common vocabulary more frequently.
+        Returns 0..1, higher = more diverse (human-like).
+        """
+        if not text:
+            return 0.0
+        words = [w.lower().strip(".,!?;:\"'()[]") for w in text.split() if w.strip(".,!?;:\"'()[]")]
+        if len(words) < 5:
+            return 0.0
+        # Type-token ratio over sliding windows (more robust than simple TTR)
+        window_size = 10
+        ttr_values = []
+        for i in range(0, len(words) - window_size + 1, window_size // 2):
+            window = words[i:i + window_size]
+            if len(window) >= window_size:
+                ttr_values.append(len(set(window)) / len(window))
+        if not ttr_values:
+            return 0.0
+        avg_ttr = sum(ttr_values) / len(ttr_values)
+        # Human IRC: ~0.7–0.95; AI: ~0.5–0.75
+        return max(0.0, min(1.0, (avg_ttr - 0.45) / 0.55))
+
+    @staticmethod
+    def _punctuation_anomaly(text: str) -> float:
+        """Detect unusual punctuation patterns common in AI output.
+
+        LLMs overuse certain punctuation (em-dashes, semicolons, colons)
+        and underuse others (ellipses, interrobangs, casual punctuation).
+        Returns 0..1, higher = more anomalous (AI-like).
+        """
+        if not text or len(text) < 10:
+            return 0.0
+        score = 0.0
+        words = text.split()
+        n_words = len(words)
+
+        # Em-dash density (LLMs love em-dashes for parentheticals)
+        emdash_count = text.count('\u2014') + text.count(' -- ')
+        if emdash_count > 0 and n_words > 10:
+            ratio = emdash_count / (n_words / 20)  # expected ~1 per 20 words
+            if ratio > 2.0:
+                score += 0.15
+
+        # Semicolon density (rare in casual IRC, common in AI prose)
+        semicolon_count = text.count(';')
+        if semicolon_count > 1 and n_words < 50:
+            score += 0.10 * min(1.0, semicolon_count / 2)
+
+        # Colon density (LLMs use colons to introduce lists/explanations)
+        colon_count = text.count(':') - text.count('::')  # exclude IRC smileys
+        if colon_count > 1 and n_words < 40:
+            score += 0.10 * min(1.0, colon_count / 2)
+
+        # Lack of casual punctuation (humans use ???, !!!, ?!, etc.)
+        has_casual_punct = bool(re.search(r'[!?]{2,}|[\?!]{2,}|\.{4,}', text))
+        if not has_casual_punct and n_words > 15:
+            score += 0.08
+
+        # Overly balanced parentheses (LLMs use them for asides)
+        paren_pairs = min(text.count('('), text.count(')'))
+        if paren_pairs > 2 and n_words < 60:
+            score += 0.07 * min(1.0, paren_pairs / 3)
+
+        return min(1.0, score)
+
+    @staticmethod
+    def _function_word_ratio(text: str) -> float:
+        """Ratio of function words to content words.
+
+        LLMs tend to have higher function-word density due to verbose
+        connective tissue ("it is important to note that...", etc.).
+        Returns 0..1, higher = more function-word heavy (AI-like).
+        """
+        if not text:
+            return 0.0
+        words = [w.lower().strip(".,!?;:\"'()[]") for w in text.split() if w.strip(".,!?;:\"'()[]")]
+        if len(words) < 5:
+            return 0.0
+
+        _function_words = frozenset({
+            "the", "a", "an", "of", "to", "in", "is", "that", "for", "it",
+            "on", "and", "be", "or", "as", "at", "by", "with", "this", "are",
+            "was", "were", "been", "has", "have", "had", "do", "does", "did",
+            "will", "would", "can", "could", "may", "might", "shall", "should",
+            "not", "no", "so", "if", "than", "then", "but", "because", "we",
+            "they", "them", "their", "there", "here", "where", "when", "what",
+            "which", "who", "whom", "whose", "about", "into", "through",
+            "during", "before", "after", "above", "below", "between",
+            "under", "again", "further", "once", "also", "just", "even",
+            "still", "already", "always", "never", "often", "sometimes",
+            "usually", "however", "therefore", "thus", "hence", "moreover",
+            "furthermore", "additionally", "consequently", "nevertheless",
+        })
+
+        func_count = sum(1 for w in words if w in _function_words)
+        ratio = func_count / len(words)
+        # Human IRC: ~0.25–0.40; AI: ~0.40–0.55
+        return max(0.0, min(1.0, (ratio - 0.30) / 0.25))
+
+    @staticmethod
+    def _sentence_openers_variety(text: str) -> float:
+        """Measure variety of sentence/phrase openers.
+
+        Humans vary how they start sentences; LLMs often repeat patterns
+        ("The...", "It...", "This...", "Additionally,...").
+        Returns 0..1, higher = more varied (human-like).
+        """
+        if not text:
+            return 0.0
+        # Split on sentence boundaries and line breaks
+        segments = re.split(r'[.!?]+\s*|\n', text)
+        segments = [s.strip() for s in segments if len(s.strip()) > 3]
+        if len(segments) < 3:
+            return 0.0
+
+        # Extract first 2 words of each segment
+        openers = []
+        for seg in segments:
+            words = seg.split()[:2]
+            if words:
+                openers.append(' '.join(w.lower() for w in words))
+
+        if not openers:
+            return 0.0
+        unique_ratio = len(set(openers)) / len(openers)
+        # Human: ~0.7–1.0; AI: ~0.3–0.7
+        return max(0.0, min(1.0, (unique_ratio - 0.25) / 0.75))
+
+    @staticmethod
     def formality_score(text: str) -> float:
         """0..1 — calibrated for 2025/2026 LLM output patterns in IRC chat."""
         if not text: return 0.0
@@ -1971,21 +2136,36 @@ class EnsembleAIDetector:
         return min(1.0, score)
 
     def _heuristic_score(self, text: str) -> float:
-        """Combined heuristic score incorporating general formality and
-        Llama-specific structural/phrasing signals."""
+        """Combined heuristic score incorporating general formality,
+        Llama-specific patterns, burstiness, lexical diversity, and
+        punctuation anomalies."""
         form  = self.formality_score(text)
         llama = self.llama_pattern_score(text)
         rep   = self.repetition(text)
         ent   = self.entropy(text)
         length = min(1.0, len(text) / 300.0)
         ent_penalty = max(0.0, (ent - 4.0) / 2.0)
+
+        # New signals
+        burst   = 1.0 - self._burstiness(text)          # low burstiness → AI-like
+        lex_div = 1.0 - self._lexical_diversity(text)   # low diversity → AI-like
+        punct   = self._punctuation_anomaly(text)       # high anomaly → AI-like
+        func_w  = self._function_word_ratio(text)       # high ratio → AI-like
+        opener  = 1.0 - self._sentence_openers_variety(text)  # low variety → AI-like
+
         # llama_pattern_score is a strong direct signal — give it equal weight to formality
+        # New signals get moderate weight to complement existing heuristics
         return max(0.0, min(1.0,
-            0.38 * form
-            + 0.35 * llama
-            + 0.14 * rep
-            + 0.07 * length
-            - 0.14 * ent_penalty
+            0.28 * form
+            + 0.25 * llama
+            + 0.10 * rep
+            + 0.05 * length
+            - 0.10 * ent_penalty
+            + 0.08 * burst
+            + 0.08 * lex_div
+            + 0.06 * punct
+            + 0.06 * func_w
+            + 0.04 * opener
         ))
 
     # ---- ML signals ----
@@ -2208,19 +2388,23 @@ class EnsembleAIDetector:
 
         Keys:
           prob  – final ensemble score (0–1)
-          heu   – combined heuristic (formality + Llama patterns + repetition)
+          heu   – combined heuristic (formality + Llama patterns + repetition
+                  + burstiness + lexical diversity + punctuation + function words)
           llama – raw Llama-specific pattern sub-score (0–1)
           bino  – Binoculars perplexity ratio score (0–1)
           cls   – average classifier score across all loaded models (0–1)
           adv   – adversarial-evasion score (char n-gram entropy + spacing) (0–1)
           embed – embedding-variance score (0–1); needs recent_embeds
+          styl  – stylometric score (burstiness + lexical diversity + punctuation)
+          wm    – watermark detection score (0–1)
 
         All values 0–1; higher = more likely AI-generated.
         Results are LRU-cached (up to _CACHE_MAX entries).
         """
         _zero: Dict[str, float] = {
             "prob": 0.0, "heu": 0.0, "llama": 0.0,
-            "bino": 0.0, "cls": 0.0, "adv": 0.0, "embed": 0.0, "watermark": 0.0}
+            "bino": 0.0, "cls": 0.0, "adv": 0.0, "embed": 0.0,
+            "styl": 0.0, "watermark": 0.0}
         if not self.enabled:
             return _zero
         text = text.strip()
@@ -2240,7 +2424,8 @@ class EnsembleAIDetector:
         if re.search(r'</?think\b', text, re.IGNORECASE):
             _certain: Dict[str, float] = {
                 "prob": 1.0, "heu": 1.0, "llama": 1.0,
-                "bino": 1.0, "cls": 1.0, "adv": 1.0, "embed": 0.0, "watermark": 1.0}
+                "bino": 1.0, "cls": 1.0, "adv": 1.0, "embed": 0.0,
+                "styl": 1.0, "watermark": 1.0}
             if len(self._pred_cache) >= self._CACHE_MAX:
                 self._pred_cache.popitem(last=False)
             self._pred_cache[text] = _certain
@@ -2254,21 +2439,40 @@ class EnsembleAIDetector:
         embed = self._embedding_variance_score(text, recent_embeds or [])
         wm    = self.watermark_score(text)
 
+        # Stylometric composite: burstiness + lexical diversity + punctuation
+        # These capture structural writing patterns independent of vocabulary
+        burst   = 1.0 - self._burstiness(text)
+        lex_div = 1.0 - self._lexical_diversity(text)
+        punct   = self._punctuation_anomaly(text)
+        func_w  = self._function_word_ratio(text)
+        opener  = 1.0 - self._sentence_openers_variety(text)
+        styl    = max(0.0, min(1.0,
+            0.30 * burst
+            + 0.25 * lex_div
+            + 0.20 * punct
+            + 0.15 * func_w
+            + 0.10 * opener
+        ))
+
         # Adaptive ensemble: ML models are unreliable on short IRC messages
         # (< 8 words) — weight heuristics much higher there.  For long text
         # (>= 30 words) Binoculars and the classifiers become more trustworthy.
         n_words = len(text.split())
         if n_words < 8:
-            prob = max(0.0, min(1.0, 0.12 * bino + 0.13 * cls + 0.75 * heu))
+            prob = max(0.0, min(1.0, 0.10 * bino + 0.10 * cls + 0.65 * heu + 0.15 * styl))
         elif n_words < 30:
-            prob = max(0.0, min(1.0, 0.35 * bino + 0.35 * cls + 0.30 * heu))
+            prob = max(0.0, min(1.0, 0.30 * bino + 0.30 * cls + 0.25 * heu + 0.15 * styl))
         else:
-            prob = max(0.0, min(1.0, 0.38 * bino + 0.37 * cls + 0.25 * heu))
+            prob = max(0.0, min(1.0, 0.32 * bino + 0.32 * cls + 0.20 * heu + 0.16 * styl))
 
         # High-confidence override: unambiguous Llama structural output in short
         # IRC messages should score high even when ML signals are uncertain.
         if llama >= 0.60 and prob < 0.55:
             prob = min(1.0, prob * 0.5 + llama * 0.5)
+
+        # Stylometric override: strong structural anomalies push score up
+        if styl >= 0.55 and prob < 0.50:
+            prob = min(1.0, prob + 0.4 * styl * (1.0 - prob))
 
         # Adversarial-evasion override: strong spacing/entropy anomalies push
         # the score upward regardless of the main ensemble.
@@ -2286,7 +2490,7 @@ class EnsembleAIDetector:
 
         result: Dict[str, float] = {
             "prob": prob, "heu": heu, "llama": llama, "bino": bino,
-            "cls": cls, "adv": adv, "embed": embed, "watermark": wm}
+            "cls": cls, "adv": adv, "embed": embed, "styl": styl, "watermark": wm}
 
         if len(self._pred_cache) >= self._CACHE_MAX:
             self._pred_cache.popitem(last=False)   # O(1) FIFO eviction
@@ -2517,19 +2721,36 @@ class BouncerBuffer:
     def __init__(self, path: str = BNC_BUFFER_PATH):
         self.path = path
         self._count: int = 0
+        self._channel_counts: Dict[str, int] = {}
+        self._highlight_count: int = 0
 
     def append(self, event_type: str, *args) -> None:
         """Write one buffered event as a JSON line."""
         try:
             entry = {"t": event_type, "a": args, "ts": time.time()}
+            # Track per-channel message counts
+            if event_type == "msg" and len(args) >= 2:
+                channel = args[1]  # target/channel
+                self._channel_counts[channel] = self._channel_counts.get(channel, 0) + 1
+            # Track highlights (mentions)
+            if event_type == "msg" and len(args) >= 7:
+                mention = args[5] if len(args) > 5 else ""
+                if mention:
+                    self._highlight_count += 1
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             self._count += 1
         except Exception:
             pass
 
-    def replay(self, ui_queue: asyncio.Queue) -> int:
+    def replay(self, ui_queue: asyncio.Queue, limit: int = 0, since: float = 0, channels: Optional[set] = None) -> int:
         """Read all buffered lines, push them onto *ui_queue*, and clear the file.
+
+        Args:
+            limit: Max events to replay (0 = unlimited)
+            since: Only replay events after this timestamp (0 = all)
+            channels: Only replay events for these channels (None = all)
+
         Returns the number of events replayed."""
         entries: list = []
         try:
@@ -2549,9 +2770,27 @@ class BouncerBuffer:
             return 0
         # Sort by timestamp so replay order matches original arrival
         entries.sort(key=lambda e: e.get("ts", 0))
+
+        # Apply filters
+        if since > 0:
+            entries = [e for e in entries if e.get("ts", 0) >= since]
+        if channels:
+            filtered = []
+            for e in entries:
+                if e["t"] == "msg" and len(e["a"]) >= 2:
+                    if e["a"][1] in channels:
+                        filtered.append(e)
+                elif e["t"] != "msg":
+                    filtered.append(e)
+            entries = filtered
+
+        replayed = 0
         for entry in entries:
+            if limit > 0 and replayed >= limit:
+                break
             try:
                 ui_queue.put_nowait(tuple([entry["t"]] + list(entry["a"])))
+                replayed += 1
             except asyncio.QueueFull:
                 break
         # Truncate the buffer file
@@ -2560,11 +2799,21 @@ class BouncerBuffer:
         except Exception:
             pass
         self._count = 0
-        return len(entries)
+        self._channel_counts.clear()
+        self._highlight_count = 0
+        return replayed
 
     @property
     def count(self) -> int:
         return self._count
+
+    def get_channel_stats(self) -> Dict[str, int]:
+        """Return per-channel message counts."""
+        return dict(self._channel_counts)
+
+    @property
+    def highlight_count(self) -> int:
+        return self._highlight_count
 
     def clear(self) -> None:
         try:
@@ -2572,6 +2821,8 @@ class BouncerBuffer:
         except Exception:
             pass
         self._count = 0
+        self._channel_counts.clear()
+        self._highlight_count = 0
 
 
 # =========================
@@ -5133,7 +5384,7 @@ class IRCClient:
             )
             return
         a_score = 0
-        detail: Dict[str, float] = {"prob": 0.0, "heu": 0.0, "bino": 0.0, "cls": 0.0, "llama": 0.0}
+        detail: Dict[str, float] = {"prob": 0.0, "heu": 0.0, "bino": 0.0, "cls": 0.0, "llama": 0.0, "styl": 0.0}
         try:
             # Confirmed bots: skip inference entirely — score is always 100.
             # Also ingest the message into their fingerprint to keep learning.
@@ -5203,6 +5454,7 @@ class IRCClient:
                 cls_score=detail.get("cls", 0), llama_score=detail.get("llama", 0),
                 adv_score=detail.get("adv", 0), embed_score=detail.get("embed", 0),
                 watermark_score_val=detail.get("watermark", 0),
+                styl_score=detail.get("styl", 0),
             )
             raise
         except Exception:
@@ -5219,6 +5471,7 @@ class IRCClient:
                 cls_score=detail.get("cls", 0), llama_score=detail.get("llama", 0),
                 adv_score=detail.get("adv", 0), embed_score=detail.get("embed", 0),
                 watermark_score_val=detail.get("watermark", 0),
+                styl_score=detail.get("styl", 0),
             )
             return
         u_state.record_message(msg, a_score)
@@ -5228,6 +5481,7 @@ class IRCClient:
             "bino": detail.get("bino", 0), "cls": detail.get("cls", 0),
             "llama": detail.get("llama", 0), "adv": detail.get("adv", 0),
             "embed": detail.get("embed", 0), "watermark": detail.get("watermark", 0),
+            "styl": detail.get("styl", 0),
         })
         # Store sentence embedding for future semantic-drift detection
         if self.scoring.ai_detector._embed_model is not None and len(msg.split()) >= 3:
@@ -5244,8 +5498,9 @@ class IRCClient:
             cls_score=detail.get("cls", 0), llama_score=detail.get("llama", 0),
             adv_score=detail.get("adv", 0), embed_score=detail.get("embed", 0),
             watermark_score_val=detail.get("watermark", 0),
+            styl_score=detail.get("styl", 0),
         )
-        await self.ui_queue.put(("ai_score", nick, rolling_ai))
+        await self.ui_queue.put(("ai_score", nick, rolling_ai, detail.get("styl", 0.0)))
 
 # =========================
 # Per-server state container
@@ -5260,6 +5515,12 @@ class PluginAPI:
     Plugin files should define a top-level setup(api) function.  Optionally
     they may also define teardown(api) which is called on /unloadplugin.
 
+    Plugin metadata (optional):
+        __plugin_name__    = "My Plugin"
+        __plugin_version__ = "1.0.0"
+        __plugin_author__  = "Your Name"
+        __plugin_desc__    = "What this plugin does"
+
     Minimal plugin example
     ----------------------
     def setup(api):
@@ -5273,6 +5534,59 @@ class PluginAPI:
         self._tui = tui
         self._commands: Dict[str, Callable] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        self._keybindings: Dict[str, Callable] = {}
+        self._repeat_tasks: List[asyncio.Task] = []
+        # Metadata from module-level attributes
+        self.version: str = ""
+        self.author: str = ""
+        self.description: str = ""
+        self._config: Dict[str, Any] = {}
+        self._load_config()
+
+    def _load_config(self) -> None:
+        """Load plugin-specific config from bouncer config section."""
+        cfg = load_irc_config()
+        self._config = cfg.get("plugins", {}).get(self.name, {})
+
+    def _save_config(self) -> None:
+        """Persist plugin config to disk."""
+        cfg = load_irc_config()
+        cfg.setdefault("plugins", {})[self.name] = self._config
+        save_irc_config(cfg)
+
+    # ── Config persistence ───────────────────────────────────────────────────
+
+    def get_config(self, key: str, default: Any = None) -> Any:
+        """Get a plugin config value."""
+        return self._config.get(key, default)
+
+    def set_config(self, key: str, value: Any) -> None:
+        """Set and persist a plugin config value."""
+        self._config[key] = value
+        self._save_config()
+
+    def delete_config(self, key: str) -> bool:
+        """Delete a plugin config key. Returns True if key existed."""
+        if key in self._config:
+            del self._config[key]
+            self._save_config()
+            return True
+        return False
+
+    def get_all_config(self) -> Dict[str, Any]:
+        """Get a copy of all plugin config."""
+        return dict(self._config)
+
+    # ── Metadata ─────────────────────────────────────────────────────────────
+
+    def set_metadata(self, version: str = "", author: str = "", description: str = "") -> None:
+        """Set plugin metadata (also auto-detected from module attributes)."""
+        if version:
+            self.version = version
+        if author:
+            self.author = author
+        if description:
+            self.description = description
 
     # ── Command registration ─────────────────────────────────────────────────
 
@@ -5300,9 +5614,19 @@ class PluginAPI:
         Supported events:
           on_message(api, nick, target, msg, is_action, is_replay)
           on_join(api, nick, channel)
-          on_part(api, nick, channel)
+          on_part(api, nick, channel, reason)
           on_quit(api, nick, reason)
           on_nick_change(api, old_nick, new_nick)
+          on_topic(api, channel, topic, setter_nick)
+          on_kick(api, channel, nick, kicker, reason)
+          on_mode(api, target, modes, setter_nick)
+          on_react(api, nick, target, msgid, emoji)
+          on_ai_score(api, nick, rolling_ai, styl_score)
+          on_notice(api, sender, target, text)
+          on_typing(api, nick, target, state)
+          on_connect(api)
+          on_disconnect(api, reason)
+          on_command(api, cmd_name, args)  -- intercepts slash commands
 
         Both sync and async callbacks are accepted.
         """
@@ -5317,12 +5641,19 @@ class PluginAPI:
         """Post text to the *status* window."""
         await self._tui.ui_queue.put(("status", text))
 
-    def add_to_window(self, window_name: str, text: str) -> None:
-        """Append a timestamped line to *window_name* (creates the window if absent)."""
+    def add_to_window(self, window_name: str, text: str, timestamp: bool = True) -> None:
+        """Append a line to *window_name* (creates the window if absent)."""
         win = self._tui.window_by_name.get(window_name)
         if win is None:
             win = self._tui.ensure_window(window_name, is_channel=window_name.startswith("#"))
-        win.add_line(text, timestamp=True)
+        win.add_line(text, timestamp=timestamp)
+        self._tui._chat_dirty = True
+        self._tui.dirty = True
+
+    def send_to_current_window(self, text: str, timestamp: bool = True) -> None:
+        """Send a line to the currently active window."""
+        win = self._tui.get_current_window()
+        win.add_line(text, timestamp=timestamp)
         self._tui._chat_dirty = True
         self._tui.dirty = True
 
@@ -5332,9 +5663,29 @@ class PluginAPI:
         """Send an IRC PRIVMSG to *target* (channel or nick)."""
         self._tui._active_client().cmd_msg(target, text)
 
+    def send_action(self, target: str, text: str) -> None:
+        """Send an IRC ACTION (/me) to *target*."""
+        self._tui._active_client().cmd_msg(target, f"\x01ACTION {text}\x01")
+
+    def send_notice(self, target: str, text: str) -> None:
+        """Send an IRC NOTICE to *target*."""
+        self._tui._active_client().cmd_notice(target, text)
+
     def send_raw(self, line: str) -> None:
         """Send a raw IRC line."""
         self._tui._active_client().send_raw(line)
+
+    def set_topic(self, channel: str, topic: str) -> None:
+        """Set channel topic."""
+        self._tui._active_client().cmd_topic(channel, topic)
+
+    def kick(self, channel: str, nick: str, reason: str = "") -> None:
+        """Kick a user from a channel."""
+        self._tui._active_client().cmd_kick(channel, nick, reason)
+
+    def set_mode(self, target: str, modes: str) -> None:
+        """Set modes on a channel or user."""
+        self._tui._active_client().cmd_mode(target, modes)
 
     # ── State accessors ──────────────────────────────────────────────────────
 
@@ -5346,12 +5697,109 @@ class PluginAPI:
     def current_window(self) -> str:
         return self._tui.get_current_window().name
 
-    def get_window_lines(self, window_name: str) -> List[str]:
+    @property
+    def my_nick(self) -> str:
+        return self._tui._active_client().nick
+
+    @property
+    def is_connected(self) -> bool:
+        return self._tui._active_client().is_connected
+
+    def get_window_lines(self, window_name: str, limit: int = 0) -> List[str]:
+        """Get recent lines from a window. limit=0 returns all."""
         win = self._tui.window_by_name.get(window_name)
-        return list(win.lines) if win else []
+        if not win:
+            return []
+        lines = list(win.lines)
+        return lines[-limit:] if limit > 0 else lines
+
+    def get_channel_users(self, channel: str) -> set:
+        """Get the set of users in a channel."""
+        return self._tui.channel_users.get(channel, set())
+
+    def get_user_modes(self, channel: str, nick: str) -> set:
+        """Get mode flags for a user in a channel."""
+        return self._tui.channel_user_modes.get(channel, {}).get(nick, set())
+
+    def get_ai_score(self, nick: str) -> int:
+        """Get the current rolling AI score for a nick."""
+        return self._tui.user_ai_scores.get(nick, 0)
+
+    def get_ai_styl_score(self, nick: str) -> float:
+        """Get the latest stylometric score for a nick."""
+        return self._tui._recent_styl_scores.get(nick, 0.0)
+
+    def is_suspect(self, nick: str) -> bool:
+        """Check if a nick is in the suspect list."""
+        return nick in self._tui._suspect_nicks
+
+    def get_user_state(self, nick: str) -> Optional[Any]:
+        """Get the UserState for a nick (if seen this session)."""
+        return self._tui._active_client().users.get(nick)
 
     def ensure_window(self, name: str, is_channel: bool = False) -> None:
         self._tui.ensure_window(name, is_channel=is_channel)
+
+    def switch_window(self, name: str) -> None:
+        """Switch the TUI focus to a window by name."""
+        win = self._tui.window_by_name.get(name)
+        if win and win in self._tui.windows:
+            self._tui.current_window_index = self._tui.windows.index(win)
+            self._tui.current_channel = name if name.startswith("#") else None
+            self._tui._unread_windows.discard(name)
+            self._tui._chat_dirty = self._tui._userlist_dirty = self._tui._input_dirty = True
+            self._tui.dirty = True
+
+    # ── Scheduling ───────────────────────────────────────────────────────────
+
+    def schedule(self, delay: float, callback: Callable) -> None:
+        """Schedule a callback to run after *delay* seconds.
+
+        callback can be sync or async.  Returns nothing; errors are logged.
+        """
+        async def _wrapper():
+            await asyncio.sleep(delay)
+            try:
+                result = callback()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                await self.status(f"[{self.name}] scheduled callback error: {exc}")
+        asyncio.create_task(_wrapper())
+
+    def repeat(self, interval: float, callback: Callable) -> asyncio.Task:
+        """Schedule a callback to run repeatedly at *interval* seconds.
+
+        Returns the asyncio.Task so it can be cancelled later.
+        Task is automatically tracked and cancelled on plugin unload.
+        """
+        async def _wrapper():
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    result = callback()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    await self.status(f"[{self.name}] repeat callback error: {exc}")
+        task = asyncio.create_task(_wrapper())
+        self._repeat_tasks.append(task)
+        return task
+
+    # ── Keybindings ──────────────────────────────────────────────────────────
+
+    def add_keybinding(self, key: str, callback: Callable) -> None:
+        """Register a keybinding. key is a curses key name like 'F5' or '^B'.
+
+        Note: keybindings are processed by the TUI main loop and must be
+        registered through the plugin manager to take effect.
+        """
+        self._keybindings[key.lower()] = callback
+
+    def remove_keybinding(self, key: str) -> None:
+        self._keybindings.pop(key.lower(), None)
 
 
 class PluginManager:
@@ -5361,6 +5809,7 @@ class PluginManager:
         self._plugins: Dict[str, Tuple[PluginAPI, Any]] = {}          # name → (api, module)
         self._commands: Dict[str, Tuple[PluginAPI, Callable]] = {}    # cmd  → (api, handler)
         self._hooks: Dict[str, List[Tuple[PluginAPI, Callable]]] = {} # event → [(api, handler)]
+        self._load_times: Dict[str, float] = {}                       # name → load timestamp
 
     def load(self, path: str, tui: "TUI") -> Tuple[bool, str]:
         """Load a plugin from *path*.  Returns (success, message)."""
@@ -5377,14 +5826,25 @@ class PluginManager:
             if not hasattr(module, "setup"):
                 return False, f"'{path}' has no setup(api) function"
             module.setup(api)
+            # Auto-detect metadata from module attributes
+            api.version = getattr(module, "__plugin_version__", "")
+            api.author = getattr(module, "__plugin_author__", "")
+            api.description = getattr(module, "__plugin_desc__", "")
             self._plugins[name] = (api, module)
+            self._load_times[name] = time.time()
             for cmd_name, handler in api._commands.items():
                 self._commands[cmd_name] = (api, handler)
             for event, handlers in api._hooks.items():
                 for h in handlers:
                     self._hooks.setdefault(event, []).append((api, h))
             cmds = " ".join(f"/{c}" for c in api._commands) if api._commands else "(no commands)"
-            return True, f"Loaded plugin '{name}'  {cmds}"
+            meta = []
+            if api.version:
+                meta.append(f"v{api.version}")
+            if api.author:
+                meta.append(f"by {api.author}")
+            meta_str = f"  [{', '.join(meta)}]" if meta else ""
+            return True, f"Loaded plugin '{name}'{meta_str}  {cmds}"
         except Exception as exc:
             return False, f"Failed to load '{path}': {exc}"
 
@@ -5393,6 +5853,11 @@ class PluginManager:
         if name not in self._plugins:
             return False, f"No plugin named '{name}' is loaded"
         api, module = self._plugins.pop(name)
+        self._load_times.pop(name, None)
+        # Cancel any repeating tasks tracked by the plugin
+        if hasattr(api, "_repeat_tasks"):
+            for task in api._repeat_tasks:
+                task.cancel()
         if hasattr(module, "teardown"):
             try:
                 result = module.teardown(api)
@@ -5424,11 +5889,40 @@ class PluginManager:
     def get_command(self, cmd: str) -> Optional[Tuple[PluginAPI, Callable]]:
         return self._commands.get(cmd)
 
-    def list_plugins(self) -> List[Tuple[str, List[str]]]:
-        return [
-            (name, list(api._commands.keys()))
-            for name, (api, _) in self._plugins.items()
-        ]
+    def list_plugins(self) -> List[Dict[str, Any]]:
+        """Return detailed info for all loaded plugins."""
+        result = []
+        for name, (api, module) in self._plugins.items():
+            info = {
+                "name": name,
+                "version": api.version,
+                "author": api.author,
+                "description": api.description,
+                "commands": list(api._commands.keys()),
+                "hooks": list(api._hooks.keys()),
+                "path": getattr(module, "__file__", "unknown"),
+                "loaded_at": self._load_times.get(name, 0),
+            }
+            result.append(info)
+        return result
+
+    def get_plugin_info(self, name: str) -> Optional[Dict[str, Any]]:
+        """Get detailed info for a specific plugin."""
+        if name not in self._plugins:
+            return None
+        api, module = self._plugins[name]
+        return {
+            "name": name,
+            "version": api.version,
+            "author": api.author,
+            "description": api.description,
+            "commands": list(api._commands.keys()),
+            "hooks": list(api._hooks.keys()),
+            "keybindings": list(api._keybindings.keys()),
+            "path": getattr(module, "__file__", "unknown"),
+            "loaded_at": self._load_times.get(name, 0),
+            "config": api.get_all_config(),
+        }
 
     async def dispatch(self, event: str, **kwargs) -> None:
         """Dispatch *event* to all registered plugin hooks."""
@@ -5440,8 +5934,52 @@ class PluginManager:
                 result = handler(api, **kwargs)
                 if asyncio.iscoroutine(result):
                     await result
-            except Exception:
-                pass
+            except Exception as exc:
+                try:
+                    await api.status(f"[plugin:{api.name}] hook '{event}' error: {exc}")
+                except Exception:
+                    pass
+
+    async def dispatch_with_result(self, event: str, **kwargs) -> Optional[Dict[str, Any]]:
+        """Dispatch *event* and return the first non-None result from any handler.
+
+        Used for hooks that can intercept/modify behavior (e.g. on_command).
+        Handlers should return a dict with "handled": True to stop processing.
+        """
+        handlers = self._hooks.get(event)
+        if not handlers:
+            return None
+        for api, handler in handlers:
+            try:
+                result = handler(api, **kwargs)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                if result is not None:
+                    return result
+            except Exception as exc:
+                try:
+                    await api.status(f"[plugin:{api.name}] hook '{event}' error: {exc}")
+                except Exception:
+                    pass
+        return None
+
+    def auto_load_plugins(self, tui: "TUI", directory: str = "") -> List[str]:
+        """Auto-load all .py files from the plugins/ directory.
+
+        Returns list of successfully loaded plugin names.
+        """
+        if not directory:
+            directory = os.path.join(_SCRIPT_DIR, "plugins")
+        if not os.path.isdir(directory):
+            return []
+        loaded = []
+        for fname in sorted(os.listdir(directory)):
+            if fname.endswith(".py") and not fname.startswith("_"):
+                path = os.path.join(directory, fname)
+                ok, msg = self.load(path, tui)
+                if ok:
+                    loaded.append(fname[:-3])
+        return loaded
 
 
 # =========================
@@ -5706,6 +6244,7 @@ class TUI:
         self.completion_state = None
         self.dirty = True
         self.last_redraw = 0.0
+        self._start_time = time.monotonic()
         self.ignored_nicks: set = set(load_irc_config().get("ignored_nicks", []))
         self._aliases: Dict[str, str] = dict(load_irc_config().get("aliases", {}))
         self.mention_beep_muted: bool = False
@@ -5714,6 +6253,8 @@ class TUI:
         self._adjacency: Dict[str, Counter] = {}
         self._targets: Dict[str, Counter] = {}
         self._ch_activity: Dict[str, Counter] = {}
+        self._recent_styl_scores: Dict[str, float] = {}
+        self._ai_feedback_log: List[Dict[str, Any]] = []
 
         # /seen tracking: nick_lower → (unix_ts, message_preview, channel)
         self._seen_times: Dict[str, Tuple[float, str, str]] = {}
@@ -5816,6 +6357,12 @@ class TUI:
         self.plugin_manager = PluginManager()
         self.script_engine = ScriptEngine(self)
         self.script_engine.load_all()
+        # Auto-load plugins from plugins/ directory
+        auto_loaded = self.plugin_manager.auto_load_plugins(self)
+        if auto_loaded:
+            self.window_by_name["*status*"].add_line(
+                f"[plugin] Auto-loaded {len(auto_loaded)} plugin(s): {', '.join(auto_loaded)}",
+                timestamp=False)
 
         stdscr.nodelay(True)
         stdscr.keypad(True)
@@ -5834,10 +6381,15 @@ class TUI:
         self._bouncer_enabled: bool = True         # master toggle
         self._bouncer_detached: bool = False       # TUI hidden, IRC still connected
         self._bouncer_buffer  = BouncerBuffer()
+        self._bouncer_replay_limit: int = 0        # 0 = unlimited
+        self._bouncer_filter_mode: str = "all"     # "all", "highlights", "dms"
+        self._bouncer_last_attach: float = 0.0     # timestamp of last attach
         # Load bouncer config (server-side playback settings)
         _bc = load_irc_config().get("bouncer", {})
         self._bouncer_enabled = _bc.get("enabled", True)
         self._bouncer_detached = _bc.get("detached", False)
+        self._bouncer_replay_limit = _bc.get("replay_limit", 0)
+        self._bouncer_filter_mode = _bc.get("filter_mode", "all")
 
         # ── GPG ───────────────────────────────────────────────────────────────────
         self._gpg_enabled: bool = _gpg_available()
@@ -6029,7 +6581,16 @@ class TUI:
         dash._wrap_dirty = True
         A = lambda t: dash.add_line(t, timestamp=False)
 
-        A("=== AI Suspects — current session (≥ {}%) ===".format(self.ai_suspect_threshold))
+        client = self._active_client()
+        now = time.monotonic()
+
+        # ── Header ──────────────────────────────────────────────────────────
+        A(f"=== AI Suspects Dashboard ===  {client.nick}@{client.server}")
+        A(f"  Threshold: {self.ai_suspect_threshold}%  |  Plugins: {len(self.plugin_manager._plugins)}  |  BNC: {'ON' if self._bouncer_enabled else 'OFF'}")
+        A("")
+
+        # ── Current session suspects ────────────────────────────────────────
+        A("── Current Session Suspects ──")
         A("")
 
         suspects = []
@@ -6042,7 +6603,6 @@ class TUI:
             A("  No high-AI users detected in this session.")
         else:
             for nick, ai_pct, state in sorted(suspects, key=lambda x: x[1], reverse=True):
-                now = time.monotonic()
                 join_ago = int((now - state.join_time) // 60)
                 last_ago = int((now - state.last_msg_time) // 60) if state.last_msg_time else 0
                 avg_len  = state.avg_msg_length()
@@ -6050,11 +6610,42 @@ class TUI:
                 bars = "▁▂▃▄▅▆▇█"
                 spark = "".join(bars[min(7, s * 8 // 101)]
                                 for s in list(state.ai_scores)[-16:])
-                A(f"  {nick:<14} [{ai_pct:2d}%]  msgs:{state.total_msgs:3d}  "
+                is_bot = state.is_confirmed_bot or nick in client.scoring.confirmed_bot_nicks
+                badge = " [BOT]" if is_bot else ""
+                A(f"  {nick:<14} [{ai_pct:2d}%]{badge}  msgs:{state.total_msgs:3d}  "
                   f"avg:{avg_len:4.0f}  mpm:{mpm:4.1f}  "
                   f"join:{join_ago:2d}m  last:{last_ago:2d}m")
                 if spark:
                     A(f"    {spark}")
+
+        # ── Channel activity ────────────────────────────────────────────────
+        A("")
+        A("── Channel Activity ──")
+        A("")
+        channels_with_msgs = {}
+        for nick, state in self.client.users.items():
+            for ch, count in state._ch_activity.items():
+                channels_with_msgs[ch] = channels_with_msgs.get(ch, 0) + count
+        if not channels_with_msgs:
+            A("  No channel activity yet.")
+        else:
+            for ch, count in sorted(channels_with_msgs.items(), key=lambda x: -x[1])[:10]:
+                users = len(self.channel_users.get(ch, set()))
+                A(f"  {ch:<20} {count:4d} msgs  {users:3d} users")
+
+        # ── Network stats ───────────────────────────────────────────────────
+        A("")
+        A("── Network Stats ──")
+        A("")
+        total_users = sum(len(users) for users in self.channel_users.values())
+        total_channels = len(self.channel_users)
+        total_msgs = sum(state.total_msgs for state in self.client.users.values())
+        uptime_mins = int((now - self._start_time) // 60) if hasattr(self, '_start_time') else 0
+        A(f"  Channels     : {total_channels}")
+        A(f"  Total users  : {total_users}")
+        A(f"  Messages     : {total_msgs}")
+        A(f"  Uptime       : {uptime_mins // 60}h {uptime_mins % 60}m")
+        A(f"  Buffered     : {self._bouncer_buffer.count} msgs ({self._bouncer_buffer.highlight_count} highlights)")
 
         # ── Historical suspects from log ─────────────────────────────────
         A("")
@@ -6220,6 +6811,7 @@ class TUI:
                 L(f"  Adversarial (adv)      : {_avg('adv'):.2f}")
                 L(f"  Embed-drift (embed)    : {_avg('embed'):.2f}")
                 L(f"  Watermark   (wm)       : {_avg('watermark'):.2f}")
+                L(f"  Stylometric (styl)     : {_avg('styl'):.2f}")
             L("")
         else:
             L("  (not seen in current session)")
@@ -6756,7 +7348,15 @@ class TUI:
         else:
             display_ch = None
 
-        header = f" Users ({display_ch or 'None'}) "
+        # Enhanced header with user count and suspect count
+        if display_ch:
+            ch_users = self.channel_users.get(display_ch, set())
+            suspect_count = len(ch_users & self._suspect_nicks)
+            header = f" Users ({display_ch}) "
+            if suspect_count > 0:
+                header += f"[{suspect_count}S]"
+        else:
+            header = f" Users (None) "
         try:
             self.user_win.addstr(0, 1, header[:uw], self._attr_userheader)
         except curses.error:
@@ -6771,17 +7371,51 @@ class TUI:
             thresh      = self.ai_suspect_threshold
             attr_sus    = self._attr_suspect
             attr_normal = self._attr_normal
+            client = self._active_client()
+            confirmed_bots = client.scoring.confirmed_bot_nicks if hasattr(client, 'scoring') else set()
+
             for i, nick in enumerate(users[:self.chat_height - 2]):
                 ai_pct = self.user_ai_scores.get(nick, 0)
                 mode_char = self._highest_prefix(modes.get(nick, set()))
                 oper_mark = "◈" if nick.lower() in self._ircop_nicks else ""
+
+                # Build status indicators
+                status_marks = ""
+                if nick in confirmed_bots:
+                    status_marks += "B"
+                elif ai_pct >= thresh:
+                    status_marks += "S"
+                elif ai_pct >= 50:
+                    status_marks += "?"
+
                 display_nick = (mode_char + oper_mark + nick) if (mode_char or oper_mark) else nick
                 nick_vis = _str_visual_width(display_nick)
-                padded   = display_nick + " " * max(0, 18 - nick_vis)
-                line     = _truncate_to_width(f"{padded} [{ai_pct:2d}%]", uw)
+
+                # Compact format: show AI score as single digit bar for space efficiency
+                # [0-9]: 0-9%, 10-19%, ..., 90-99%, 100%
+                ai_bar = min(9, ai_pct // 10)
+                ai_display = f"{ai_bar}"
+
+                # Calculate available width for nick
+                status_width = len(status_marks) + 1 if status_marks else 0
+                ai_width = 2  # " N" format
+                max_nick_width = uw - 4 - status_width - ai_width  # 4 for borders and spacing
+
+                if nick_vis > max_nick_width:
+                    display_nick = _truncate_to_width(display_nick, max_nick_width)
+                    nick_vis = max_nick_width
+
+                padded = display_nick + " " * max(0, max_nick_width - nick_vis)
+                line = f"{padded}"
+                if status_marks:
+                    line += f" {status_marks}"
+                line += f" {ai_display}"
+
                 try:
-                    self.user_win.addstr(i + 1, 1, line,
-                        attr_sus if ai_pct >= thresh else attr_normal)
+                    if ai_pct >= thresh:
+                        self.user_win.addstr(i + 1, 1, line[:uw], attr_sus)
+                    else:
+                        self.user_win.addstr(i + 1, 1, line[:uw], attr_normal)
                 except curses.error:
                     break
 
@@ -6839,6 +7473,9 @@ class TUI:
         Active tab uses A_REVERSE|A_BOLD; windows with unread messages get A_BOLD
         and a '*' prefix; inactive read windows are dimmed.  The strip scrolls so
         the active tab is always visible.
+
+        Enhanced: shows unread counts (>9 as +), suspect indicators (S), and
+        highlights/mentions (H) for channels.
         """
         _, w = self.input_win.getmaxyx()
         usable = w - 2  # columns between left and right borders
@@ -6846,6 +7483,7 @@ class TUI:
         # Build label strings for every window
         multi_server = len(self.servers) > 1
         labels: List[str] = []
+        indicators: List[str] = []
         for i, win in enumerate(self.windows):
             name = win.name
             if name == "*status*":
@@ -6862,7 +7500,27 @@ class TUI:
                 short = f"{host[:8]}:{short}"
             is_active = (i == self.current_window_index)
             has_unread = (name in self._unread_windows and not is_active)
-            labels.append(f"[{'*' if has_unread else ''}{i + 1}:{short}]")
+
+            # Build indicator string
+            indicator = ""
+            if has_unread:
+                # Count unread lines
+                unread_count = len(win.lines) - win._unread_from if win._unread_from >= 0 else len(win.lines)
+                if unread_count > 99:
+                    indicator = "+"
+                elif unread_count > 1:
+                    indicator = str(unread_count)
+                else:
+                    indicator = "*"
+
+                # Check for suspects in this channel
+                if name.startswith("#"):
+                    ch_users = self.channel_users.get(name, set())
+                    suspect_in_ch = bool(ch_users & self._suspect_nicks)
+                    if suspect_in_ch:
+                        indicator += "S"
+            labels.append(f"[{indicator if indicator else ''}{i + 1}:{short}]")
+            indicators.append(indicator)
 
         # Find the leftmost visible index so the active tab is always on screen
         widths = [len(l) + 1 for l in labels]   # +1 for the space separator
@@ -6883,8 +7541,15 @@ class TUI:
                 break
             is_active = (i == self.current_window_index)
             has_unread = (self.windows[i].name in self._unread_windows and not is_active)
+            has_suspect = False
+            if self.windows[i].name.startswith("#"):
+                ch_users = self.channel_users.get(self.windows[i].name, set())
+                has_suspect = bool(ch_users & self._suspect_nicks)
+
             if is_active:
                 attr = curses.A_REVERSE | curses.A_BOLD
+            elif has_suspect:
+                attr = curses.A_BOLD | curses.color_pair(3)
             elif has_unread:
                 attr = curses.A_BOLD
             else:
@@ -6903,7 +7568,12 @@ class TUI:
         if self._bouncer_detached and self._bouncer_enabled:
             try:
                 _, w = self.input_win.getmaxyx()
-                self.input_win.addstr(0, max(2, w - 8), "[BNC]", curses.A_BOLD)
+                buf_count = self._bouncer_buffer.count
+                hl_count = self._bouncer_buffer.highlight_count
+                indicator = f"[BNC:{buf_count}]"
+                if hl_count > 0:
+                    indicator = f"[BNC:{buf_count}*{hl_count}]"
+                self.input_win.addstr(0, max(2, w - len(indicator) - 2), indicator, curses.A_BOLD | curses.color_pair(3))
             except curses.error:
                 pass
 
@@ -7071,6 +7741,52 @@ class TUI:
         replacement = match + suffix
         self.input_buffer = buf[:word_start] + replacement + buf[cursor:]
         self.input_cursor = word_start + len(replacement)
+        self._input_dirty = True
+        self.dirty = True
+
+    def do_command_complete(self, reverse: bool = False) -> None:
+        """Complete slash command names when input starts with '/'."""
+        buf = self.input_buffer
+        cursor = min(self.input_cursor, len(buf))
+        if not buf.startswith("/"):
+            return
+
+        # Extract partial command (after /, up to cursor, no spaces)
+        partial = buf[1:cursor].lower()
+        if " " in partial:
+            return  # Already typed a full command with args
+
+        # Gather all available commands
+        builtins = sorted(self._slash_handlers.keys())
+        plugin_cmds = sorted(self.plugin_manager._commands.keys())
+        script_cmds = sorted(self.script_engine._commands.keys())
+        aliases = sorted(k for k in self._aliases.keys() if k not in self._slash_handlers)
+
+        # Combine and deduplicate
+        all_cmds = sorted(set(builtins + plugin_cmds + script_cmds + aliases))
+        if not all_cmds:
+            return
+
+        matches = [c for c in all_cmds if c.startswith(partial)]
+        if not matches:
+            return
+
+        # Completion state for cycling through matches
+        state_prefix = "/" + partial
+        if self.completion_state and self.completion_state[0] == state_prefix:
+            if reverse:
+                idx = (self.completion_state[2] - 1) % len(self.completion_state[1])
+            else:
+                idx = (self.completion_state[2] + 1) % len(self.completion_state[1])
+            match = self.completion_state[1][idx]
+        else:
+            idx = len(matches) - 1 if reverse else 0
+            match = matches[idx]
+
+        self.completion_state = (state_prefix, matches, idx)
+        replacement = "/" + match + " "
+        self.input_buffer = replacement + buf[cursor:]
+        self.input_cursor = len(replacement)
         self._input_dirty = True
         self.dirty = True
 
@@ -7272,6 +7988,10 @@ class TUI:
         if tgt == self.get_current_window().name.lower():
             self._chat_dirty = True
             self.dirty = True
+        await self.plugin_manager.dispatch("on_typing", nick=nick, target=target, state=state)
+        if tgt == self.get_current_window().name.lower():
+            self._chat_dirty = True
+            self.dirty = True
 
     async def _ev_react(self, event):
         _, nick, target, msgid, emoji = event
@@ -7287,6 +8007,7 @@ class TUI:
         if win is self.get_current_window():
             self._chat_dirty = True
             self.dirty = True
+        await self.plugin_manager.dispatch("on_react", nick=nick, target=target, msgid=msgid, emoji=emoji)
 
     async def _ev_redact(self, event):
         _, nick, target, msgid, reason = event
@@ -7333,9 +8054,10 @@ class TUI:
             self.dirty = True
 
     async def _ev_ai_score(self, event):
-        _, nick, rolling_ai = event
+        _, nick, rolling_ai, styl_score = event if len(event) > 3 else (event[0], event[1], event[2], 0.0)
         old_score = self.user_ai_scores.get(nick)
         self.user_ai_scores[nick] = rolling_ai
+        self._recent_styl_scores[nick] = styl_score
         was_suspect = nick in self._suspect_nicks
         if rolling_ai >= self.ai_suspect_threshold:
             self._suspect_nicks.add(nick)
@@ -7350,6 +8072,7 @@ class TUI:
             # Suspect set changed — chat must repaint to apply/remove bold highlighting
             self._chat_dirty = True
             self.dirty = True
+        await self.plugin_manager.dispatch("on_ai_score", nick=nick, rolling_ai=rolling_ai, styl_score=styl_score)
 
     async def _ev_notice(self, event):
         _, sender, target, text = event
@@ -7362,6 +8085,7 @@ class TUI:
             self._input_dirty = True
         self._chat_dirty = True
         self.dirty = True
+        await self.plugin_manager.dispatch("on_notice", sender=sender, target=target, text=text)
 
     async def _ev_nick_change(self, event):
         _, old_nick, new_nick = event
@@ -7385,6 +8109,8 @@ class TUI:
             self._suspect_nicks.discard(old_nick)
             if score >= self.ai_suspect_threshold:
                 self._suspect_nicks.add(new_nick)
+        if old_nick in self._recent_styl_scores:
+            self._recent_styl_scores[new_nick] = self._recent_styl_scores.pop(old_nick)
         old_lower = old_nick.lower()
         new_lower = new_nick.lower()
         if old_lower in self._ircop_nicks:
@@ -7393,6 +8119,7 @@ class TUI:
         self._status_win().add_line(f"* {old_nick} is now known as {new_nick}")
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
+        await self.plugin_manager.dispatch("on_nick_change", old_nick=old_nick, new_nick=new_nick)
 
     async def _ev_names(self, event):
         _, channel, names_raw = event
@@ -7428,6 +8155,7 @@ class TUI:
         win.add_line(text)
         self._chat_dirty = True
         self.dirty = True
+        await self.plugin_manager.dispatch("on_topic", channel=channel, topic=topic_text, setter_nick="")
 
     async def _ev_join(self, event):
         _, nick, channel = event
@@ -7457,17 +8185,19 @@ class TUI:
 
     async def _ev_part(self, event):
         _, nick, channel = event
+        reason = event[3] if len(event) > 3 else ""
         if channel in self.channel_users:
             self.channel_users[channel].discard(nick)
             self.channel_user_modes.get(channel, {}).pop(nick, None)
             self._sorted_users.pop(channel, None)
         win = self.ensure_window(channel)
-        win.add_line(f"* {nick} has left {channel}")
+        win.add_line(f"* {nick} has left {channel}" + (f" ({reason})" if reason else ""))
         if win is not self.get_current_window():
             self._unread_windows.add(channel)
             self._input_dirty = True
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
+        await self.plugin_manager.dispatch("on_part", nick=nick, channel=channel, reason=reason)
 
     async def _ev_quit(self, event):
         _, nick, reason = event
@@ -7490,6 +8220,7 @@ class TUI:
         self.user_ai_scores.pop(nick, None)
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
+        await self.plugin_manager.dispatch("on_quit", nick=nick, reason=reason)
 
     async def _ev_mode(self, event):
         _, nick, params = event
@@ -7523,6 +8254,7 @@ class TUI:
         self._sorted_users.pop(target, None)
         self._userlist_dirty = True
         self.dirty = True
+        await self.plugin_manager.dispatch("on_mode", target=target, modes=modestr, setter_nick=nick)
 
     async def _ev_channel_rename(self, event):
         _, old_ch, new_ch = event
@@ -7559,6 +8291,7 @@ class TUI:
                 self._input_dirty = True
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
+        await self.plugin_manager.dispatch("on_kick", channel=channel, nick=kicked, kicker=nick, reason=reason)
 
     async def _ev_own_umodes(self, event):
         self._own_umodes = event[1]
@@ -7784,6 +8517,7 @@ class TUI:
         h["topai"]      = self._slash_topai
         h["aitoggle"]   = self._slash_aitoggle
         h["logtoggle"]  = self._slash_logtoggle
+        h["feedback"]   = self._slash_feedback
         h["join"]       = self._slash_join
         h["part"]       = self._slash_part
         h["nick"]       = self._slash_nick
@@ -7879,6 +8613,11 @@ class TUI:
             cmd   = parts[0].lower()
             args  = parts[1] if len(parts) > 1 else ""
             extra = parts[2] if len(parts) > 2 else ""
+            # Plugin on_command hook: allows intercepting/modifying commands
+            cmd_result = await self.plugin_manager.dispatch_with_result(
+                "on_command", cmd_name=cmd, args=args, extra=extra, line=line)
+            if cmd_result is not None and cmd_result.get("handled"):
+                return  # Plugin handled the command
             # User-defined alias expansion — only expand once (no recursion)
             if cmd in self._aliases and cmd not in self._slash_handlers:
                 expanded = self._aliases[cmd]
@@ -8299,6 +9038,7 @@ class TUI:
                 msgs     = state.total_msgs if state else 0
                 avg_len  = state.avg_msg_length() if state else 0.0
                 mpm      = state.messages_per_minute() if state else 0.0
+                styl     = self._recent_styl_scores.get(nick, 0.0)
                 if is_bot:
                     flag = "B"
                 elif ai_pct >= thresh:
@@ -8307,10 +9047,11 @@ class TUI:
                     flag = " "
                 L(f"  {flag}{nick:<15} {ai_pct:3d}%  {msgs:4d}  "
                   f"{avg_len:6.0f}  {mpm:5.1f}"
-                  f"  {last_ago:3d}m  {spark}")
+                  f"  {last_ago:3d}m  styl:{styl:.2f}  {spark}")
 
         L("")
         L(f"  B = confirmed bot/AI  * = at or above suspect threshold ({self.ai_suspect_threshold}%)")
+        L(f"  styl = stylometric score (burstiness + lexical diversity + punctuation)")
 
         self._dashboard_mode           = "profile"
         self._dashboard_profile_locked = True
@@ -8342,6 +9083,149 @@ class TUI:
             log_toggle_event(enabled=True, nick=self._active_client().nick)
         state = "ENABLED" if _ai_logging_enabled else "DISABLED"
         await self.ui_queue.put(("status", f"AI detection logging {state}  (file: {AI_LOG_PATH})"))
+
+    async def _slash_feedback(self, args, extra, line):
+        """Provide feedback on AI detection to tune weights dynamically.
+
+        Usage:
+          /feedback ai <nick>          – confirm this user IS AI/bot
+          /feedback human <nick>       – confirm this user is HUMAN (false positive)
+          /feedback status             – show feedback stats and current weight adjustments
+          /feedback reset              – clear all feedback data and restore default weights
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[feedback] disabled by --no-ai")); return
+
+        action = (args or "").strip().lower()
+        nick = (extra or "").strip()
+
+        if action == "ai" or action == "bot":
+            if not nick:
+                await self.ui_queue.put(("status", "Usage: /feedback ai <nick>  – confirm user is AI/bot"))
+                return
+            self._record_feedback(nick, "ai")
+            await self.ui_queue.put(("status", f"[feedback] {nick} marked as AI — weights will adapt"))
+
+        elif action == "human" or action == "notai":
+            if not nick:
+                await self.ui_queue.put(("status", "Usage: /feedback human <nick>  – confirm user is human"))
+                return
+            self._record_feedback(nick, "human")
+            await self.ui_queue.put(("status", f"[feedback] {nick} marked as human — weights will adapt"))
+
+        elif action == "status":
+            self._show_feedback_status()
+
+        elif action == "reset":
+            self._reset_feedback()
+            await self.ui_queue.put(("status", "[feedback] All feedback data cleared, weights restored to defaults"))
+
+        else:
+            await self.ui_queue.put(("status",
+                "Usage: /feedback <ai|human> <nick> | status | reset\n"
+                "  ai <nick>    – confirm user IS AI/bot\n"
+                "  human <nick> – confirm user is HUMAN (false positive)\n"
+                "  status       – show feedback stats\n"
+                "  reset        – clear feedback and restore defaults"))
+
+    def _record_feedback(self, nick: str, label: str) -> None:
+        """Store feedback and adjust detector weights."""
+        client = self._active_client()
+        detector = client.scoring.ai_detector
+        state = client.users.get(nick)
+
+        feedback_entry = {
+            "nick": nick,
+            "label": label,
+            "ts": time.time(),
+            "rolling_ai": self.user_ai_scores.get(nick, 0),
+            "styl": self._recent_styl_scores.get(nick, 0.0),
+        }
+        if state:
+            scores = list(state.ai_scores)
+            feedback_entry["recent_scores"] = scores[-10:] if scores else []
+            feedback_entry["msg_count"] = state.total_msgs
+
+        self._ai_feedback_log.append(feedback_entry)
+
+        # Adaptive weight tuning based on feedback
+        self._apply_feedback_weights(detector, label)
+
+    def _apply_feedback_weights(self, detector, label: str) -> None:
+        """Nudge ensemble weights based on user feedback."""
+        if not hasattr(detector, '_feedback_adjustments'):
+            detector._feedback_adjustments = {"ai": 0, "human": 0}
+
+        adjustments = detector._feedback_adjustments
+        if label == "ai":
+            adjustments["ai"] += 1
+        else:
+            adjustments["human"] += 1
+
+        total = adjustments["ai"] + adjustments["human"]
+        if total < 3:
+            return  # Need more feedback before adjusting
+
+        ai_ratio = adjustments["ai"] / total
+
+        # If we're getting many false positives (human feedback), reduce heuristic aggressiveness
+        if ai_ratio < 0.3 and hasattr(detector, '_heu_weight'):
+            detector._heu_weight = max(0.05, detector._heu_weight - 0.02)
+        # If we're missing real bots (ai feedback), increase classifier weight
+        elif ai_ratio > 0.7 and hasattr(detector, '_cls_weight'):
+            detector._cls_weight = min(0.40, detector._cls_weight + 0.02)
+
+    def _show_feedback_status(self) -> None:
+        """Display feedback statistics to the user."""
+        total = len(self._ai_feedback_log)
+        ai_count = sum(1 for f in self._ai_feedback_log if f["label"] == "ai")
+        human_count = total - ai_count
+
+        lines = [
+            f"=== AI Feedback Status ===",
+            f"  Total feedback entries : {total}",
+            f"  AI/bot confirmations   : {ai_count}",
+            f"  Human (false positive) : {human_count}",
+        ]
+
+        client = self._active_client()
+        detector = client.scoring.ai_detector
+        if hasattr(detector, '_feedback_adjustments'):
+            adj = detector._feedback_adjustments
+            lines.append(f"  Feedback ratio (AI)    : {adj['ai']}/{adj['ai'] + adj['human']}")
+
+        if hasattr(detector, '_heu_weight'):
+            lines.append(f"  Current heu_weight     : {detector._heu_weight:.3f}")
+        if hasattr(detector, '_cls_weight'):
+            lines.append(f"  Current cls_weight     : {detector._cls_weight:.3f}")
+
+        lines.append("")
+        lines.append("  Recent feedback:")
+        for entry in self._ai_feedback_log[-5:]:
+            nick = entry["nick"]
+            label = entry["label"]
+            rolling = entry.get("rolling_ai", 0)
+            lines.append(f"    {nick:15s} → {label.upper():5s}  (was {rolling}%)")
+
+        sw = self.window_by_name.get("*status*")
+        if sw:
+            for line in lines:
+                sw.add_line(line)
+            self._chat_dirty = True
+            self.dirty = True
+
+    def _reset_feedback(self) -> None:
+        """Clear all feedback data and restore default weights."""
+        self._ai_feedback_log.clear()
+        client = self._active_client()
+        detector = client.scoring.ai_detector
+        if hasattr(detector, '_feedback_adjustments'):
+            detector._feedback_adjustments = {"ai": 0, "human": 0}
+        # Restore default weights if they were modified
+        if hasattr(detector, '_heu_weight'):
+            detector._heu_weight = detector._default_heu_weight if hasattr(detector, '_default_heu_weight') else 0.25
+        if hasattr(detector, '_cls_weight'):
+            detector._cls_weight = detector._default_cls_weight if hasattr(detector, '_default_cls_weight') else 0.25
 
     async def _slash_join(self, args, extra, line):
         if args:
@@ -9172,10 +10056,22 @@ class TUI:
             self._save_bouncer_config()
             await self.ui_queue.put(("status", "BNC disabled"))
         elif sub == "status":
-            await self.ui_queue.put(("status",
+            buf = self._bouncer_buffer
+            stats = buf.get_channel_stats()
+            lines = [
                 f"BNC: {'ON' if self._bouncer_enabled else 'OFF'}  "
                 f"Detached: {self._bouncer_detached}  "
-                f"Buffered: {self._bouncer_buffer.count}"))
+                f"Buffered: {buf.count}",
+                f"Highlights: {buf.highlight_count}  "
+                f"Filter: {self._bouncer_filter_mode}  "
+                f"Replay limit: {self._bouncer_replay_limit or 'unlimited'}",
+            ]
+            if stats:
+                lines.append("Per-channel:")
+                for ch, cnt in sorted(stats.items(), key=lambda x: -x[1]):
+                    lines.append(f"  {ch}: {cnt} msgs")
+            for line_text in lines:
+                await self.ui_queue.put(("status", line_text))
         elif sub in ("detach", "hide"):
             self._bouncer_detached = True
             self._save_bouncer_config()
@@ -9183,14 +10079,32 @@ class TUI:
         elif sub in ("attach", "show"):
             await self._do_attach()
         elif sub == "replay":
-            n = self._bouncer_buffer.replay(self.ui_queue)
+            limit_str = parts[1] if len(parts) > 1 else ""
+            limit = int(limit_str) if limit_str.isdigit() else self._bouncer_replay_limit
+            n = self._bouncer_buffer.replay(self.ui_queue, limit=limit)
             await self.ui_queue.put(("status", f"BNC: replayed {n} buffered messages"))
         elif sub == "clear":
             self._bouncer_buffer.clear()
             await self.ui_queue.put(("status", "BNC: buffer cleared"))
+        elif sub == "limit":
+            limit_str = parts[1] if len(parts) > 1 else ""
+            if not limit_str.isdigit():
+                await self.ui_queue.put(("status", f"Current replay limit: {self._bouncer_replay_limit or 'unlimited'}"))
+                return
+            self._bouncer_replay_limit = int(limit_str)
+            self._save_bouncer_config()
+            await self.ui_queue.put(("status", f"BNC: replay limit set to {limit_str}"))
+        elif sub == "filter":
+            mode = parts[1] if len(parts) > 1 else ""
+            if mode not in ("all", "highlights", "dms"):
+                await self.ui_queue.put(("status", f"Current filter mode: {self._bouncer_filter_mode} (all|highlights|dms)"))
+                return
+            self._bouncer_filter_mode = mode
+            self._save_bouncer_config()
+            await self.ui_queue.put(("status", f"BNC: filter mode set to '{mode}'"))
         else:
             await self.ui_queue.put(("status",
-                "Usage: /bouncer on|off|status|detach|attach|replay|clear"))
+                "Usage: /bouncer on|off|status|detach|attach|replay [N]|clear|limit [N]|filter [mode]"))
 
     async def _slash_detach(self, args, extra, line):
         """Convenience alias: /detach"""
@@ -9210,14 +10124,45 @@ class TUI:
 
     async def _do_attach(self) -> None:
         self._bouncer_detached = False
-        n = self._bouncer_buffer.replay(self.ui_queue)
+        self._bouncer_last_attach = time.time()
+        n = self._bouncer_buffer.replay(
+            self.ui_queue,
+            limit=self._bouncer_replay_limit,
+            since=self._bouncer_last_attach if self._bouncer_last_attach > 0 else 0,
+        )
         self._save_bouncer_config()
         await self.ui_queue.put(("status", f"BNC: attached — replayed {n} buffered messages"))
 
+    def _should_buffer_event(self, event) -> bool:
+        """Determine if an event should be buffered based on filter mode."""
+        if self._bouncer_filter_mode == "all":
+            return True
+
+        event_type = event[0] if event else ""
+        if event_type != "msg":
+            # Always buffer non-message events (joins, parts, etc.)
+            return True
+
+        args = event[1] if len(event) > 1 else ()
+        if self._bouncer_filter_mode == "highlights":
+            # Only buffer messages with mentions
+            mention = args[5] if len(args) > 5 else ""
+            return bool(mention)
+
+        elif self._bouncer_filter_mode == "dms":
+            # Only buffer direct messages (target doesn't start with #)
+            target = args[1] if len(args) > 1 else ""
+            return not target.startswith("#")
+
+        return True
+
     def _save_bouncer_config(self) -> None:
         cfg = load_irc_config()
-        cfg.setdefault("bouncer", {})["enabled"]  = self._bouncer_enabled
-        cfg.setdefault("bouncer", {})["detached"] = self._bouncer_detached
+        bnc = cfg.setdefault("bouncer", {})
+        bnc["enabled"]      = self._bouncer_enabled
+        bnc["detached"]     = self._bouncer_detached
+        bnc["replay_limit"] = self._bouncer_replay_limit
+        bnc["filter_mode"]  = self._bouncer_filter_mode
         cfg.setdefault("gpg", {})["key_fingerprint"] = self._gpg_key_fp
         save_irc_config(cfg)
 
@@ -9897,6 +10842,7 @@ class TUI:
         _E("/forget_tell <phrase>",         "Remove n-grams of a phrase from the AI blocklist")
         _E("/scan_watermark [text]",        "Scan recent msgs or text for LLM watermark patterns")
         _E("/fingerprint <nick> [min_sim]", "Compare a nick's linguistic fingerprint against all others")
+        _E("/feedback <ai|human> <nick>",   "Confirm AI/bot or human to tune detection weights")
         _C("")
         _H("AI Integration  (Claude + OpenAI + Gemini + Ollama + llama.cpp)")
         _E("/askai [model] <question>",   "Ask AI a question; answer shown in dashboard")
@@ -9921,7 +10867,7 @@ class TUI:
         _E("/pem [/path/to.pem]",          "Generate NIST P-256 key pair for SASL ECDSA auth")
         _C("")
         _H("Windows & Navigation")
-        _C("  Tab bar (above input): [1:status] [2:dash] [*3:##chat]  * = unread")
+        _C("  Tab bar: [1:status] [2:dash] [*3:##chat]  * = unread  N = count  S = suspect")
         _E("/win <n>",    "Switch to window n; clears its unread marker")
         _E("/close  (or /wc)", "Close current window; focus moves to previous")
         _E("/clear",     "Clear messages in the current window")
@@ -9929,16 +10875,22 @@ class TUI:
         _E("/links [n]", "Show last n links shared in this channel (default 20)")
         _E("/list [pattern]","Fetch and display the server's channel list")
         _E("/lf [keyword|min=<n>]","Locally filter cached /list results by keyword or min users")
-        _E("/theme <1-5>","Switch colour theme: Classic Hacker Ocean Sunset Neon")
+        _E("/theme <1-12>","Switch colour theme: Classic Hacker Ocean Sunset Neon Nord Dracula Monokai Solarized Gruvbox Tokyo Catppuccin")
         _E("/userlist",   "Toggle the user list panel on/off")
         _E("/znc <cmd>",  "Send a command to ZNC's *status (e.g. /znc play *chan 60)")
-        _C("  Ctrl+N  next window    Tab/Shift+Tab  nick completion    PgUp/PgDn  scroll")
+        _C("  Ctrl+N  next window    Tab/Shift+Tab  nick or command completion")
         _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
         _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
-        _C("  Left-click a nick in userlist or chat → /query    Left-click header → switch channel")
+        _C("  Ctrl+L  clear window    Ctrl+R  toggle userlist    Ctrl+G  go to window #")
+        _C("  Ctrl+T  toggle link preview    Ctrl+Z  clear input    Esc  clear/close")
+        _C("  Left-click nick → /query    Left-click header → switch channel    Wheel → scroll")
         _C("")
         _H("BNC & GPG & Tor")
         _E("/bouncer on|off|status|detach|attach|replay","Built-in bouncer: buffer msgs when detached, replay on attach")
+        _E("/bouncer replay [N]",                 "Replay buffered msgs (optional limit N)")
+        _E("/bouncer limit [N]",                  "Set max msgs to replay on attach (0 = unlimited)")
+        _E("/bouncer filter [all|highlights|dms]","Filter mode: all msgs, only highlights, or only DMs")
+        _E("/bouncer clear",                      "Clear the message buffer without replaying")
         _E("/detach",                         "Shortcut for /bouncer detach")
         _E("/attach",                         "Shortcut for /bouncer attach")
         _E("/pgp key [fp]",                   "Set signing key; with no arg, show current key")
@@ -9953,8 +10905,10 @@ class TUI:
         _E("/loadplugin <path>",   "Load a Python plugin file; its setup(api) is called")
         _E("/unloadplugin <name>", "Unload a plugin and remove its commands")
         _E("/reloadplugin <name>", "Reload a plugin from its original file (hot-swap)")
-        _E("/plugins",             "List loaded plugins and their registered commands")
+        _E("/plugins [name]",      "List loaded plugins; with name, show detailed info")
         _E("/script load|unload|reload|list", "Manage Python/Lua scripts in scripts/ dir")
+        _C("  Plugins auto-load from plugins/ directory on startup")
+        _C("  Plugin API: command(), on(event), send(), status(), schedule(), get_config()")
         _C("")
         _H("General")
         _E("/redraw [channel]",   "Force full screen repaint and reload userlist from server")
@@ -10558,9 +11512,39 @@ class TUI:
             await self.ui_queue.put(("status",
                 "[plugin] No plugins loaded — use /loadplugin <path>"))
             return
-        for name, cmds in plugins:
-            cmds_str = "  ".join(f"/{c}" for c in cmds) if cmds else "(no commands)"
-            await self.ui_queue.put(("status", f"[plugin] {name}  {cmds_str}"))
+        query = (args + " " + extra).strip()
+        if query:
+            info = self.plugin_manager.get_plugin_info(query)
+            if not info:
+                await self.ui_queue.put(("status", f"[plugin] No plugin named '{query}'"))
+                return
+            await self.ui_queue.put(("status", f"=== Plugin: {info['name']} ==="))
+            if info["version"]:
+                await self.ui_queue.put(("status", f"  Version   : {info['version']}"))
+            if info["author"]:
+                await self.ui_queue.put(("status", f"  Author    : {info['author']}"))
+            if info["description"]:
+                await self.ui_queue.put(("status", f"  Desc      : {info['description']}"))
+            await self.ui_queue.put(("status", f"  Path      : {info['path']}"))
+            cmds_str = "  ".join(f"/{c}" for c in info["commands"]) if info["commands"] else "(none)"
+            await self.ui_queue.put(("status", f"  Commands  : {cmds_str}"))
+            hooks_str = ", ".join(info["hooks"]) if info["hooks"] else "(none)"
+            await self.ui_queue.put(("status", f"  Hooks     : {hooks_str}"))
+            if info["keybindings"]:
+                kb_str = ", ".join(info["keybindings"])
+                await self.ui_queue.put(("status", f"  Keys      : {kb_str}"))
+            if info["config"]:
+                await self.ui_queue.put(("status", f"  Config    : {info['config']}"))
+            return
+        for info in plugins:
+            meta = []
+            if info["version"]:
+                meta.append(f"v{info['version']}")
+            if info["author"]:
+                meta.append(f"by {info['author']}")
+            meta_str = f"  [{', '.join(meta)}]" if meta else ""
+            cmds_str = "  ".join(f"/{c}" for c in info["commands"]) if info["commands"] else "(no commands)"
+            await self.ui_queue.put(("status", f"[plugin] {info['name']}{meta_str}  {cmds_str}"))
 
     async def _slash_script(self, args, extra, line):
         parts = (args + " " + extra).strip().split()
@@ -10798,11 +11782,20 @@ class TUI:
                 self._chat_dirty = True
                 self.dirty = True
 
-        elif ch == 9:    # Tab — nick completion
-            self.do_nick_complete()
+        elif ch == 9:    # Tab — nick completion or command completion
+            buf = self.input_buffer[:self.input_cursor]
+            if buf.startswith("/"):
+                # Command completion: /partial_command
+                self.do_command_complete()
+            else:
+                self.do_nick_complete()
 
         elif ch == curses.KEY_BTAB:  # Shift+Tab — reverse nick completion
-            self.do_nick_complete(reverse=True)
+            buf = self.input_buffer[:self.input_cursor]
+            if buf.startswith("/"):
+                self.do_command_complete(reverse=True)
+            else:
+                self.do_nick_complete(reverse=True)
 
         elif ch == 3:    # Ctrl+C
             raise SystemExit
@@ -10953,6 +11946,66 @@ class TUI:
         elif ch == curses.KEY_RESIZE:
             self.dirty = True
 
+        elif ch == 12:   # Ctrl+L — clear current window
+            win = self.get_current_window()
+            if win.name not in ("*status*", "*dashboard*"):
+                win.lines.clear()
+                win.wrapped_cache.clear()
+                win.url_map.clear()
+                win._line_msgids.clear()
+                win._unread_from = -1
+                win._wrap_dirty = True
+                self._chat_dirty = True
+                self.dirty = True
+
+        elif ch == 18:   # Ctrl+R — toggle userlist
+            self._show_userlist = not self._show_userlist
+            self._resize_windows()
+            self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 7:    # Ctrl+G — go to window by number
+            if self.input_buffer:
+                try:
+                    win_num = int(self.input_buffer) - 1
+                    if 0 <= win_num < len(self.windows):
+                        self.current_window_index = win_num
+                        win = self.windows[win_num]
+                        self.current_channel = win.name if win.name.startswith("#") else None
+                        self._unread_windows.discard(win.name)
+                        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                        self.dirty = True
+                except ValueError:
+                    pass
+            self.input_buffer = ""
+            self.input_cursor = 0
+            self._input_dirty = True
+
+        elif ch == 20:   # Ctrl+T — toggle link preview
+            self.link_preview_enabled = not self.link_preview_enabled
+            state = "ON" if self.link_preview_enabled else "OFF"
+            self.window_by_name["*status*"].add_line(f"Link preview: {state}", timestamp=False)
+            self._chat_dirty = True
+            self.dirty = True
+
+        elif ch == 26:   # Ctrl+Z — undo (clear input buffer)
+            if self.input_buffer:
+                self.input_buffer = ""
+                self.input_cursor = 0
+                self._input_dirty = True
+                self.dirty = True
+
+        elif ch == 27:   # Escape — clear input or close window
+            if self.input_buffer:
+                self.input_buffer = ""
+                self.input_cursor = 0
+                self._input_dirty = True
+                self.dirty = True
+            else:
+                win = self.get_current_window()
+                if win.name not in ("*status*", "*dashboard*"):
+                    self._slash_close("", "", "")
+
         return False
 
     # ── IRCv3 outgoing +typing helpers ───────────────────────────────────────
@@ -11052,7 +12105,8 @@ class TUI:
                     event = self.ui_queue.get_nowait()
                     # Buffer to disk when detached (bouncer mode)
                     if self._bouncer_detached and self._bouncer_enabled:
-                        self._bouncer_buffer.append(*event)
+                        if self._should_buffer_event(event):
+                            self._bouncer_buffer.append(*event)
                     try:
                         await self.handle_event(event)
                     except Exception as _ev_exc:
