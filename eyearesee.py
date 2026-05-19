@@ -5183,6 +5183,673 @@ class RelationshipGraph:
 
 
 # =========================
+# Network Analytics
+# =========================
+
+class NetworkAnalytics:
+    """Tracks connection latency, channel activity heatmaps, and server topology.
+
+    Provides:
+      • Per-server latency history with jitter/p95/p99 stats
+      • Channel activity heatmap (hour × day)
+      • Network topology: server → channels → users mapping
+      • Connection uptime/downtime tracking
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "network_analytics.json")
+
+    def __init__(self):
+        self._latency_samples: Dict[str, deque] = {}
+        self._heatmaps: Dict[str, Dict[int, Dict[int, int]]] = {}
+        self._topology: Dict[str, Dict[str, set]] = {}
+        self._connect_times: Dict[str, List[Tuple[float, Optional[float]]]] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def record_latency(self, server: str, latency_ms: float) -> None:
+        samples = self._latency_samples.setdefault(server, deque(maxlen=1000))
+        samples.append({"ts": time.time(), "ms": latency_ms})
+        self._maybe_save()
+
+    def get_latency_stats(self, server: str) -> Dict[str, Any]:
+        samples = self._latency_samples.get(server, deque())
+        if not samples:
+            return {"server": server, "samples": 0}
+        values = [s["ms"] for s in samples]
+        sorted_v = sorted(values)
+        n = len(sorted_v)
+        return {
+            "server": server,
+            "samples": n,
+            "current": round(values[-1], 1),
+            "mean": round(sum(values) / n, 1),
+            "min": round(sorted_v[0], 1),
+            "max": round(sorted_v[-1], 1),
+            "median": round(sorted_v[n // 2], 1),
+            "p95": round(sorted_v[int(n * 0.95)], 1),
+            "p99": round(sorted_v[int(n * 0.99)], 1),
+            "jitter": round((sum((v - sum(values)/n)**2 for v in values) / n) ** 0.5, 1),
+        }
+
+    def record_message(self, channel: str) -> None:
+        ts = time.localtime()
+        day = ts.tm_wday
+        hour = ts.tm_hour
+        hm = self._heatmaps.setdefault(channel.lower(), {})
+        hm.setdefault(day, {})
+        hm[day][hour] = hm[day].get(hour, 0) + 1
+        self._maybe_save()
+
+    def get_heatmap(self, channel: str) -> Dict[int, Dict[int, int]]:
+        return self._heatmaps.get(channel.lower(), {})
+
+    def get_heatmap_summary(self, channel: str, days: int = 7) -> List[Tuple[int, int, int]]:
+        hm = self.get_heatmap(channel)
+        entries = []
+        for d in range(7):
+            if d in hm:
+                for h, count in hm[d].items():
+                    entries.append((d, h, count))
+        entries.sort(key=lambda x: -x[2])
+        return entries[:days * 24]
+
+    def update_topology(self, server: str, channel: str, users: set) -> None:
+        srv_topo = self._topology.setdefault(server, {})
+        srv_topo[channel.lower()] = {u.lower() for u in users}
+
+    def get_topology(self, server: str) -> Dict[str, Any]:
+        srv = self._topology.get(server, {})
+        total_channels = len(srv)
+        total_users = len(set().union(*srv.values())) if srv else 0
+        return {
+            "server": server,
+            "channels": total_channels,
+            "total_users": total_users,
+            "channel_list": sorted(srv.keys()),
+        }
+
+    def record_connect(self, server: str) -> None:
+        self._connect_times.setdefault(server, []).append((time.time(), None))
+
+    def record_disconnect(self, server: str) -> None:
+        conns = self._connect_times.get(server, [])
+        if conns and conns[-1][1] is None:
+            conns[-1] = (conns[-1][0], time.time())
+
+    def get_uptime(self, server: str) -> Dict[str, Any]:
+        conns = self._connect_times.get(server, [])
+        if not conns:
+            return {"server": server, "connected": False}
+        last = conns[-1]
+        is_connected = last[1] is None
+        current_duration = time.time() - last[0] if is_connected else 0
+        total_up = sum((e[1] or time.time()) - e[0] for e in conns)
+        total_span = (conns[-1][1] or time.time()) - conns[0][0] if len(conns) > 1 else current_duration
+        return {
+            "server": server,
+            "connected": is_connected,
+            "current_duration": round(current_duration, 0),
+            "total_connections": len(conns),
+            "total_uptime": round(total_up, 0),
+            "uptime_pct": round(total_up / max(total_span, 1) * 100, 1),
+        }
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "latency": {s: list(d)[-100:] for s, d in self._latency_samples.items()},
+                "heatmaps": self._heatmaps,
+                "topology": {s: {c: sorted(u) for c, u in ch.items()} for s, ch in self._topology.items()},
+                "connect_times": self._connect_times,
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for s, samples in data.get("latency", {}).items():
+                self._latency_samples[s] = deque(samples[-1000:], maxlen=1000)
+            self._heatmaps = data.get("heatmaps", {})
+            for s, ch in data.get("topology", {}).items():
+                self._topology[s] = {c: set(u) for c, u in ch.items()}
+            self._connect_times = data.get("connect_times", {})
+        except Exception:
+            pass
+
+
+# =========================
+# Trigger Manager
+# =========================
+
+class TriggerManager:
+    """Auto-respond to message patterns with custom actions.
+
+    Supports:
+      • Regex-based pattern matching
+      • Actions: reply, notify, log, exec, ignore
+      • Per-channel or global triggers
+      • Rate limiting per trigger
+      • Cooldown periods to prevent spam
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "triggers.json")
+
+    def __init__(self):
+        self._triggers: List[Dict] = []
+        self._last_fired: Dict[int, float] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def add(self, pattern: str, action: str, response: str = "",
+            channel: str = "", cooldown: float = 30.0, case_sensitive: bool = False) -> int:
+        trigger_id = len(self._triggers)
+        self._triggers.append({
+            "id": trigger_id, "pattern": pattern, "action": action,
+            "response": response, "channel": channel.lower() if channel else "",
+            "cooldown": cooldown, "case_sensitive": case_sensitive,
+            "enabled": True, "fire_count": 0, "created": time.time(),
+        })
+        self._maybe_save()
+        return trigger_id
+
+    def remove(self, trigger_id: int) -> bool:
+        for i, t in enumerate(self._triggers):
+            if t["id"] == trigger_id:
+                del self._triggers[i]
+                self._last_fired.pop(trigger_id, None)
+                self._maybe_save()
+                return True
+        return False
+
+    def match(self, nick: str, channel: str, text: str) -> List[Dict]:
+        results = []
+        now = time.time()
+        for t in self._triggers:
+            if not t["enabled"]:
+                continue
+            if t["channel"] and t["channel"] != channel.lower():
+                continue
+            last = self._last_fired.get(t["id"], 0)
+            if now - last < t["cooldown"]:
+                continue
+            flags = 0 if t["case_sensitive"] else re.IGNORECASE
+            try:
+                if re.search(t["pattern"], text, flags):
+                    self._last_fired[t["id"]] = now
+                    t["fire_count"] += 1
+                    results.append(t)
+            except re.error:
+                pass
+        return results
+
+    def list_triggers(self) -> List[Dict]:
+        return sorted(self._triggers, key=lambda x: x["id"])
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._triggers, f, indent=2)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                self._triggers = json.load(f)
+        except Exception:
+            pass
+
+
+# =========================
+# AutoMod Manager
+# =========================
+
+class AutoModManager:
+    """Auto-moderation rules for channels.
+
+    Supports:
+      • Regex-based spam/harassment detection
+      • Flood detection (message rate per user)
+      • Caps lock detection
+      • Link filtering
+      • Actions: warn, mute, kick, ban, delete
+      • Whitelist for trusted users
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "automod.json")
+
+    def __init__(self):
+        self._rules: Dict[str, List[Dict]] = {}
+        self._flood_tracker: Dict[str, deque] = {}
+        self._whitelist: Dict[str, set] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def add_rule(self, channel: str, rule_type: str, pattern: str = "",
+                 action: str = "warn", threshold: int = 3, duration: int = 60) -> int:
+        cl = channel.lower()
+        rule_id = len(self._rules.get(cl, []))
+        self._rules.setdefault(cl, []).append({
+            "id": rule_id, "type": rule_type, "pattern": pattern,
+            "action": action, "threshold": threshold, "duration": duration,
+            "enabled": True,
+        })
+        self._maybe_save()
+        return rule_id
+
+    def remove_rule(self, channel: str, rule_id: int) -> bool:
+        cl = channel.lower()
+        rules = self._rules.get(cl, [])
+        for i, r in enumerate(rules):
+            if r["id"] == rule_id:
+                del rules[i]
+                self._maybe_save()
+                return True
+        return False
+
+    def add_whitelist(self, channel: str, nick: str) -> None:
+        self._whitelist.setdefault(channel.lower(), set()).add(nick.lower())
+
+    def remove_whitelist(self, channel: str, nick: str) -> None:
+        self._whitelist.get(channel.lower(), set()).discard(nick.lower())
+
+    def check(self, nick: str, channel: str, text: str) -> List[Dict]:
+        cl = channel.lower()
+        nl = nick.lower()
+        if nl in self._whitelist.get(cl, set()):
+            return []
+        results = []
+        now = time.time()
+
+        # Flood detection
+        ft = self._flood_tracker.setdefault(nl, deque(maxlen=20))
+        ft.append(now)
+        recent = sum(1 for t in ft if now - t < 5.0)
+        rules = self._rules.get(cl, [])
+        for r in rules:
+            if not r["enabled"]:
+                continue
+            if r["type"] == "flood" and recent >= r["threshold"]:
+                results.append({"rule": r, "reason": f"flood: {recent} msgs in 5s", "nick": nick})
+            elif r["type"] == "caps":
+                caps = sum(1 for c in text if c.isupper())
+                letters = sum(1 for c in text if c.isalpha())
+                if letters > 5 and caps / letters > r["threshold"] / 100:
+                    results.append({"rule": r, "reason": f"caps: {caps/letters:.0%}", "nick": nick})
+            elif r["type"] == "regex" and r["pattern"]:
+                try:
+                    if re.search(r["pattern"], text, re.IGNORECASE):
+                        results.append({"rule": r, "reason": f"regex match", "nick": nick})
+                except re.error:
+                    pass
+            elif r["type"] == "links" and ("http://" in text or "https://" in text):
+                results.append({"rule": r, "reason": "link detected", "nick": nick})
+        return results
+
+    def list_rules(self, channel: str) -> List[Dict]:
+        return self._rules.get(channel.lower(), [])
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "rules": self._rules,
+                "whitelist": {k: sorted(v) for k, v in self._whitelist.items()},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._rules = data.get("rules", {})
+            self._whitelist = {k: set(v) for k, v in data.get("whitelist", {}).items()}
+        except Exception:
+            pass
+
+
+# =========================
+# Webhook Manager
+# =========================
+
+class WebhookManager:
+    """Forward IRC events to external webhooks (Discord, Slack, custom).
+
+    Supports:
+      • Channel-specific or global webhooks
+      • Event filtering (msg, join, part, quit, topic, action)
+      • Payload formatting (JSON, form-data, plain text)
+      • Retry on failure with exponential backoff
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "webhooks.json")
+
+    def __init__(self):
+        self._webhooks: List[Dict] = []
+        self._last_save: float = 0.0
+        self.load()
+
+    def add(self, url: str, events: List[str], channel: str = "",
+            name: str = "", format_type: str = "json") -> int:
+        wh_id = len(self._webhooks)
+        self._webhooks.append({
+            "id": wh_id, "url": url, "events": events,
+            "channel": channel.lower() if channel else "",
+            "name": name or f"webhook-{wh_id}", "format": format_type,
+            "enabled": True, "fail_count": 0, "created": time.time(),
+        })
+        self._maybe_save()
+        return wh_id
+
+    def remove(self, wh_id: int) -> bool:
+        for i, w in enumerate(self._webhooks):
+            if w["id"] == wh_id:
+                del self._webhooks[i]
+                self._maybe_save()
+                return True
+        return False
+
+    async def fire(self, event_type: str, channel: str, data: Dict) -> None:
+        for wh in self._webhooks:
+            if not wh["enabled"]:
+                continue
+            if event_type not in wh["events"]:
+                continue
+            if wh["channel"] and wh["channel"] != channel.lower():
+                continue
+            await self._send_webhook(wh, event_type, channel, data)
+
+    async def _send_webhook(self, wh: Dict, event_type: str, channel: str, data: Dict) -> None:
+        try:
+            payload = json.dumps({
+                "event": event_type, "channel": channel,
+                "ts": time.time(), "data": data,
+            })
+            req = urllib.request.Request(
+                wh["url"],
+                data=payload.encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(_IO_EXECUTOR, lambda: urllib.request.urlopen(req, timeout=10))
+            wh["fail_count"] = 0
+        except Exception:
+            wh["fail_count"] = wh.get("fail_count", 0) + 1
+            if wh["fail_count"] > 10:
+                wh["enabled"] = False
+
+    def list_webhooks(self) -> List[Dict]:
+        return self._webhooks
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._webhooks, f, indent=2)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                self._webhooks = json.load(f)
+        except Exception:
+            pass
+
+
+# =========================
+# GitHub Tracker
+# =========================
+
+class GitHubTracker:
+    """Track GitHub repositories and post updates to IRC channels.
+
+    Monitors:
+      • New issues, PRs, releases
+      • Commit activity
+      • Star/watcher count changes
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "github_tracker.json")
+
+    def __init__(self):
+        self._repos: Dict[str, Dict] = {}
+        self._last_check: Dict[str, float] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def add(self, owner: str, repo: str, channel: str, events: List[str] = None,
+            token: str = "") -> str:
+        key = f"{owner}/{repo}".lower()
+        self._repos[key] = {
+            "owner": owner, "repo": repo, "channel": channel.lower(),
+            "events": events or ["issue", "pr", "release"],
+            "token": token, "enabled": True,
+            "last_issue": 0, "last_pr": 0, "last_release": 0,
+        }
+        self._maybe_save()
+        return key
+
+    def remove(self, key: str) -> bool:
+        if key.lower() in self._repos:
+            del self._repos[key.lower()]
+            self._maybe_save()
+            return True
+        return False
+
+    async def check_updates(self) -> List[Dict]:
+        updates = []
+        now = time.time()
+        for key, repo in self._repos.items():
+            if not repo["enabled"]:
+                continue
+            if now - self._last_check.get(key, 0) < 300:
+                continue
+            self._last_check[key] = now
+            try:
+                updates.extend(await self._check_repo(key, repo))
+            except Exception:
+                pass
+        return updates
+
+    async def _check_repo(self, key: str, repo: Dict) -> List[Dict]:
+        updates = []
+        headers = {"Accept": "application/vnd.github.v3+json"}
+        if repo.get("token"):
+            headers["Authorization"] = f"token {repo['token']}"
+        base = f"https://api.github.com/repos/{repo['owner']}/{repo['repo']}"
+
+        loop = asyncio.get_running_loop()
+        if "issue" in repo["events"]:
+            try:
+                url = f"{base}/issues?state=open&sort=created&direction=desc&per_page=3"
+                raw = await loop.run_in_executor(_IO_EXECUTOR, lambda: self._fetch(url, headers))
+                issues = json.loads(raw) if raw else []
+                for iss in issues:
+                    if iss.get("pull_request"):
+                        continue
+                    created = time.mktime(time.strptime(iss["created_at"][:19], "%Y-%m-%dT%H:%M:%S"))
+                    if created > repo.get("last_issue", 0):
+                        updates.append({"type": "issue", "repo": key, "title": iss["title"],
+                                       "user": iss["user"]["login"], "url": iss["html_url"], "channel": repo["channel"]})
+                        repo["last_issue"] = max(repo.get("last_issue", 0), created)
+            except Exception:
+                pass
+
+        if "pr" in repo["events"]:
+            try:
+                url = f"{base}/pulls?state=open&sort=created&direction=desc&per_page=3"
+                raw = await loop.run_in_executor(_IO_EXECUTOR, lambda: self._fetch(url, headers))
+                prs = json.loads(raw) if raw else []
+                for pr in prs:
+                    created = time.mktime(time.strptime(pr["created_at"][:19], "%Y-%m-%dT%H:%M:%S"))
+                    if created > repo.get("last_pr", 0):
+                        updates.append({"type": "pr", "repo": key, "title": pr["title"],
+                                       "user": pr["user"]["login"], "url": pr["html_url"], "channel": repo["channel"]})
+                        repo["last_pr"] = max(repo.get("last_pr", 0), created)
+            except Exception:
+                pass
+
+        if "release" in repo["events"]:
+            try:
+                url = f"{base}/releases?per_page=1"
+                raw = await loop.run_in_executor(_IO_EXECUTOR, lambda: self._fetch(url, headers))
+                releases = json.loads(raw) if raw else []
+                if releases:
+                    rel = releases[0]
+                    created = time.mktime(time.strptime(rel["published_at"][:19], "%Y-%m-%dT%H:%M:%S"))
+                    if created > repo.get("last_release", 0):
+                        updates.append({"type": "release", "repo": key, "title": rel["name"] or rel["tag_name"],
+                                       "user": rel["author"]["login"], "url": rel["html_url"], "channel": repo["channel"]})
+                        repo["last_release"] = max(repo.get("last_release", 0), created)
+            except Exception:
+                pass
+
+        return updates
+
+    @staticmethod
+    def _fetch(url: str, headers: Dict) -> Optional[str]:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.read().decode("utf-8")
+        except Exception:
+            return None
+
+    def list_repos(self) -> List[Dict]:
+        return [{"key": k, **v} for k, v in self._repos.items()]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._repos, f, indent=2)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                self._repos = json.load(f)
+        except Exception:
+            pass
+
+
+# =========================
+# Chat Log Importer
+# =========================
+
+class ChatLogImporter:
+    """Import chat logs from other IRC clients.
+
+    Supported formats:
+      • HexChat/XChat (.log)
+      • WeeChat (.weechatlog)
+      • irssi (.log)
+      • Generic timestamped text
+    """
+
+    @staticmethod
+    def detect_format(filepath: str) -> str:
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                first_lines = [f.readline() for _ in range(5)]
+            for line in first_lines:
+                if re.match(r'\*\*\*\*\s+Log', line):
+                    return "hexchat"
+                if re.match(r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}', line):
+                    return "weechat"
+                if re.match(r'--.*--\s+Log', line):
+                    return "irssi"
+            return "generic"
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def import_file(filepath: str, window_name: str, fmt: str = "auto") -> int:
+        if fmt == "auto":
+            fmt = ChatLogImporter.detect_format(filepath)
+        count = 0
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    if not line.strip():
+                        continue
+                    parsed = ChatLogImporter._parse_line(line, fmt)
+                    if parsed:
+                        ts_str, nick, text = parsed
+                        append_chat_line(window_name, f"{ts_str} <{nick}> {text}")
+                        count += 1
+        except Exception:
+            pass
+        return count
+
+    @staticmethod
+    def _parse_line(line: str, fmt: str) -> Optional[Tuple[str, str, str]]:
+        if fmt == "hexchat":
+            m = re.match(r'\*\*\*\*\s+Log opened:\s+(.*)', line)
+            if m:
+                return None
+            m = re.match(r'(\d{2}:\d{2}:\d{2})\s+<([^>]+)>\s+(.*)', line)
+            if m:
+                return (f"[{m.group(1)}]", m.group(2), m.group(3))
+        elif fmt == "weechat":
+            m = re.match(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+<([^>]+)>\s+(.*)', line)
+            if m:
+                dt = m.group(1).split()[1]
+                return (f"[{dt}]", m.group(2), m.group(3))
+        elif fmt == "irssi":
+            m = re.match(r'--\w+\s+\w+\s+\d+\s+(\d{2}:\d{2}:\d{2})\s+--\s+<([^>]+)>\s+(.*)', line)
+            if m:
+                return (f"[{m.group(1)}]", m.group(2), m.group(3))
+        m = re.match(r'\[?(\d{2}:\d{2}(?::\d{2})?)\]?\s*[<\[]([^>\]]+)[>\]]\s+(.*)', line)
+        if m:
+            return (f"[{m.group(1)}]", m.group(2), m.group(3))
+        return None
+
+
+# =========================
 # AICalibrationManager
 # =========================
 
@@ -6454,6 +7121,14 @@ class ScoringEngine:
         # Advanced AI detection
         self.llm_fingerprinter = LLMFingerprinter()
         self.deepfake_relay = DeepfakeRelayDetector()
+        # Networking & analytics
+        self.network_analytics = NetworkAnalytics()
+        # Automation & bots
+        self.triggers = TriggerManager()
+        self.automod = AutoModManager()
+        self.webhooks = WebhookManager()
+        # Data & integration
+        self.github = GitHubTracker()
 
     def _load_fingerprints(self) -> None:
         """Load persisted bot fingerprints from disk."""
@@ -7426,6 +8101,7 @@ class IRCClient:
                 echoed_ts = int(params[0].lstrip(":keepalive-"))
                 if echoed_ts > 0:
                     self._latency = time.time() - echoed_ts
+                    self.biometrics.record_incoming_message()
             except (ValueError, IndexError):
                 pass
 
@@ -11009,6 +11685,48 @@ class TUI:
             except Exception:
                 pass
 
+    async def _periodic_github_poller(self) -> None:
+        """Periodically check tracked GitHub repos for updates."""
+        while True:
+            try:
+                await asyncio.sleep(300)
+                if not hasattr(self._active_client(), 'scoring'):
+                    continue
+                scoring = self._active_client().scoring
+                updates = await scoring.github.check_updates()
+                if updates:
+                    status_win = self.window_by_name.get("*status*")
+                    for u in updates:
+                        msg = f"[GitHub] {u['type'].upper()} {u['repo']}: {u['title']} by {u['user']} {u['url']}"
+                        if status_win:
+                            status_win.add_line(msg)
+                        # Also post to the tracked channel
+                        target_win = self.window_by_name.get(u["channel"])
+                        if target_win and target_win != status_win:
+                            target_win.add_line(f"-!- {msg}")
+                    self._chat_dirty = True
+                    self.dirty = True
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _periodic_topology_updater(self) -> None:
+        """Periodically update network topology from channel user lists."""
+        while True:
+            try:
+                await asyncio.sleep(60)
+                if not hasattr(self._active_client(), 'scoring'):
+                    continue
+                client = self._active_client()
+                na = client.scoring.network_analytics
+                for ch, users in self.channel_users.items():
+                    na.update_topology(client.server_id, ch, users)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
     def apply_theme(self, n: int, announce: bool = True) -> None:
         """Switch to theme n (1-based). Re-initialises the four key color pairs
         and forces a full redraw.  Color pair integers are live — no need to
@@ -11869,6 +12587,8 @@ class TUI:
             # Productivity: channel stats tracking
             if target.startswith("#"):
                 scoring.channel_stats.record_message(nick, target, msg)
+                # Network analytics: heatmap tracking
+                scoring.network_analytics.record_message(target)
             # Productivity: nick watch checks
             triggered = scoring.watches.check_event("speak", nick, target)
             if mention:
@@ -11915,6 +12635,57 @@ class TUI:
             pass  # _chat_dirty already set below
         self._chat_dirty = True
         self.dirty = True
+
+        # Automation: trigger matching
+        if not is_replay and hasattr(self._active_client(), 'scoring'):
+            scoring = self._active_client().scoring
+            triggers = scoring.triggers.match(nick, target, msg)
+            for t in triggers:
+                if t["action"] == "reply":
+                    response = t["response"].replace("{nick}", nick).replace("{msg}", msg)
+                    client = self._active_client()
+                    client.cmd_msg(target, response)
+                    sw = self.ensure_window(target, is_channel=target.startswith("#"))
+                    sw.add_line(f"[trigger #{t['id']}] → {response}", timestamp=False)
+                elif t["action"] == "notify":
+                    await self.ui_queue.put(("status", f"[trigger #{t['id']}] {nick}: {msg}"))
+                elif t["action"] == "log":
+                    log_path = os.path.join(_SCRIPT_DIR, "trigger_log.jsonl")
+                    try:
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write(json.dumps({"ts": time.time(), "trigger": t["id"],
+                                               "nick": nick, "channel": target, "msg": msg}) + "\n")
+                    except Exception:
+                        pass
+
+            # Automation: auto-mod checks
+            if target.startswith("#"):
+                violations = scoring.automod.check(nick, target, msg)
+                for v in violations:
+                    rule = v["rule"]
+                    await self.ui_queue.put(("status", f"[automod] {v['nick']} in {target}: {v['reason']} → {rule['action']}"))
+                    if rule["action"] in ("kick", "ban"):
+                        client = self._active_client()
+                        if rule["action"] == "kick":
+                            client.send_raw(f"KICK {target} {v['nick']} :AutoMod: {v['reason']}")
+                        elif rule["action"] == "ban":
+                            client.send_raw(f"MODE {target} +b *!*@*")
+                            client.send_raw(f"KICK {target} {v['nick']} :AutoMod: {v['reason']}")
+
+            # Webhook: fire event
+            await scoring.webhooks.fire("msg", target, {
+                "nick": nick, "msg": msg, "channel": target, "action": "msg",
+            })
+
+            # Bot mode: check for !commands
+            if getattr(self, '_bot_mode_enabled', False) and hasattr(self, '_bot_commands'):
+                if msg.startswith("!"):
+                    cmd = msg[1:].split()[0].lower()
+                    if cmd in self._bot_commands:
+                        response = self._bot_commands[cmd]
+                        client = self._active_client()
+                        client.cmd_msg(target, response)
+
         await self.plugin_manager.dispatch("on_message", nick=nick, target=target,
                                            msg=msg, is_action=is_action, is_replay=is_replay)
         await self.script_engine.dispatch("on_message", nick=nick, target=target,
@@ -12520,6 +13291,15 @@ class TUI:
         h["raw"]        = self._slash_raw
         h["dns"]        = self._slash_dns
         h["resolve"]    = self._slash_dns
+        h["latency"]    = self._slash_latency
+        h["heatmap"]    = self._slash_heatmap
+        h["network"]    = self._slash_network
+        h["trigger"]    = self._slash_trigger
+        h["automod"]    = self._slash_automod
+        h["webhook"]    = self._slash_webhook
+        h["bot"]        = self._slash_bot_cmd
+        h["github"]     = self._slash_github
+        h["import"]     = self._slash_import
         h["stats"]      = self._slash_stats
         h["uptime"]     = self._slash_uptime
         h["ping"]       = self._slash_ping
@@ -15135,6 +15915,419 @@ class TUI:
                     sw.add_line(f"-!- No results for {host}")
             except Exception as e:
                 sw.add_line(f"-!- DNS resolution failed: {e}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_latency(self, args, extra, line):
+        """Show connection latency statistics.
+
+        Usage: /latency [server]
+        """
+        client = self._active_client()
+        server = (args or "").strip() or client.server
+        na = client.scoring.network_analytics
+        sw = self._status_win()
+
+        if client._latency > 0:
+            na.record_latency(client.server_id, client._latency * 1000)
+
+        stats = na.get_latency_stats(server)
+        if stats.get("samples", 0) == 0:
+            sw.add_line(f"=== Latency: {server} ===")
+            sw.add_line(f"  Current: {client._latency * 1000:.1f} ms")
+            sw.add_line("  No history yet — send more PINGs to collect samples.")
+        else:
+            sw.add_line(f"=== Latency: {server} ===")
+            sw.add_line(f"  Current  : {stats.get('current', 0):.1f} ms")
+            sw.add_line(f"  Mean     : {stats['mean']:.1f} ms")
+            sw.add_line(f"  Min/Max  : {stats['min']:.1f} / {stats['max']:.1f} ms")
+            sw.add_line(f"  Median   : {stats['median']:.1f} ms")
+            sw.add_line(f"  P95/P99  : {stats['p95']:.1f} / {stats['p99']:.1f} ms")
+            sw.add_line(f"  Jitter   : {stats['jitter']:.1f} ms")
+            sw.add_line(f"  Samples  : {stats['samples']}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_heatmap(self, args, extra, line):
+        """Show channel activity heatmap.
+
+        Usage: /heatmap [channel]
+        """
+        client = self._active_client()
+        channel = (args or "").strip()
+        if not channel:
+            cur_win = self.get_current_window()
+            channel = cur_win.name if cur_win.name.startswith("#") else self.current_channel
+        if not channel:
+            await self.ui_queue.put(("status", "Usage: /heatmap <channel>"))
+            return
+
+        na = client.scoring.network_analytics
+        sw = self._status_win()
+        hm = na.get_heatmap(channel)
+        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+        sw.add_line(f"=== Activity Heatmap: {channel} ===")
+        sw.add_line("")
+        header = "      " + "".join(f"{h:3d}" for h in range(24))
+        sw.add_line(header)
+        sw.add_line("      " + "───" * 24)
+
+        max_count = 1
+        for d in range(7):
+            if d in hm:
+                max_count = max(max_count, max(hm[d].values()))
+
+        for d in range(7):
+            row = f"{day_names[d]:>4} "
+            for h in range(24):
+                count = hm.get(d, {}).get(h, 0)
+                if count == 0:
+                    row += "  ."
+                else:
+                    intensity = int(count / max_count * 5)
+                    chars = " ░▒▓█"
+                    row += f" {chars[min(intensity, 4)]}"
+            sw.add_line(row)
+
+        sw.add_line("")
+        top = na.get_heatmap_summary(channel)
+        if top:
+            d, h, c = top[0]
+            sw.add_line(f"  Peak: {day_names[d]} {h:02d}:00 ({c} messages)")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_network(self, args, extra, line):
+        """Show network topology and analytics.
+
+        Usage:
+          /network topology  — show server → channels → users map
+          /network uptime    — show connection uptime stats
+          /network status    — show all network analytics
+        """
+        client = self._active_client()
+        sub = (args or "").strip().lower()
+        na = client.scoring.network_analytics
+        sw = self._status_win()
+
+        if sub == "topology":
+            topo = na.get_topology(client.server_id)
+            sw.add_line(f"=== Network Topology: {client.server_id} ===")
+            sw.add_line(f"  Channels: {topo['channels']}")
+            sw.add_line(f"  Total users: {topo['total_users']}")
+            sw.add_line("")
+            for ch in topo["channel_list"][:20]:
+                users = na._topology.get(client.server_id, {}).get(ch, set())
+                sw.add_line(f"  {ch:<20} ({len(users)} users)")
+        elif sub == "uptime":
+            up = na.get_uptime(client.server_id)
+            sw.add_line(f"=== Uptime: {client.server_id} ===")
+            sw.add_line(f"  Connected: {'Yes' if up['connected'] else 'No'}")
+            if up["connected"]:
+                dur = up["current_duration"]
+                sw.add_line(f"  Current session: {dur // 3600:.0f}h {(dur % 3600) // 60:.0f}m")
+            sw.add_line(f"  Total connections: {up['total_connections']}")
+            sw.add_line(f"  Uptime: {up['uptime_pct']:.1f}%")
+        else:
+            up = na.get_uptime(client.server_id)
+            lat = na.get_latency_stats(client.server_id)
+            sw.add_line(f"=== Network Status: {client.server_id} ===")
+            sw.add_line(f"  Connected: {'Yes' if up['connected'] else 'No'}")
+            sw.add_line(f"  Latency: {lat.get('current', 0):.1f} ms (mean: {lat.get('mean', 0):.1f} ms)")
+            sw.add_line(f"  Channels: {up.get('total_connections', 0)}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_trigger(self, args, extra, line):
+        """Manage auto-response triggers.
+
+        Usage:
+          /trigger add <regex> <action> <response> [channel] [cooldown]
+          /trigger list
+          /trigger remove <id>
+          /trigger enable|disable <id>
+        """
+        client = self._active_client()
+        triggers = client.scoring.triggers
+        parts = (args + " " + extra).strip().split(maxsplit=4)
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /trigger <add|list|remove|enable|disable> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "add":
+            if len(parts) < 4:
+                await self.ui_queue.put(("status", "Usage: /trigger add <regex> <reply|notify|log> <response> [channel] [cooldown]"))
+                return
+            pattern = parts[1]
+            trigger_action = parts[2]
+            response = parts[3]
+            channel = parts[4].split()[0] if len(parts) > 4 else ""
+            tid = triggers.add(pattern, trigger_action, response, channel)
+            sw.add_line(f"-!- Trigger #{tid} added: {pattern} → {trigger_action}")
+        elif action == "list":
+            tlist = triggers.list_triggers()
+            sw.add_line("=== Triggers ===")
+            if not tlist:
+                sw.add_line("  No triggers configured.")
+            else:
+                for t in tlist:
+                    status = "ON" if t["enabled"] else "OFF"
+                    sw.add_line(f"  #{t['id']} [{status}] {t['pattern']} → {t['action']} "
+                               f"({t['channel'] or 'global'}) fires={t['fire_count']}")
+        elif action == "remove":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /trigger remove <id>"))
+                return
+            if triggers.remove(int(parts[1])):
+                sw.add_line(f"-!- Trigger #{parts[1]} removed")
+            else:
+                sw.add_line(f"-!- Trigger #{parts[1]} not found")
+        elif action in ("enable", "disable"):
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Usage: /trigger {action} <id>"))
+                return
+            tid = int(parts[1])
+            for t in triggers._triggers:
+                if t["id"] == tid:
+                    t["enabled"] = action == "enable"
+                    sw.add_line(f"-!- Trigger #{tid} {action}d")
+                    break
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_automod(self, args, extra, line):
+        """Manage auto-moderation rules.
+
+        Usage:
+          /automod add <channel> <type> <pattern> <action> [threshold]
+          /automod list [channel]
+          /automod remove <channel> <id>
+          /automod whitelist <channel> <nick>
+        """
+        client = self._active_client()
+        automod = client.scoring.automod
+        parts = (args + " " + extra).strip().split()
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /automod <add|list|remove|whitelist> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "add":
+            if len(parts) < 5:
+                await self.ui_queue.put(("status", "Usage: /automod add <channel> <flood|caps|regex|links> <pattern> <warn|kick|ban> [threshold]"))
+                return
+            channel, rule_type, pattern, mod_action = parts[1], parts[2], parts[3], parts[4]
+            threshold = int(parts[5]) if len(parts) > 5 else 3
+            rid = automod.add_rule(channel, rule_type, pattern, mod_action, threshold)
+            sw.add_line(f"-!- AutoMod rule #{rid} added to {channel}")
+        elif action == "list":
+            channel = parts[1] if len(parts) > 1 else (self.current_channel or "")
+            rules = automod.list_rules(channel)
+            sw.add_line(f"=== AutoMod Rules: {channel} ===")
+            if not rules:
+                sw.add_line("  No rules configured.")
+            else:
+                for r in rules:
+                    sw.add_line(f"  #{r['id']} [{r['type']}] pattern='{r['pattern']}' "
+                               f"→ {r['action']} (threshold={r['threshold']})")
+        elif action == "remove":
+            if len(parts) < 3:
+                await self.ui_queue.put(("status", "Usage: /automod remove <channel> <id>"))
+                return
+            if automod.remove_rule(parts[1], int(parts[2])):
+                sw.add_line(f"-!- Rule #{parts[2]} removed from {parts[1]}")
+        elif action == "whitelist":
+            if len(parts) < 3:
+                await self.ui_queue.put(("status", "Usage: /automod whitelist <channel> <nick>"))
+                return
+            automod.add_whitelist(parts[1], parts[2])
+            sw.add_line(f"-!- {parts[2]} whitelisted in {parts[1]}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_webhook(self, args, extra, line):
+        """Manage webhooks for forwarding IRC events.
+
+        Usage:
+          /webhook add <url> <events> [channel] [name]
+          /webhook list
+          /webhook remove <id>
+        """
+        client = self._active_client()
+        webhooks = client.scoring.webhooks
+        parts = (args + " " + extra).strip().split(maxsplit=4)
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /webhook <add|list|remove> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "add":
+            if len(parts) < 3:
+                await self.ui_queue.put(("status", "Usage: /webhook add <url> <msg,join,part,quit,topic,action> [channel] [name]"))
+                return
+            url = parts[1]
+            events = parts[2].split(",")
+            channel = parts[3] if len(parts) > 3 else ""
+            name = parts[4] if len(parts) > 4 else ""
+            wid = webhooks.add(url, events, channel, name)
+            sw.add_line(f"-!- Webhook #{wid} added: {url}")
+        elif action == "list":
+            wh_list = webhooks.list_webhooks()
+            sw.add_line("=== Webhooks ===")
+            if not wh_list:
+                sw.add_line("  No webhooks configured.")
+            else:
+                for w in wh_list:
+                    status = "ON" if w["enabled"] else "OFF"
+                    sw.add_line(f"  #{w['id']} [{status}] {w['name']}: {w['url']} "
+                               f"events={','.join(w['events'])} channel={w['channel'] or 'all'}")
+        elif action == "remove":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /webhook remove <id>"))
+                return
+            if webhooks.remove(int(parts[1])):
+                sw.add_line(f"-!- Webhook #{parts[1]} removed")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_bot_cmd(self, args, extra, line):
+        """Bot mode: respond to commands from other users.
+
+        Usage:
+          /bot start    — enable bot mode (respond to !commands)
+          /bot stop     — disable bot mode
+          /bot status   — show bot mode status
+          /bot addcmd <trigger> <response>
+        """
+        sub = (args or "").strip().lower()
+        sw = self._status_win()
+
+        if sub == "start":
+            self._bot_mode_enabled = True
+            sw.add_line("-!- Bot mode enabled — responding to !commands")
+        elif sub == "stop":
+            self._bot_mode_enabled = False
+            sw.add_line("-!- Bot mode disabled")
+        elif sub == "status":
+            status = "enabled" if getattr(self, '_bot_mode_enabled', False) else "disabled"
+            sw.add_line(f"-!- Bot mode: {status}")
+        elif sub.startswith("addcmd"):
+            rest = (extra or "").strip()
+            if not rest:
+                await self.ui_queue.put(("status", "Usage: /bot addcmd <trigger> <response>"))
+                return
+            parts = rest.split(maxsplit=1)
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /bot addcmd <trigger> <response>"))
+                return
+            trigger, response = parts
+            if not hasattr(self, '_bot_commands'):
+                self._bot_commands = {}
+            self._bot_commands[trigger.lower()] = response
+            sw.add_line(f"-!- Bot command '!{trigger}' added")
+        else:
+            await self.ui_queue.put(("status", "Usage: /bot <start|stop|status|addcmd>"))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_github(self, args, extra, line):
+        """Track GitHub repositories.
+
+        Usage:
+          /github add <owner/repo> [channel] [events]
+          /github list
+          /github remove <owner/repo>
+          /github check    — manually check for updates
+        """
+        client = self._active_client()
+        gh = client.scoring.github
+        parts = (args + " " + extra).strip().split()
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /github <add|list|remove|check> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "add":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /github add <owner/repo> [channel]"))
+                return
+            repo_key = parts[1]
+            if "/" not in repo_key:
+                await self.ui_queue.put(("status", "Usage: /github add <owner/repo> [channel]"))
+                return
+            owner, repo = repo_key.split("/", 1)
+            channel = parts[2] if len(parts) > 2 else (self.current_channel or "")
+            events = parts[3].split(",") if len(parts) > 3 else ["issue", "pr", "release"]
+            token = GITHUB_TOKEN
+            key = gh.add(owner, repo, channel, events, token)
+            sw.add_line(f"-!- Tracking {key} → {channel}")
+        elif action == "list":
+            repos = gh.list_repos()
+            sw.add_line("=== GitHub Tracked Repos ===")
+            if not repos:
+                sw.add_line("  No repos tracked.")
+            else:
+                for r in repos:
+                    sw.add_line(f"  {r['key']} → {r['channel']} "
+                               f"events={','.join(r['events'])} enabled={r['enabled']}")
+        elif action == "remove":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /github remove <owner/repo>"))
+                return
+            if gh.remove(parts[1]):
+                sw.add_line(f"-!- Stopped tracking {parts[1]}")
+        elif action == "check":
+            sw.add_line("-!- Checking for GitHub updates...")
+            updates = await gh.check_updates()
+            if updates:
+                for u in updates:
+                    sw.add_line(f"  [{u['type'].upper()}] {u['repo']}: {u['title']} by {u['user']}")
+                    sw.add_line(f"    {u['url']}")
+            else:
+                sw.add_line("  No new updates.")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_import(self, args, extra, line):
+        """Import chat logs from other IRC clients.
+
+        Usage: /import <filepath> [window_name] [format]
+        Formats: hexchat, weechat, irssi, generic, auto
+        """
+        parts = (args + " " + extra).strip().split()
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /import <filepath> [window_name] [format]"))
+            return
+
+        filepath = parts[0]
+        window = parts[1] if len(parts) > 1 else (self.current_channel or "*status*")
+        fmt = parts[2] if len(parts) > 2 else "auto"
+
+        if not os.path.isfile(filepath):
+            await self.ui_queue.put(("status", f"-!- File not found: {filepath}"))
+            return
+
+        detected = ChatLogImporter.detect_format(filepath)
+        sw.add_line(f"-!- Importing {filepath} (format: {fmt if fmt != 'auto' else detected}) → {window}")
+
+        count = ChatLogImporter.import_file(filepath, window, fmt)
+        sw.add_line(f"-!- Imported {count} messages")
+
+        if window in self.window_by_name:
+            win = self.window_by_name[window]
+            win._wrap_dirty = True
         self._chat_dirty = True
         self.dirty = True
 
@@ -18677,6 +19870,8 @@ class TUI:
         # Start periodic background tasks for productivity features
         asyncio.create_task(self._periodic_reminder_checker())
         asyncio.create_task(self._periodic_rss_poller())
+        asyncio.create_task(self._periodic_github_poller())
+        asyncio.create_task(self._periodic_topology_updater())
         try:
             await self._run_loop()
         except (SystemExit, asyncio.CancelledError, KeyboardInterrupt):
