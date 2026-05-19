@@ -5744,6 +5744,11 @@ class PluginAPI:
         """Switch the TUI focus to a window by name."""
         win = self._tui.window_by_name.get(name)
         if win and win in self._tui.windows:
+            # Reset dashboard state when navigating away
+            prev_win = self._tui.get_current_window()
+            if prev_win.name == "*dashboard*":
+                self._tui._dashboard_mode = "suspects"
+                self._tui._dashboard_profile_locked = False
             self._tui.current_window_index = self._tui.windows.index(win)
             self._tui.current_channel = name if name.startswith("#") else None
             self._tui._unread_windows.discard(name)
@@ -7459,6 +7464,11 @@ class TUI:
             if col + lw + 1 > usable:
                 break
             if col <= mx < col + lw:
+                # Reset dashboard state when navigating away
+                prev_win = self.get_current_window()
+                if prev_win.name == "*dashboard*":
+                    self._dashboard_mode = "suspects"
+                    self._dashboard_profile_locked = False
                 self.current_window_index = i
                 self.current_channel = None
                 self._chat_dirty = self._userlist_dirty = self._input_dirty = True
@@ -7678,6 +7688,10 @@ class TUI:
     def switch_to_next_window(self):
         prev_win = self.get_current_window()
         self._mark_window_read(prev_win)
+        # Reset dashboard state when navigating away
+        if prev_win.name == "*dashboard*":
+            self._dashboard_mode = "suspects"
+            self._dashboard_profile_locked = False
         self.current_window_index = (self.current_window_index + 1) % len(self.windows)
         win = self.get_current_window()
         if win.name not in ("*status*", "*dashboard*"):
@@ -9390,6 +9404,10 @@ class TUI:
             new_win = self.get_current_window()
             if new_win.name not in ("*status*", "*dashboard*"):
                 self.current_channel = new_win.name
+            # Reset dashboard state if we landed on it
+            if new_win.name == "*dashboard*":
+                self._dashboard_mode = "suspects"
+                self._dashboard_profile_locked = False
             self._chat_dirty = self._userlist_dirty = self._input_dirty = True
             self.dirty = True
 
@@ -9398,6 +9416,11 @@ class TUI:
             idx = int(args) - 1
             if 0 <= idx < len(self.windows):
                 self._mark_window_read(self.get_current_window())
+                # Reset dashboard state when navigating away
+                prev_win = self.get_current_window()
+                if prev_win.name == "*dashboard*":
+                    self._dashboard_mode = "suspects"
+                    self._dashboard_profile_locked = False
                 self.current_window_index = idx
                 win = self.windows[idx]
                 if win.name not in ("*status*", "*dashboard*"):
@@ -10882,7 +10905,7 @@ class TUI:
         _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
         _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
         _C("  Ctrl+L  clear window    Ctrl+R  toggle userlist    Ctrl+G  go to window #")
-        _C("  Ctrl+T  toggle link preview    Ctrl+Z  clear input    Esc  clear/close")
+        _C("  Ctrl+T  toggle link preview    Ctrl+Z  clear input    Esc  clear/close/reset dashboard")
         _C("  Left-click nick → /query    Left-click header → switch channel    Wheel → scroll")
         _C("")
         _H("BNC & GPG & Tor")
@@ -11861,6 +11884,11 @@ class TUI:
 
                 if my == 0 and disp_ch:
                     # Click on header → switch to that channel window
+                    # Reset dashboard state when navigating away
+                    prev_win = self.get_current_window()
+                    if prev_win.name == "*dashboard*":
+                        self._dashboard_mode = "suspects"
+                        self._dashboard_profile_locked = False
                     for i, w in enumerate(self.windows):
                         if w.name == disp_ch:
                             self.current_window_index = i
@@ -11870,6 +11898,11 @@ class TUI:
                             return True
                 elif my >= 1 and disp_ch:
                     # Click on a nick → open /query
+                    # Reset dashboard state when navigating away
+                    prev_win = self.get_current_window()
+                    if prev_win.name == "*dashboard*":
+                        self._dashboard_mode = "suspects"
+                        self._dashboard_profile_locked = False
                     if disp_ch not in self._sorted_users:
                         self._sorted_users[disp_ch] = self._sort_users_by_mode(disp_ch)
                     users = self._sorted_users[disp_ch]
@@ -11920,6 +11953,11 @@ class TUI:
                     target = nick_match.group(1)
                     our_nick = self._active_client().nick
                     if target.lower() != our_nick.lower():
+                        # Reset dashboard state when navigating away
+                        prev_win = self.get_current_window()
+                        if prev_win.name == "*dashboard*":
+                            self._dashboard_mode = "suspects"
+                            self._dashboard_profile_locked = False
                         qwin = self.ensure_window(target, is_channel=False)
                         for i, w in enumerate(self.windows):
                             if w is qwin:
@@ -11969,6 +12007,11 @@ class TUI:
                 try:
                     win_num = int(self.input_buffer) - 1
                     if 0 <= win_num < len(self.windows):
+                        # Reset dashboard state when navigating away
+                        prev_win = self.get_current_window()
+                        if prev_win.name == "*dashboard*":
+                            self._dashboard_mode = "suspects"
+                            self._dashboard_profile_locked = False
                         self.current_window_index = win_num
                         win = self.windows[win_num]
                         self.current_channel = win.name if win.name.startswith("#") else None
@@ -11995,7 +12038,7 @@ class TUI:
                 self._input_dirty = True
                 self.dirty = True
 
-        elif ch == 27:   # Escape — clear input or close window
+        elif ch == 27:   # Escape — clear input, reset dashboard, or close window
             if self.input_buffer:
                 self.input_buffer = ""
                 self.input_cursor = 0
@@ -12003,7 +12046,13 @@ class TUI:
                 self.dirty = True
             else:
                 win = self.get_current_window()
-                if win.name not in ("*status*", "*dashboard*"):
+                if win.name == "*dashboard*":
+                    # Reset dashboard to suspects mode
+                    self._dashboard_mode = "suspects"
+                    self._dashboard_profile_locked = False
+                    self._chat_dirty = True
+                    self.dirty = True
+                elif win.name not in ("*status*", "*dashboard*"):
                     self._slash_close("", "", "")
 
         return False
@@ -12146,8 +12195,8 @@ class TUI:
                     self._dashboard_profile_locked = False  # consume lock; hold the profile
                 else:
                     self._dashboard_mode = "suspects"       # genuine navigate-back — reset
-            # Profile views (/summarize, /ai, /topai) hold for 120 s then expire.
-            if self._dashboard_mode == "profile" and now - self._dashboard_last_update >= 120.0:
+            # Profile views (/summarize, /ai, /topai) hold for 30 s then expire.
+            if self._dashboard_mode == "profile" and now - self._dashboard_last_update >= 30.0:
                 self._dashboard_mode = "suspects"
             self._prev_on_dashboard = on_dashboard
             # Auto-refresh is suppressed while showing a profile (/ai output) so
