@@ -17848,10 +17848,72 @@ def main():
         sys.exit(subprocess.call([sys.executable] + sys.argv))
 
     # ── Startup prompts (plain terminal, before curses takes over) ──────────────
-    print("╔══════════════════════════════════════╗")
-    print("║       eyearesee  —  IRC client       ║")
-    print("╚══════════════════════════════════════╝")
-    print("  Press Enter to accept the [default].\n")
+
+    # ANSI helpers — gracefully degrade on terminals without colour support
+    _TTY = sys.stdin.isatty()
+    if sys.platform == "win32":
+        try:
+            import ctypes as _ctypes
+            _k32 = _ctypes.windll.kernel32
+            _k32.SetConsoleMode(_k32.GetStdHandle(-11), 7)
+        except Exception:
+            pass
+    _HAS_COLOR = _TTY and hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+    def _c(code: str, text: str = "") -> str:
+        if not _HAS_COLOR:
+            return text
+        return f"\033[{code}m{text}"
+
+    _RST   = _c("0")
+    _B     = _c("1")
+    _DIM   = _c("2")
+    _UL    = _c("4")
+    _BLK   = _c("30")
+    _RD    = _c("31")
+    _GN    = _c("32")
+    _YL    = _c("33")
+    _BL    = _c("34")
+    _MG    = _c("35")
+    _CY    = _c("36")
+    _GR    = _c("37")
+    _B_GN  = _c("1;32")
+    _B_CY  = _c("1;36")
+    _B_MG  = _c("1;35")
+    _B_YL  = _c("1;33")
+    _B_GR  = _c("1;37")
+    _B_BL  = _c("1;34")
+    _BG_BL = _c("44")
+    _BG_MG = _c("45")
+    _BG_CN = _c("46;30")
+
+    def _status(on: bool) -> str:
+        return f"{_B_GN}\u2713{_RST}" if on else f"{_DIM}\u2022{_RST}"
+
+    def _mask(val: str, visible: int = 4) -> str:
+        if not val:
+            return ""
+        if len(val) <= visible:
+            return "*" * len(val)
+        return val[:visible] + "\u2022" * min(len(val) - visible, 12)
+
+    _W = 54
+    _VL = "\u2502"
+    _HL = "\u2500"
+    _TL = "\u250c"
+    _TR = "\u2510"
+    _BL = "\u2514"
+    _BR = "\u2518"
+    _DASH = "\u2500"
+
+    def _section(title: str) -> None:
+        if not _TTY:
+            print(f"\n  {title}")
+            return
+        print()
+        half = (_W - len(title) - 4) // 2
+        line = _HL * half
+        print(f"  {_DIM}{line}{_RST} {_B_YL}{title}{_RST} {_DIM}{line}{_RST}")
 
     # Load all settings from irc_config.json; env vars are the fallback already
     # applied at module level.  Config file takes precedence over env vars.
@@ -17876,8 +17938,7 @@ def main():
         _AUTOJOIN_CHANNELS.update(_saved["autojoin"])
 
     # ── Safe input helper (returns "" on EOF / non-TTY so defaults are used) ──
-    if not sys.stdin.isatty():
-        # Double-clicked on Windows — no interactive console; use all defaults.
+    if not _TTY:
         _input = lambda _: ""
     else:
         def _input(prompt: str) -> str:
@@ -17886,72 +17947,161 @@ def main():
             except EOFError:
                 return ""
 
-    # ── IRC connection ───────────────────────────────────────────────────────────
+    # ── Draw the startup interface ──────────────────────────────────────────────
 
-    # Server — accepts host  or  host:port
-    raw = _input(f"  Server   [{DEFAULT_SERVER}] : ").strip()
+    if _TTY:
+        _logo = [
+            f"{_B_CY}  ___  ___  ___  ___  {_RST}",
+            f"{_B_CY} / _ \\/ __|/ _ \\/ __| {_RST}",
+            f"{_B_CY}| (_) \\__ \\ (_) \\__ \\ {_RST}",
+            f"{_B_CY} \\___/|___/\\___/|___/ {_RST}",
+        ]
+        print()
+        for _ln in _logo:
+            print(f"  {_ln}")
+        print()
+        for _ln in [
+            f"  {_B_MG}eyearesee{_RST}{_DIM} \u2014 IRC client with AI detection{_RST}",
+            f"  {_DIM}Press Enter to accept defaults  \u2502  Ctrl-C to cancel{_RST}",
+        ]:
+            print(_ln)
+        print()
+    else:
+        print(f"  eyearesee \u2014 IRC client\n")
+
+    # ── IRC Connection ─────────────────────────────────────────────────────────
+
+    _section("CONNECTION")
+
+    # Server
+    _srv_hint = f"{_DIM}{DEFAULT_SERVER}:{DEFAULT_PORT}{_RST}" if _TTY else f"{DEFAULT_SERVER}:{DEFAULT_PORT}"
+    raw = _input(f"  {_B_GR}Server{_RST}  {_srv_hint} : ").strip()
     if raw:
         if ":" in raw:
             host, _, port_str = raw.rpartition(":")
             if port_str.isdigit():
                 DEFAULT_SERVER, DEFAULT_PORT = host, int(port_str)
             else:
-                DEFAULT_SERVER = raw          # treat whole thing as hostname
+                DEFAULT_SERVER = raw
         else:
             DEFAULT_SERVER = raw
 
     # Nick
-    raw = _input(f"  Nick     [{DEFAULT_NICK}] : ").strip()
+    _nk_hint = f"{_DIM}{DEFAULT_NICK}{_RST}" if _TTY else DEFAULT_NICK
+    raw = _input(f"  {_B_GR}Nick{_RST}    {_nk_hint} : ").strip()
     if raw:
-        # IRC nicks: letters/digits/[-\[\]\\`_^{|}], max 30 chars (RFC 1459 §2.3.1)
         raw = re.sub(r'[^a-zA-Z0-9\[\]\\`_\-^{|}]', '', raw)[:30]
         if raw:
             DEFAULT_NICK = raw
 
-    # Channel — prepend # if omitted
-    raw = _input(f"  Channel  [{DEFAULT_CHANNEL}] : ").strip()
+    # Channel
+    _ch_hint = f"{_DIM}{DEFAULT_CHANNEL}{_RST}" if _TTY else DEFAULT_CHANNEL
+    raw = _input(f"  {_B_GR}Channel{_RST} {_ch_hint} : ").strip()
     if raw:
         DEFAULT_CHANNEL = raw if raw.startswith("#") else "#" + raw
-        # Strip characters illegal in channel names: NUL, BEL, space, comma, CR/LF
         DEFAULT_CHANNEL = re.sub(r'[\x00-\x07\x09-\x1f\x7f ,]', '', DEFAULT_CHANNEL)[:50] \
                           or DEFAULT_CHANNEL
 
+    # ── Auto-join channels ──────────────────────────────────────────────────────
+
+    _section("AUTO-JOIN CHANNELS")
+
+    if _TTY:
+        _aj_list = sorted(_AUTOJOIN_CHANNELS)
+        _aj_toggled = True
+        while _aj_toggled:
+            _aj_list = sorted(_AUTOJOIN_CHANNELS)
+            if _aj_list:
+                for _i, _ch in enumerate(_aj_list, 1):
+                    _mark = _B_GN + "\u2713" + _RST
+                    print("  " + _mark + " " + _DIM + str(_i).rjust(2) + _RST + " " + _ch)
+            else:
+                print("  " + _DIM + "  No channels configured" + _RST)
+            print("  " + _DIM + "Toggle: number  \u2022  Add: #channel  \u2022  Remove: -#  \u2022  Done: Enter" + _RST)
+            raw = _input("  " + _B_GR + "Auto-join" + _RST + " : ").strip()
+            if not raw:
+                _aj_toggled = False
+            elif raw.isdigit():
+                _idx = int(raw) - 1
+                if 0 <= _idx < len(_aj_list):
+                    _removed = _aj_list[_idx]
+                    _AUTOJOIN_CHANNELS.discard(_removed)
+                    print("  " + _RD + "\u2717 Removed " + _removed + _RST)
+                    _save_autojoin_config()
+            elif raw.startswith("-") and len(raw) > 1:
+                _rm_ch = raw[1:]
+                if not _rm_ch.startswith("#"):
+                    _rm_ch = "#" + _rm_ch
+                _AUTOJOIN_CHANNELS.discard(_rm_ch)
+                print("  " + _RD + "\u2717 Removed " + _rm_ch + _RST)
+                _save_autojoin_config()
+            else:
+                _add_ch = raw if raw.startswith("#") else "#" + raw
+                _add_ch = re.sub(r'[\x00-\x07\x09-\x1f\x7f ,]', '', _add_ch)[:50]
+                if _add_ch and len(_add_ch) > 1:
+                    _AUTOJOIN_CHANNELS.add(_add_ch)
+                    print("  " + _B_GN + "\u2713 Added " + _add_ch + _RST)
+                    _save_autojoin_config()
+    else:
+        if _AUTOJOIN_CHANNELS:
+            raw = _input("  Auto-join channels (space-separated, Enter to keep) : ").strip()
+            if raw:
+                _AUTOJOIN_CHANNELS.clear()
+                for _ch in raw.split():
+                    _ch = _ch if _ch.startswith("#") else "#" + _ch
+                    _ch = re.sub(r'[\x00-\x07\x09-\x1f\x7f ,]', '', _ch)[:50]
+                    if _ch and len(_ch) > 1:
+                        _AUTOJOIN_CHANNELS.add(_ch)
+                _save_autojoin_config()
+        else:
+            raw = _input("  Auto-join channels (space-separated, Enter to skip) : ").strip()
+            if raw:
+                for _ch in raw.split():
+                    _ch = _ch if _ch.startswith("#") else "#" + _ch
+                    _ch = re.sub(r'[\x00-\x07\x09-\x1f\x7f ,]', '', _ch)[:50]
+                    if _ch and len(_ch) > 1:
+                        _AUTOJOIN_CHANNELS.add(_ch)
+                _save_autojoin_config()
+
     # ── SASL ────────────────────────────────────────────────────────────────────
 
-    _mech_hint = f"PLAIN/SCRAM-SHA-256/EXTERNAL/ECDSA-NIST256P-CHALLENGE"
-    raw = _input(f"  SASL     [{SASL_MECHANISM}] ({_mech_hint}) : ").strip().upper()
+    _section("AUTHENTICATION")
+
+    _mech_hint = f"{_DIM}PLAIN | SCRAM-SHA-256 | EXTERNAL | ECDSA-NIST256P-CHALLENGE{_RST}" if _TTY else "PLAIN/SCRAM-SHA-256/EXTERNAL/ECDSA-NIST256P-CHALLENGE"
+    _mech_disp = f"{_B_CY}{SASL_MECHANISM}{_RST}" if _TTY else SASL_MECHANISM
+    raw = _input(f"  {_B_GR}SASL{_RST}     {_mech_disp} {_mech_hint} : ").strip().upper()
     if raw:
         SASL_MECHANISM = raw
 
-    # NickServ / SASL password (PLAIN and SCRAM-SHA-256)
-    _pw_hint = "[configured]" if NICKSERV_PASSWORD else "blank to skip"
+    _pw_hint = f"{_B_GN}[configured]{_RST}" if NICKSERV_PASSWORD else f"{_DIM}blank to skip{_RST}"
     try:
-        raw = getpass.getpass(f"  Password ({_pw_hint}) : ")
+        raw = getpass.getpass(f"  {_B_GR}Password{_RST} {_pw_hint} : ")
         if raw:
             NICKSERV_PASSWORD = raw
     except EOFError:
         pass
 
-    # Cert/key paths — only relevant for EXTERNAL and ECDSA
     if SASL_MECHANISM in ("EXTERNAL", "ECDSA-NIST256P-CHALLENGE"):
         if SASL_MECHANISM == "EXTERNAL":
-            _cert_hint = SASL_CERT or "path to PEM cert"
-            raw = _input(f"  SASL cert [{_cert_hint}] : ").strip()
+            _cert_hint = f"{_DIM}{SASL_CERT or 'path to PEM cert'}{_RST}" if _TTY else (SASL_CERT or "path to PEM cert")
+            raw = _input(f"  {_B_GR}Cert{_RST}    {_cert_hint} : ").strip()
             if raw:
                 SASL_CERT = raw
-        _key_hint = SASL_KEY or "path to PEM key"
-        raw = _input(f"  SASL key  [{_key_hint}] : ").strip()
+        _key_hint = f"{_DIM}{SASL_KEY or 'path to PEM key'}{_RST}" if _TTY else (SASL_KEY or "path to PEM key")
+        raw = _input(f"  {_B_GR}Key{_RST}     {_key_hint} : ").strip()
         if raw:
             SASL_KEY = raw
 
     # ── AI API keys ──────────────────────────────────────────────────────────────
 
-    print()
-    print("  AI API keys — press Enter to keep existing value, '-' to clear.")
+    _section("AI PROVIDERS")
+    if _TTY:
+        print(f"  {_DIM}Enter to keep  \u2022  '-' to clear  \u2022  values masked on summary{_RST}")
 
     def _prompt_key(label: str, current: str) -> str:
-        hint = "[configured]" if current else "blank to skip"
-        val = _input(f"  {label:<22} ({hint}) : ").strip()
+        _icon = _status(bool(current)) if _TTY else ""
+        hint = f"{_B_GN}[configured]{_RST}" if current else f"{_DIM}blank to skip{_RST}"
+        val = _input(f"  {_icon} {_B_GR}{label:<18}{_RST} {hint} : ").strip()
         if val == "-":
             return ""
         return val if val else current
@@ -17962,12 +18112,16 @@ def main():
     GITHUB_TOKEN      = _prompt_key("GitHub token",      GITHUB_TOKEN)
     GEMINI_API_KEY    = _prompt_key("Gemini API key",    GEMINI_API_KEY)
 
-    print()
-    print("  Local inference servers (press Enter to keep).")
-    raw = _input(f"  Ollama URL    [{OLLAMA_URL}] : ").strip()
+    # ── Local inference ─────────────────────────────────────────────────────────
+
+    _section("LOCAL INFERENCE")
+    if _TTY:
+        print(f"  {_DIM}Press Enter to keep current URLs{_RST}")
+
+    raw = _input(f"  {_B_GR}Ollama{_RST}     {_DIM}{OLLAMA_URL}{_RST} : ").strip()
     if raw:
         OLLAMA_URL = raw
-    raw = _input(f"  llama.cpp URL [{LLAMACPP_URL}] : ").strip()
+    raw = _input(f"  {_B_GR}llama.cpp{_RST}  {_DIM}{LLAMACPP_URL}{_RST} : ").strip()
     if raw:
         LLAMACPP_URL = raw
 
@@ -17981,9 +18135,8 @@ def main():
         "nickserv_password": NICKSERV_PASSWORD,
         "ollama_url":        OLLAMA_URL,
         "llamacpp_url":      LLAMACPP_URL,
+        "autojoin":          sorted(_AUTOJOIN_CHANNELS),
     }
-    # Cert/key only written when non-empty (paths are sensitive enough to omit
-    # if unused, and writing empty strings would clutter the file).
     if SASL_CERT:     _cfg["sasl_cert"]          = SASL_CERT
     if SASL_KEY:      _cfg["sasl_key"]            = SASL_KEY
     if ANTHROPIC_API_KEY: _cfg["anthropic_api_key"] = ANTHROPIC_API_KEY
@@ -17993,9 +18146,71 @@ def main():
     if GEMINI_API_KEY:    _cfg["gemini_api_key"]     = GEMINI_API_KEY
     save_irc_config(_cfg)
 
-    print(f"\n  → {DEFAULT_SERVER}:{DEFAULT_PORT} (SSL)  nick={DEFAULT_NICK}"
-          + (f"  channel={DEFAULT_CHANNEL}" if DEFAULT_CHANNEL else ""))
-    print()
+    # ── Connection summary ──────────────────────────────────────────────────────
+
+    if _TTY:
+        print()
+        _sw = _W
+        _summary_top = _TL + _HL * _sw + _TR
+        _summary_bot = _BL + _HL * _sw + _BR
+
+        def _sec(t):
+            _inner = " " + t
+            return _VL + _B_CY + _inner.ljust(_sw - 1) + _RST + _VL
+
+        def _row(k, v):
+            return _VL + " " + _B_GR + k.ljust(16) + _RST + " " + v + _RST
+
+        def _pw_row(k, v):
+            if v:
+                return _VL + " " + _B_GR + k.ljust(16) + _RST + " " + _DIM + v + _RST
+            return _VL + " " + _B_GR + k.ljust(16) + _RST + " " + _DIM + "\u2014" + _RST
+
+        _pw_show = _mask(NICKSERV_PASSWORD) if NICKSERV_PASSWORD else "\u2014"
+
+        _rows = [
+            _summary_top,
+            _sec("CONNECTION"),
+            _row("Server",  DEFAULT_SERVER + ":" + str(DEFAULT_PORT) + " (TLS)"),
+            _row("Nick",    DEFAULT_NICK),
+            _row("Channel", DEFAULT_CHANNEL or "\u2014"),
+        ]
+        if _AUTOJOIN_CHANNELS:
+            _aj_sorted = sorted(_AUTOJOIN_CHANNELS)
+            _rows.append(_row("Auto-join", ", ".join(_aj_sorted[:5]) + ("..." if len(_aj_sorted) > 5 else "")))
+        _rows += [
+            _sec("AUTH"),
+            _row("SASL",    SASL_MECHANISM),
+            _pw_row("Password", _pw_show),
+        ]
+        if SASL_MECHANISM in ("EXTERNAL", "ECDSA-NIST256P-CHALLENGE"):
+            if SASL_CERT:
+                _rows.append(_pw_row("Cert", _mask(SASL_CERT, 8)))
+            if SASL_KEY:
+                _rows.append(_pw_row("Key", _mask(SASL_KEY, 8)))
+        _rows.append(_sec("AI PROVIDERS"))
+
+        _ai_providers = []
+        if ANTHROPIC_API_KEY: _ai_providers.append("Anthropic " + _status(True))
+        if OPENAI_API_KEY:    _ai_providers.append("OpenAI " + _status(True))
+        if DEEPSEEK_API_KEY:  _ai_providers.append("DeepSeek " + _status(True))
+        if GITHUB_TOKEN:      _ai_providers.append("GitHub " + _status(True))
+        if GEMINI_API_KEY:    _ai_providers.append("Gemini " + _status(True))
+        if not _ai_providers:
+            _ai_providers.append(_DIM + "none configured" + _RST)
+        _provs = "  ".join(_ai_providers)
+        _rows.append(_VL + " " + _provs)
+        _rows.append(_sec("LOCAL INFERENCE"))
+        _rows.append(_row("Ollama",    OLLAMA_URL))
+        _rows.append(_row("llama.cpp", LLAMACPP_URL))
+        _rows.append(_summary_bot)
+        for _ln in _rows:
+            print("  " + _ln)
+        print()
+    else:
+        print("\n  -> " + str(DEFAULT_SERVER) + ":" + str(DEFAULT_PORT) + " (TLS)  nick=" + DEFAULT_NICK
+              + (("  channel=" + DEFAULT_CHANNEL) if DEFAULT_CHANNEL else ""))
+        print()
 
     # Load AI models before curses starts so progress prints go to the normal
     # terminal and don't corrupt the TUI display.
