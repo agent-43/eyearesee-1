@@ -5750,6 +5750,12 @@ class PluginAPI:
                 self._tui._dashboard_mode = "suspects"
                 self._tui._dashboard_profile_locked = False
             self._tui.current_window_index = self._tui.windows.index(win)
+            # Reset dashboard state when navigating TO it
+            if win.name == "*dashboard*":
+                self._tui._dashboard_mode = "suspects"
+                self._tui._dashboard_profile_locked = False
+                self._tui._dashboard_dirty = True
+                self._tui._dashboard_last_update = 0.0
             self._tui.current_channel = name if name.startswith("#") else None
             self._tui._unread_windows.discard(name)
             self._tui._chat_dirty = self._tui._userlist_dirty = self._tui._input_dirty = True
@@ -6615,7 +6621,7 @@ class TUI:
                 bars = "▁▂▃▄▅▆▇█"
                 spark = "".join(bars[min(7, s * 8 // 101)]
                                 for s in list(state.ai_scores)[-16:])
-                is_bot = state.is_confirmed_bot or nick in client.scoring.confirmed_bot_nicks
+                is_bot = state.is_confirmed_bot or nick in (client.scoring.confirmed_bot_nicks if hasattr(client, 'scoring') else set())
                 badge = " [BOT]" if is_bot else ""
                 A(f"  {nick:<14} [{ai_pct:2d}%]{badge}  msgs:{state.total_msgs:3d}  "
                   f"avg:{avg_len:4.0f}  mpm:{mpm:4.1f}  "
@@ -6628,8 +6634,8 @@ class TUI:
         A("── Channel Activity ──")
         A("")
         channels_with_msgs = {}
-        for nick, state in self.client.users.items():
-            for ch, count in state._ch_activity.items():
+        for nick, ch_counts in self._ch_activity.items():
+            for ch, count in ch_counts.items():
                 channels_with_msgs[ch] = channels_with_msgs.get(ch, 0) + count
         if not channels_with_msgs:
             A("  No channel activity yet.")
@@ -7470,6 +7476,13 @@ class TUI:
                     self._dashboard_mode = "suspects"
                     self._dashboard_profile_locked = False
                 self.current_window_index = i
+                win = self.windows[i]
+                # Reset dashboard state when navigating TO it
+                if win.name == "*dashboard*":
+                    self._dashboard_mode = "suspects"
+                    self._dashboard_profile_locked = False
+                    self._dashboard_dirty = True
+                    self._dashboard_last_update = 0.0
                 self.current_channel = None
                 self._chat_dirty = self._userlist_dirty = self._input_dirty = True
                 self.dirty = True
@@ -7694,6 +7707,12 @@ class TUI:
             self._dashboard_profile_locked = False
         self.current_window_index = (self.current_window_index + 1) % len(self.windows)
         win = self.get_current_window()
+        # Reset dashboard state when navigating TO it
+        if win.name == "*dashboard*":
+            self._dashboard_mode = "suspects"
+            self._dashboard_profile_locked = False
+            self._dashboard_dirty = True
+            self._dashboard_last_update = 0.0
         if win.name not in ("*status*", "*dashboard*"):
             self.current_channel = win.name
         if win.name in self._unread_windows:
@@ -8992,6 +9011,7 @@ class TUI:
         L("  Score < 0.15  — natural/unwatermarked text")
 
         self._dashboard_mode = "profile"
+        self._dashboard_profile_locked = True
         self._dashboard_dirty = False
         self._dashboard_last_update = time.monotonic()
         self.current_window_index = 1
@@ -9012,7 +9032,7 @@ class TUI:
         bars      = "▁▂▃▄▅▆▇█"
         now       = time.monotonic()
 
-        confirmed = client.scoring.confirmed_bot_nicks
+        confirmed = client.scoring.confirmed_bot_nicks if hasattr(client, 'scoring') else set()
 
         rows = []
         for nick in chan_nicks:
@@ -9423,6 +9443,12 @@ class TUI:
                     self._dashboard_profile_locked = False
                 self.current_window_index = idx
                 win = self.windows[idx]
+                # Reset dashboard state when navigating TO it
+                if win.name == "*dashboard*":
+                    self._dashboard_mode = "suspects"
+                    self._dashboard_profile_locked = False
+                    self._dashboard_dirty = True
+                    self._dashboard_last_update = 0.0
                 if win.name not in ("*status*", "*dashboard*"):
                     self.current_channel = win.name
                 if win.name in self._unread_windows:
@@ -12014,6 +12040,12 @@ class TUI:
                             self._dashboard_profile_locked = False
                         self.current_window_index = win_num
                         win = self.windows[win_num]
+                        # Reset dashboard state when navigating TO it
+                        if win.name == "*dashboard*":
+                            self._dashboard_mode = "suspects"
+                            self._dashboard_profile_locked = False
+                            self._dashboard_dirty = True
+                            self._dashboard_last_update = 0.0
                         self.current_channel = win.name if win.name.startswith("#") else None
                         self._unread_windows.discard(win.name)
                         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
@@ -12050,6 +12082,8 @@ class TUI:
                     # Reset dashboard to suspects mode
                     self._dashboard_mode = "suspects"
                     self._dashboard_profile_locked = False
+                    self._dashboard_dirty = True
+                    self._dashboard_last_update = 0.0
                     self._chat_dirty = True
                     self.dirty = True
                 elif win.name not in ("*status*", "*dashboard*"):
@@ -12195,25 +12229,30 @@ class TUI:
                     self._dashboard_profile_locked = False  # consume lock; hold the profile
                 else:
                     self._dashboard_mode = "suspects"       # genuine navigate-back — reset
+                    self._dashboard_dirty = True
             # Profile views (/summarize, /ai, /topai) hold for 30 s then expire.
             if self._dashboard_mode == "profile" and now - self._dashboard_last_update >= 30.0:
                 self._dashboard_mode = "suspects"
+                self._dashboard_dirty = True
             self._prev_on_dashboard = on_dashboard
             # Auto-refresh is suppressed while showing a profile (/ai output) so
             # the suspects rebuild doesn't overwrite it mid-read.
             if self._dashboard_mode == "suspects":
-                if on_dashboard and now - self._dashboard_last_update >= self._dashboard_ota_interval:
-                    await self.update_dashboard()
-                    self._dashboard_dirty = False
-                    self._dashboard_last_update = now
-                    self._chat_dirty = True
-                    self.dirty = True
-                elif self._dashboard_dirty and now - self._dashboard_last_update >= 1.0:
+                if self._dashboard_dirty:
+                    # Always refresh immediately when dirty
                     await self.update_dashboard()
                     self._dashboard_dirty = False
                     self._dashboard_last_update = now
                     if on_dashboard:
                         self._chat_dirty = True
+                        self.dirty = True
+                elif on_dashboard and now - self._dashboard_last_update >= self._dashboard_ota_interval:
+                    # Periodic auto-refresh while viewing dashboard
+                    await self.update_dashboard()
+                    self._dashboard_dirty = False
+                    self._dashboard_last_update = now
+                    self._chat_dirty = True
+                    self.dirty = True
 
             # ── 5. Full redraw (chat + userlist; throttled to ~30fps) ─────────────
             if self.dirty and self.redraw():
