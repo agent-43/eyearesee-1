@@ -646,6 +646,236 @@ class SentimentAICorrelator:
             pass
 
 
+# =========================
+# BehavioralBiometrics
+# =========================
+
+class BehavioralBiometrics:
+    """Tracks user typing cadence, response latency, and keystroke dynamics.
+
+    Monitors:
+      • Key-to-key dwell times (typing rhythm)
+      • Flight times (gap between key releases/presses)
+      • Inter-message latency (time between receiving a message and replying)
+      • Typing burst patterns (continuous typing vs pause-heavy)
+      • Backspace/edit rate (self-correction frequency)
+      • Message composition time (from first keystroke to Enter)
+
+    Provides a per-session biometric profile that can be correlated with
+    AI detection scores — humans exhibit variable, idiosyncratic typing
+    patterns while bots/AI tend to have uniform timing or instant responses.
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "biometrics.json")
+
+    def __init__(self):
+        self._key_dwell_times: deque = deque(maxlen=500)
+        self._flight_times: deque = deque(maxlen=500)
+        self._composition_times: deque = deque(maxlen=200)
+        self._response_latencies: deque = deque(maxlen=200)
+        self._backspace_count: int = 0
+        self._total_keystrokes: int = 0
+        self._current_composition_start: float = 0.0
+        self._last_key_time: float = 0.0
+        self._last_incoming_msg_time: float = 0.0
+        self._typing_bursts: deque = deque(maxlen=100)
+        self._current_burst_start: float = 0.0
+        self._current_burst_keys: int = 0
+        self._burst_threshold: float = 0.5
+        self._session_start: float = time.time()
+        self._messages_sent: int = 0
+        self._messages_edited: int = 0
+        self.load()
+
+    def record_keypress(self, is_backspace: bool = False) -> None:
+        now = time.monotonic()
+        self._total_keystrokes += 1
+        if is_backspace:
+            self._backspace_count += 1
+            self._messages_edited += 1
+        if self._last_key_time > 0:
+            flight = now - self._last_key_time
+            if flight < 2.0:
+                self._flight_times.append(flight)
+                if flight < self._burst_threshold:
+                    if self._current_burst_start == 0:
+                        self._current_burst_start = now
+                        self._current_burst_keys = 0
+                    self._current_burst_keys += 1
+                else:
+                    if self._current_burst_start > 0:
+                        duration = now - self._current_burst_start
+                        self._typing_bursts.append({
+                            "duration": duration,
+                            "keys": self._current_burst_keys,
+                            "rate": self._current_burst_keys / duration if duration > 0 else 0,
+                        })
+                        self._current_burst_start = 0
+                        self._current_burst_keys = 0
+        self._last_key_time = now
+        if self._current_composition_start == 0:
+            self._current_composition_start = now
+
+    def record_composition_complete(self) -> float:
+        if self._current_composition_start > 0:
+            comp_time = time.monotonic() - self._current_composition_start
+            self._composition_times.append(comp_time)
+            self._current_composition_start = 0
+            self._messages_sent += 1
+            if self._current_burst_start > 0:
+                now = time.monotonic()
+                duration = now - self._current_burst_start
+                self._typing_bursts.append({
+                    "duration": duration,
+                    "keys": self._current_burst_keys,
+                    "rate": self._current_burst_keys / duration if duration > 0 else 0,
+                })
+                self._current_burst_start = 0
+                self._current_burst_keys = 0
+            return comp_time
+        return 0.0
+
+    def record_incoming_message(self) -> None:
+        self._last_incoming_msg_time = time.monotonic()
+
+    def record_response(self) -> None:
+        if self._last_incoming_msg_time > 0:
+            latency = time.monotonic() - self._last_incoming_msg_time
+            if latency < 300:
+                self._response_latencies.append(latency)
+
+    def get_typing_cadence_stats(self) -> Dict[str, float]:
+        if len(self._flight_times) < 5:
+            return {"mean": 0, "std": 0, "median": 0, "p10": 0, "p90": 0, "samples": 0}
+        sorted_ft = sorted(self._flight_times)
+        mean = sum(sorted_ft) / len(sorted_ft)
+        std = (sum((x - mean) ** 2 for x in sorted_ft) / len(sorted_ft)) ** 0.5
+        median = sorted_ft[len(sorted_ft) // 2]
+        p10 = sorted_ft[max(0, int(len(sorted_ft) * 0.1))]
+        p90 = sorted_ft[min(len(sorted_ft) - 1, int(len(sorted_ft) * 0.9))]
+        return {
+            "mean": round(mean * 1000, 1),
+            "std": round(std * 1000, 1),
+            "median": round(median * 1000, 1),
+            "p10": round(p10 * 1000, 1),
+            "p90": round(p90 * 1000, 1),
+            "samples": len(sorted_ft),
+        }
+
+    def get_composition_stats(self) -> Dict[str, float]:
+        if not self._composition_times:
+            return {"mean": 0, "std": 0, "median": 0, "min": 0, "max": 0, "samples": 0}
+        sorted_ct = sorted(self._composition_times)
+        mean = sum(sorted_ct) / len(sorted_ct)
+        std = (sum((x - mean) ** 2 for x in sorted_ct) / len(sorted_ct)) ** 0.5
+        return {
+            "mean": round(mean, 2),
+            "std": round(std, 2),
+            "median": round(sorted_ct[len(sorted_ct) // 2], 2),
+            "min": round(sorted_ct[0], 2),
+            "max": round(sorted_ct[-1], 2),
+            "samples": len(sorted_ct),
+        }
+
+    def get_response_latency_stats(self) -> Dict[str, float]:
+        if not self._response_latencies:
+            return {"mean": 0, "std": 0, "median": 0, "min": 0, "max": 0, "samples": 0}
+        sorted_rl = sorted(self._response_latencies)
+        mean = sum(sorted_rl) / len(sorted_rl)
+        std = (sum((x - mean) ** 2 for x in sorted_rl) / len(sorted_rl)) ** 0.5
+        return {
+            "mean": round(mean, 2),
+            "std": round(std, 2),
+            "median": round(sorted_rl[len(sorted_rl) // 2], 2),
+            "min": round(sorted_rl[0], 2),
+            "max": round(sorted_rl[-1], 2),
+            "samples": len(sorted_rl),
+        }
+
+    def get_backspace_ratio(self) -> float:
+        if self._total_keystrokes == 0:
+            return 0.0
+        return round(self._backspace_count / self._total_keystrokes, 4)
+
+    def get_burst_stats(self) -> Dict[str, float]:
+        if not self._typing_bursts:
+            return {"avg_duration": 0, "avg_rate": 0, "avg_keys": 0, "count": 0}
+        durations = [b["duration"] for b in self._typing_bursts]
+        rates = [b["rate"] for b in self._typing_bursts]
+        keys = [b["keys"] for b in self._typing_bursts]
+        return {
+            "avg_duration": round(sum(durations) / len(durations), 2),
+            "avg_rate": round(sum(rates) / len(rates), 1),
+            "avg_keys": round(sum(keys) / len(keys), 1),
+            "count": len(self._typing_bursts),
+        }
+
+    def get_human_likelihood(self) -> float:
+        score = 50.0
+        comp = self.get_composition_stats()
+        if comp["samples"] > 0:
+            if comp["std"] > 0.5:
+                score += 10
+            if comp["mean"] > 1.0:
+                score += 5
+        resp = self.get_response_latency_stats()
+        if resp["samples"] > 0:
+            if resp["std"] > 1.0:
+                score += 10
+            if resp["mean"] > 2.0:
+                score += 5
+        bs_ratio = self.get_backspace_ratio()
+        if bs_ratio > 0.02:
+            score += 10
+        elif bs_ratio > 0.005:
+            score += 5
+        cadence = self.get_typing_cadence_stats()
+        if cadence["std"] > 20:
+            score += 10
+        bursts = self.get_burst_stats()
+        if bursts["count"] > 5:
+            rate_var = bursts["avg_rate"]
+            if 2 < rate_var < 15:
+                score += 5
+        return min(100.0, max(0.0, score))
+
+    def _save(self) -> None:
+        try:
+            data = {
+                "session_start": self._session_start,
+                "messages_sent": self._messages_sent,
+                "backspace_count": self._backspace_count,
+                "total_keystrokes": self._total_keystrokes,
+                "flight_times": list(self._flight_times)[-100:],
+                "composition_times": list(self._composition_times)[-50:],
+                "response_latencies": list(self._response_latencies)[-50:],
+                "typing_bursts": list(self._typing_bursts)[-30:],
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._session_start = data.get("session_start", time.time())
+            self._messages_sent = data.get("messages_sent", 0)
+            self._backspace_count = data.get("backspace_count", 0)
+            self._total_keystrokes = data.get("total_keystrokes", 0)
+            for ft in data.get("flight_times", [])[-100:]:
+                self._flight_times.append(ft)
+            for ct in data.get("composition_times", [])[-50:]:
+                self._composition_times.append(ct)
+            for rl in data.get("response_latencies", [])[-50:]:
+                self._response_latencies.append(rl)
+            for tb in data.get("typing_bursts", [])[-30:]:
+                self._typing_bursts.append(tb)
+        except Exception:
+            pass
+
+
 
 # IRC Formatting
 # =========================
@@ -6046,6 +6276,12 @@ class IRCClient:
         # Strong references to fire-and-forget scoring tasks so they are not
         # garbage-collected before they finish (asyncio only holds weak refs).
         self._bg_tasks: set = set()
+        # Behavioral biometrics tracker for user typing patterns
+        self.biometrics: BehavioralBiometrics = BehavioralBiometrics()
+        # IRCv3 draft/thread: track last thread parent per channel
+        self._thread_parents: Dict[str, str] = {}
+        # IRCv3 read-marker: last known read marker per channel
+        self._read_markers: Dict[str, str] = {}
 
     @property
     def server_id(self) -> str:
@@ -6579,7 +6815,7 @@ class IRCClient:
         "chathistory", "draft/chathistory",
         "draft/multiline", "draft/format", "draft/ping",
         "message-redaction", "read-marker", "message-intents",
-        "draft/account-registration",
+        "draft/thread", "draft/account-registration",
         "draft/reply", "draft/react", "draft/typing",
         "draft/mention", "draft/event-playback",
         "draft/channel-rename", "draft/persistent-channel",
@@ -7159,6 +7395,8 @@ class IRCClient:
         if (self._irc_lower(nick) == self._irc_lower(self.nick)
                 and not self._current_batch_is_replay):
             return
+        # Biometrics: record incoming message timestamp for response latency
+        self.biometrics.record_incoming_message()
         target = params[0]
         msg    = params[1]
         # server-time: prefer server-provided timestamp over local clock
@@ -7167,7 +7405,14 @@ class IRCClient:
         account  = tags.get("account", "")
         msgid    = tags.get("msgid", "")
         reply_to = tags.get("+reply", "")
+        thread_id = tags.get("draft/thread", "")
         is_replay = self._current_batch_is_replay
+        # read-marker: track last seen read marker per channel
+        read_marker = tags.get("read-marker", "")
+        if read_marker and target.startswith("#"):
+            self._read_markers[target.lower()] = read_marker
+        if thread_id and target.startswith("#"):
+            self._thread_parents[target.lower()] = thread_id
 
         # ACTION must be checked before the generic CTCP block — both use \x01
         # wrappers and falling into the CTCP branch silently drops /me lines.
@@ -9550,6 +9795,21 @@ class TUI:
         A(f"  Uptime       : {uptime_mins // 60}h {uptime_mins % 60}m")
         A(f"  Buffered     : {self._bouncer_buffer.count} msgs ({self._bouncer_buffer.highlight_count} highlights)")
 
+        # ── Your Biometrics ─────────────────────────────────────────────────
+        A("")
+        A("── Your Biometrics ──")
+        A("")
+        bio = client.biometrics
+        cadence = bio.get_typing_cadence_stats()
+        comp = bio.get_composition_stats()
+        resp = bio.get_response_latency_stats()
+        A(f"  Typing cadence   : {cadence['mean']:.0f} ms (σ {cadence['std']:.0f} ms)")
+        A(f"  Composition time : {comp['mean']:.1f} s (σ {comp['std']:.1f} s)")
+        A(f"  Response latency : {resp['mean']:.1f} s (σ {resp['std']:.1f} s)")
+        A(f"  Backspace ratio  : {bio.get_backspace_ratio():.1%}")
+        A(f"  Human likelihood : {bio.get_human_likelihood():.0f}%")
+        A(f"  Messages sent    : {bio._messages_sent}  |  Keystrokes: {bio._total_keystrokes}")
+
         # ── Historical suspects from log ─────────────────────────────────
         A("")
         A("── Historical suspects (all sessions, from log) ──")
@@ -11526,6 +11786,7 @@ class TUI:
         h["fp"]         = self._slash_fingerprint
         h["savefp"]     = self._slash_savefp
         h["behavior"]   = self._slash_behavior
+        h["biometrics"] = self._slash_biometrics
         h["aistatus"]   = self._slash_aistatus
         h["aipipeline"] = self._slash_aistatus
         h["join"]       = self._slash_join
@@ -11731,10 +11992,12 @@ class TUI:
 
     async def _send_plain_text(self, line: str) -> None:
         cur_win = self.get_current_window()
+        client = self._active_client()
+        client.biometrics.record_composition_complete()
+        client.biometrics.record_response()
         # DCC CHAT: route text over the direct TCP connection
         if cur_win.name.startswith("=DCC-chat-"):
             nick = cur_win.name[len("=DCC-chat-"):]
-            client = self._active_client()
             tid = self._dcc_chat_tid_for_window(cur_win.name)
             if tid:
                 client.dcc_chat_send(tid, line)
@@ -11753,7 +12016,7 @@ class TUI:
                 self.current_channel = target
                 self.current_window_index = self.windows.index(dest)
                 self._unread_windows.discard(target)
-        result = self._active_client().cmd_msg(target, line)
+        result = client.cmd_msg(target, line)
         if result:
             await self.ui_queue.put(result)
 
@@ -12708,6 +12971,64 @@ class TUI:
         sw.add_line(f"  Messages      : {u_state.total_msgs}")
         sw.add_line(f"  Avg length    : {u_state.avg_msg_length():.0f} chars")
         sw.add_line(f"  Messages/min  : {u_state.messages_per_minute():.1f}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_biometrics(self, args, extra, line):
+        """Show your own behavioral biometrics profile.
+
+        Usage: /biometrics
+        """
+        client = self._active_client()
+        bio = client.biometrics
+        sw = self._status_win()
+        sw.add_line("=== Your Behavioral Biometrics Profile ===")
+        sw.add_line("")
+        cadence = bio.get_typing_cadence_stats()
+        sw.add_line("  ── Typing Cadence (flight times) ────────")
+        sw.add_line(f"  Mean     : {cadence['mean']:.1f} ms")
+        sw.add_line(f"  Std dev  : {cadence['std']:.1f} ms")
+        sw.add_line(f"  Median   : {cadence['median']:.1f} ms")
+        sw.add_line(f"  P10/P90  : {cadence['p10']:.1f} / {cadence['p90']:.1f} ms")
+        sw.add_line(f"  Samples  : {cadence['samples']}")
+        sw.add_line("")
+        comp = bio.get_composition_stats()
+        sw.add_line("  ── Message Composition ──────────────────")
+        sw.add_line(f"  Mean     : {comp['mean']:.2f} s")
+        sw.add_line(f"  Std dev  : {comp['std']:.2f} s")
+        sw.add_line(f"  Median   : {comp['median']:.2f} s")
+        sw.add_line(f"  Min/Max  : {comp['min']:.2f} / {comp['max']:.2f} s")
+        sw.add_line(f"  Samples  : {comp['samples']}")
+        sw.add_line("")
+        resp = bio.get_response_latency_stats()
+        sw.add_line("  ── Response Latency ─────────────────────")
+        sw.add_line(f"  Mean     : {resp['mean']:.2f} s")
+        sw.add_line(f"  Std dev  : {resp['std']:.2f} s")
+        sw.add_line(f"  Median   : {resp['median']:.2f} s")
+        sw.add_line(f"  Min/Max  : {resp['min']:.2f} / {resp['max']:.2f} s")
+        sw.add_line(f"  Samples  : {resp['samples']}")
+        sw.add_line("")
+        bursts = bio.get_burst_stats()
+        sw.add_line("  ── Typing Bursts ────────────────────────")
+        sw.add_line(f"  Count        : {bursts['count']}")
+        sw.add_line(f"  Avg duration : {bursts['avg_duration']:.2f} s")
+        sw.add_line(f"  Avg rate     : {bursts['avg_rate']:.1f} keys/s")
+        sw.add_line(f"  Avg keys     : {bursts['avg_keys']:.1f}")
+        sw.add_line("")
+        sw.add_line("  ── Summary ──────────────────────────────")
+        sw.add_line(f"  Backspace ratio  : {bio.get_backspace_ratio():.2%}")
+        sw.add_line(f"  Messages sent    : {bio._messages_sent}")
+        sw.add_line(f"  Total keystrokes : {bio._total_keystrokes}")
+        sw.add_line(f"  Human likelihood : {bio.get_human_likelihood():.0f}%")
+        sw.add_line("")
+        if "message-tags" in client._active_caps:
+            sw.add_line("  IRCv3 message-tags: active")
+        if "draft/typing" in client._active_caps:
+            sw.add_line("  IRCv3 draft/typing: active")
+        if "draft/thread" in client._active_caps:
+            sw.add_line("  IRCv3 draft/thread: active")
+        if "read-marker" in client._active_caps:
+            sw.add_line("  IRCv3 read-marker: active")
         self._chat_dirty = True
         self.dirty = True
 
@@ -17042,6 +17363,7 @@ class TUI:
             return True   # caller handles asynchronously
 
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            self._active_client().biometrics.record_keypress(is_backspace=True)
             if self.input_cursor > 0:
                 self.input_buffer = (self.input_buffer[:self.input_cursor - 1]
                                      + self.input_buffer[self.input_cursor:])
@@ -17377,6 +17699,7 @@ class TUI:
                                 return True
 
         elif 32 <= ch <= 1114111:
+            self._active_client().biometrics.record_keypress(is_backspace=False)
             try:
                 ch_str = chr(ch)
             except (ValueError, OverflowError):
