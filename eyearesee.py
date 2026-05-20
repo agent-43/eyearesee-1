@@ -1339,6 +1339,1110 @@ class BotSwarmDetector:
 
 
 # =========================
+# Role Inference
+# =========================
+
+class RoleInference:
+    """Classifies users into social roles based on behavioral and linguistic patterns.
+
+    Roles:
+      • moderator     — enforces rules, uses authoritative language, high channel tenure
+      • helper        — answers questions, high reply-to-others ratio, positive sentiment
+      • expert        — deep technical vocabulary, long messages, cited by others
+      • regular       — consistent presence, balanced participation
+      • lurker        — low message count, long gaps, mostly observes
+      • troll         — negative sentiment, provocative language, high conflict rate
+      • newbie        — asks many questions, short messages, recent join date
+      • socializer    — high off-topic ratio, greeting/farewell frequency, emoji use
+      • debater       — high argument frequency, logical connectors, counter-statements
+      • broadcaster   — shares links/resources, high information density, one-to-many pattern
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "role_inference.json")
+
+    _ROLE_WEIGHTS = {
+        "moderator":    {"auth_words": 0.20, "tenure": 0.15, "cmd_usage": 0.15, "reply_ratio": 0.10, "msg_freq": 0.10, "sentiment": 0.05, "conflict": -0.15, "link_share": 0.05, "question_ratio": -0.10, "off_topic": -0.05},
+        "helper":       {"auth_words": 0.05, "tenure": 0.10, "cmd_usage": 0.05, "reply_ratio": 0.25, "msg_freq": 0.10, "sentiment": 0.20, "conflict": -0.10, "link_share": 0.05, "question_ratio": -0.10, "off_topic": 0.05},
+        "expert":       {"auth_words": 0.10, "tenure": 0.15, "cmd_usage": 0.05, "reply_ratio": 0.15, "msg_freq": 0.10, "sentiment": 0.05, "conflict": 0.00, "link_share": 0.15, "question_ratio": -0.15, "off_topic": -0.10},
+        "regular":      {"auth_words": 0.00, "tenure": 0.10, "cmd_usage": 0.00, "reply_ratio": 0.10, "msg_freq": 0.20, "sentiment": 0.05, "conflict": 0.00, "link_share": 0.05, "question_ratio": 0.00, "off_topic": 0.10},
+        "lurker":       {"auth_words": 0.00, "tenure": 0.05, "cmd_usage": 0.00, "reply_ratio": 0.05, "msg_freq": -0.20, "sentiment": 0.00, "conflict": 0.00, "link_share": 0.00, "question_ratio": 0.00, "off_topic": 0.00},
+        "troll":        {"auth_words": 0.00, "tenure": 0.00, "cmd_usage": 0.00, "reply_ratio": 0.10, "msg_freq": 0.10, "sentiment": -0.25, "conflict": 0.30, "link_share": 0.00, "question_ratio": 0.00, "off_topic": 0.15},
+        "newbie":       {"auth_words": 0.00, "tenure": -0.15, "cmd_usage": 0.00, "reply_ratio": 0.10, "msg_freq": 0.05, "sentiment": 0.05, "conflict": 0.00, "link_share": 0.00, "question_ratio": 0.25, "off_topic": 0.10},
+        "socializer":   {"auth_words": 0.00, "tenure": 0.05, "cmd_usage": 0.00, "reply_ratio": 0.15, "msg_freq": 0.15, "sentiment": 0.15, "conflict": -0.05, "link_share": 0.00, "question_ratio": 0.00, "off_topic": 0.25},
+        "debater":      {"auth_words": 0.05, "tenure": 0.05, "cmd_usage": 0.00, "reply_ratio": 0.20, "msg_freq": 0.15, "sentiment": -0.05, "conflict": 0.20, "link_share": 0.05, "question_ratio": 0.10, "off_topic": -0.05},
+        "broadcaster":  {"auth_words": 0.05, "tenure": 0.10, "cmd_usage": 0.05, "reply_ratio": 0.05, "msg_freq": 0.15, "sentiment": 0.05, "conflict": 0.00, "link_share": 0.30, "question_ratio": -0.10, "off_topic": 0.00},
+    }
+
+    _AUTH_WORDS = {"should", "must", "rule", "policy", "ban", "kick", "warning", "enforce", "moderator", "admin", "please stop", "read the", "topic is", "stay on", "keep it", "respect", "follow the"}
+    _LOGICAL_CONNECTORS = {"however", "therefore", "because", "although", "but", "thus", "hence", "consequently", "nevertheless", "moreover", "furthermore", "whereas", "conversely", "arguably", "counterpoint"}
+    _QUESTION_MARKERS = {"what", "how", "why", "when", "where", "who", "which", "can you", "could you", "does anyone", "is there", "anyone know", "help with", "how do i", "what is"}
+    _GREETINGS = {"hi", "hello", "hey", "good morning", "good evening", "good night", "welcome", "wb", "welcome back", "greetings", "o/", "sup", "yo"}
+    _FAREWELLS = {"bye", "goodbye", "see you", "later", "gtg", "brb", "afk", "goodnight", "cya", "farewell", "o7"}
+
+    def __init__(self):
+        self._user_data: Dict[str, Dict] = {}
+        self._roles: Dict[str, Dict] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def observe(self, nick: str, channel: str, text: str, is_reply: bool, sentiment_score: float, first_seen: float, now: float) -> None:
+        nl = nick.lower()
+        ch = channel.lower()
+        d = self._user_data.setdefault(nl, {
+            "msg_count": 0, "reply_count": 0, "question_count": 0,
+            "link_count": 0, "auth_word_count": 0, "connector_count": 0,
+            "greeting_count": 0, "farewell_count": 0, "off_topic_count": 0,
+            "conflict_count": 0, "total_chars": 0, "first_seen": first_seen,
+            "last_seen": 0.0, "channels": set(), "sentiment_sum": 0.0,
+        })
+        d["msg_count"] += 1
+        d["reply_count"] += 1 if is_reply else 0
+        d["total_chars"] += len(text)
+        d["last_seen"] = now
+        d["channels"].add(ch)
+        d["sentiment_sum"] += sentiment_score
+
+        lower = text.lower()
+        words = set(lower.split())
+        if any(w in words for w in self._AUTH_WORDS):
+            d["auth_word_count"] += 1
+        if any(w in words for w in self._LOGICAL_CONNECTORS):
+            d["connector_count"] += 1
+        if any(lower.startswith(q) for q in self._QUESTION_MARKERS) or "?" in text:
+            d["question_count"] += 1
+        if any(lower.startswith(g) for g in self._GREETINGS):
+            d["greeting_count"] += 1
+        if any(lower.startswith(f) for f in self._FAREWELLS):
+            d["farewell_count"] += 1
+        if "http://" in lower or "https://" in lower:
+            d["link_count"] += 1
+        if any(w in words for w in {"stupid", "idiot", "moron", "dumb", "wrong", "shut up", "noob", "fake", "lies"}):
+            d["conflict_count"] += 1
+
+    def infer_roles(self, channel: str = "") -> Dict[str, List[Dict]]:
+        results: Dict[str, List[Dict]] = {}
+        for nl, d in self._user_data.items():
+            if channel and channel.lower() not in d["channels"]:
+                continue
+            if d["msg_count"] < 3:
+                continue
+
+            tenure_days = (d["last_seen"] - d["first_seen"]) / 86400.0
+            msg_freq = d["msg_count"] / max(tenure_days, 0.01)
+            reply_ratio = d["reply_count"] / max(d["msg_count"], 1)
+            question_ratio = d["question_count"] / max(d["msg_count"], 1)
+            link_ratio = d["link_count"] / max(d["msg_count"], 1)
+            avg_sentiment = d["sentiment_sum"] / max(d["msg_count"], 1)
+            conflict_ratio = d["conflict_count"] / max(d["msg_count"], 1)
+            auth_ratio = d["auth_word_count"] / max(d["msg_count"], 1)
+            connector_ratio = d["connector_count"] / max(d["msg_count"], 1)
+            off_topic_ratio = (d["greeting_count"] + d["farewell_count"]) / max(d["msg_count"], 1)
+
+            features = {
+                "auth_words": auth_ratio,
+                "tenure": min(tenure_days / 30.0, 1.0),
+                "cmd_usage": auth_ratio * 0.5,
+                "reply_ratio": reply_ratio,
+                "msg_freq": min(msg_freq / 50.0, 1.0),
+                "sentiment": avg_sentiment,
+                "conflict": conflict_ratio,
+                "link_share": link_ratio,
+                "question_ratio": question_ratio,
+                "off_topic": off_topic_ratio,
+            }
+
+            scores = {}
+            for role, weights in self._ROLE_WEIGHTS.items():
+                score = sum(weights.get(k, 0) * v for k, v in features.items())
+                scores[role] = max(0.0, min(1.0, 0.5 + score))
+
+            primary_role = max(scores, key=scores.get)
+            ch_key = channel.lower() if channel else "*"
+            results.setdefault(ch_key, []).append({
+                "nick": nl,
+                "primary_role": primary_role,
+                "scores": {k: round(v, 3) for k, v in sorted(scores.items(), key=lambda x: -x[1])},
+                "msg_count": d["msg_count"],
+                "tenure_days": round(tenure_days, 1),
+            })
+
+        for ch in results:
+            results[ch].sort(key=lambda x: -x["scores"][x["primary_role"]])
+        return results
+
+    def get_role(self, nick: str, channel: str = "") -> Optional[Dict]:
+        nl = nick.lower()
+        d = self._user_data.get(nl)
+        if not d or d["msg_count"] < 3:
+            return None
+        roles = self.infer_roles(channel)
+        ch_key = channel.lower() if channel else "*"
+        for r in roles.get(ch_key, []):
+            if r["nick"] == nl:
+                return r
+        return None
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "user_data": {k: {**v, "channels": list(v["channels"])} for k, v in self._user_data.items()},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in data.get("user_data", {}).items():
+                v["channels"] = set(v.get("channels", []))
+                self._user_data[k] = v
+        except Exception:
+            pass
+
+
+# =========================
+# Debate Analyzer
+# =========================
+
+class DebateAnalyzer:
+    """Analyzes conversations between two users to score argument quality.
+
+    Metrics:
+      • Logical fallacies (ad hominem, strawman, appeal to authority, etc.)
+      • Evidence usage (citations, data references, examples)
+      • Response quality (addresses points, stays on topic, constructive)
+      • Tone analysis (respectful, aggressive, dismissive)
+      • Turn balance (fair exchange vs domination)
+      • Resolution indicators (agreement, compromise, concession)
+    """
+
+    _FALLACIES = {
+        "ad_hominem": {"you're", "you are", "stupid", "idiot", "moron", "ignorant", "delusional", "clueless", "pathetic"},
+        "strawman": {"so you're saying", "you think that", "your position is", "you believe", "apparently you"},
+        "appeal_to_authority": {"experts agree", "scientists say", "studies show", "research proves", "authorities confirm"},
+        "appeal_to_emotion": {"think of", "imagine if", "how would you feel", "it's heartbreaking", "unacceptable"},
+        "false_dichotomy": {"either.*or", "only two options", "black and white", "all or nothing", "with us or against"},
+        "slippery_slope": {"will lead to", "next thing", "eventually", "soon they'll", "before you know it"},
+        "circular_reasoning": {"because it is", "by definition", "obviously", "self-evident", "inherently"},
+        "red_herring": {"but what about", "you're ignoring", "let's not forget", "meanwhile", "distracting from"},
+        "bandwagon": {"everyone knows", "most people", "majority agrees", "common sense", "widely accepted"},
+        "appeal_to_nature": {"natural", "organic", "chemical-free", "pure", "unnatural"},
+    }
+
+    _EVIDENCE_MARKERS = {"study", "research", "paper", "data", "statistics", "according to", "source", "citation", "reference", "peer-reviewed", "meta-analysis", "survey", "experiment", "trial", "evidence", "proof", "demonstrates", "shows that", "indicates"}
+    _AGREEMENT_MARKERS = {"i agree", "you're right", "good point", "fair enough", "concede", "you make a valid", "i see your point", "that's true", "agreed", "makes sense", "i hadn't considered"}
+    _DISMISSIVE_MARKERS = {"whatever", "doesn't matter", "irrelevant", "who cares", "nobody asked", "so what", "big deal", "yeah right", "sure", "ok boomer"}
+    _CONSTRUCTIVE_MARKERS = {"let's consider", "perhaps", "maybe we could", "what if", "another perspective", "building on that", "to add to", "i think we could", "compromise", "middle ground"}
+
+    def __init__(self):
+        self._exchanges: Dict[str, List[Dict]] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def record_message(self, nick1: str, nick2: str, channel: str, text: str, ts: float) -> None:
+        key = self._debate_key(nick1, nick2, channel)
+        exchange = self._exchanges.setdefault(key, {"messages": [], "started": ts, "channel": channel})
+        exchange["messages"].append({"nick": nick1.lower(), "text": text, "ts": ts})
+        if len(exchange["messages"]) > 200:
+            exchange["messages"] = exchange["messages"][-100:]
+
+    def analyze(self, nick1: str, nick2: str, channel: str = "") -> Optional[Dict]:
+        key = self._debate_key(nick1, nick2, channel)
+        alt_key = self._debate_key(nick2, nick1, channel)
+        exchange = self._exchanges.get(key) or self._exchanges.get(alt_key)
+        if not exchange or len(exchange["messages"]) < 4:
+            return None
+
+        msgs = exchange["messages"]
+        n1, n2 = nick1.lower(), nick2.lower()
+        n1_msgs = [m for m in msgs if m["nick"] == n1]
+        n2_msgs = [m for m in msgs if m["nick"] == n2]
+
+        n1_analysis = self._analyze_user(n1_msgs, n2_msgs)
+        n2_analysis = self._analyze_user(n2_msgs, n1_msgs)
+
+        turn_balance = self._turn_balance(msgs, n1, n2)
+        resolution = self._check_resolution(msgs)
+
+        return {
+            "nick1": nick1, "nick2": nick2, "channel": exchange["channel"],
+            "msg_count": len(msgs), "duration_min": round((msgs[-1]["ts"] - msgs[0]["ts"]) / 60, 1),
+            "nick1_analysis": n1_analysis, "nick2_analysis": n2_analysis,
+            "turn_balance": turn_balance,
+            "resolution": resolution,
+            "overall_quality": round((n1_analysis["quality_score"] + n2_analysis["quality_score"]) / 2, 3),
+        }
+
+    def _analyze_user(self, user_msgs: List[Dict], opponent_msgs: List[Dict]) -> Dict:
+        if not user_msgs:
+            return {"quality_score": 0.0}
+
+        fallacies_found = []
+        evidence_count = 0
+        constructive_count = 0
+        dismissive_count = 0
+        agreement_count = 0
+        topic_adherence = 0.0
+        total = len(user_msgs)
+
+        for m in user_msgs:
+            text = m["text"].lower()
+            words = set(text.split())
+
+            for fname, fwords in self._FALLACIES.items():
+                if any(w in words for w in fwords):
+                    fallacies_found.append(fname)
+
+            if any(w in words for w in self._EVIDENCE_MARKERS):
+                evidence_count += 1
+            if any(m["text"].lower().startswith(c) for c in self._CONSTRUCTIVE_MARKERS):
+                constructive_count += 1
+            if any(m["text"].lower().startswith(d) for d in self._DISMISSIVE_MARKERS):
+                dismissive_count += 1
+            if any(m["text"].lower().startswith(a) for a in self._AGREEMENT_MARKERS):
+                agreement_count += 1
+
+        fallacy_rate = len(fallacies_found) / max(total, 1)
+        evidence_rate = evidence_count / max(total, 1)
+        constructive_rate = constructive_count / max(total, 1)
+        dismissive_rate = dismissive_count / max(total, 1)
+
+        quality = 0.5
+        quality -= fallacy_rate * 0.3
+        quality += evidence_rate * 0.25
+        quality += constructive_rate * 0.2
+        quality -= dismissive_rate * 0.25
+        quality += min(agreement_count / max(total, 1) * 0.1, 0.1)
+        quality = max(0.0, min(1.0, quality))
+
+        fallacy_counts = Counter(fallacies_found)
+        return {
+            "quality_score": round(quality, 3),
+            "fallacy_rate": round(fallacy_rate, 3),
+            "evidence_rate": round(evidence_rate, 3),
+            "constructive_rate": round(constructive_rate, 3),
+            "dismissive_rate": round(dismissive_rate, 3),
+            "agreement_count": agreement_count,
+            "fallacies": dict(fallacy_counts.most_common(5)),
+            "msg_count": total,
+        }
+
+    def _turn_balance(self, msgs: List[Dict], n1: str, n2: str) -> Dict:
+        n1_count = sum(1 for m in msgs if m["nick"] == n1)
+        n2_count = sum(1 for m in msgs if m["nick"] == n2)
+        total = n1_count + n2_count
+        return {
+            "nick1_msgs": n1_count, "nick2_msgs": n2_count,
+            "ratio": round(n1_count / max(n2_count, 1), 2),
+            "balance": round(1.0 - abs(n1_count - n2_count) / max(total, 1), 3),
+        }
+
+    def _check_resolution(self, msgs: List[Dict]) -> Dict:
+        recent = msgs[-10:]
+        agreements = sum(1 for m in recent if any(m["text"].lower().startswith(a) for a in self._AGREEMENT_MARKERS))
+        return {
+            "indicators": agreements,
+            "resolved": agreements >= 2,
+            "status": "resolved" if agreements >= 2 else "ongoing" if len(msgs) > 4 else "insufficient data",
+        }
+
+    def _debate_key(self, nick1: str, nick2: str, channel: str) -> str:
+        n1, n2 = sorted([nick1.lower(), nick2.lower()])
+        return f"{n1}:{n2}:{channel.lower()}"
+
+    def get_active_debates(self, channel: str = "", limit: int = 10) -> List[Dict]:
+        results = []
+        for key, exchange in self._exchanges.items():
+            if channel and exchange["channel"].lower() != channel.lower():
+                continue
+            if len(exchange["messages"]) < 4:
+                continue
+            parts = key.split(":")
+            analysis = self.analyze(parts[0], parts[1], exchange["channel"])
+            if analysis:
+                results.append(analysis)
+        results.sort(key=lambda x: -x["msg_count"])
+        return results[:limit]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "exchanges": {k: v for k, v in list(self._exchanges.items())[:50]},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._exchanges = data.get("exchanges", {})
+        except Exception:
+            pass
+
+
+# =========================
+# Echo Chamber Detector
+# =========================
+
+class EchoChamberDetector:
+    """Measures opinion homogeneity and cross-pollination in channels.
+
+    Metrics:
+      • Sentiment consensus — how aligned are users' sentiments?
+      • Vocabulary overlap — do users share the same lexicon?
+      • Agreement ratio — how often do users affirm each other?
+      • Dissent suppression — are contrary voices ignored or attacked?
+      • Cross-channel exposure — do users participate in diverse channels?
+      • Information diversity — range of topics discussed
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "echo_chamber.json")
+    _AGREEMENT_PHRASES = {"i agree", "you're right", "good point", "exactly", "true", "agreed", "makes sense", "that's right", "absolutely", "definitely", "for sure", "no doubt", "well said", "couldn't agree more"}
+    _DISSENT_PHRASES = {"i disagree", "not true", "that's wrong", "incorrect", "nope", "false", "i don't think so", "hardly", "doubt it", "that's not", "you're mistaken"}
+    _ATTACK_PHRASES = {"stupid", "idiot", "moron", "shut up", "you're dumb", "ignorant", "delusional", "clueless", "wake up", "brainwashed"}
+
+    def __init__(self):
+        self._channel_data: Dict[str, Dict] = {}
+        self._user_channel_map: Dict[str, set] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def observe(self, nick: str, channel: str, text: str, sentiment_score: float) -> None:
+        ch = channel.lower()
+        nl = nick.lower()
+        cd = self._channel_data.setdefault(ch, {
+            "msg_count": 0, "sentiment_scores": [], "vocab": set(),
+            "agreement_count": 0, "dissent_count": 0, "attack_count": 0,
+            "topic_set": set(), "user_sentiments": {}, "users": set(),
+        })
+        cd["msg_count"] += 1
+        cd["sentiment_scores"].append(sentiment_score)
+        cd["users"].add(nl)
+        cd["user_sentiments"].setdefault(nl, []).append(sentiment_score)
+
+        words = set(text.lower().split())
+        cd["vocab"].update(w for w in words if len(w) > 3)
+
+        lower = text.lower()
+        if any(lower.startswith(p) for p in self._AGREEMENT_PHRASES):
+            cd["agreement_count"] += 1
+        if any(lower.startswith(p) for p in self._DISSENT_PHRASES):
+            cd["dissent_count"] += 1
+        if any(p in lower for p in self._ATTACK_PHRASES):
+            cd["attack_count"] += 1
+
+        self._user_channel_map.setdefault(nl, set()).add(ch)
+
+    def analyze(self, channel: str) -> Optional[Dict]:
+        ch = channel.lower()
+        cd = self._channel_data.get(ch)
+        if not cd or cd["msg_count"] < 10:
+            return None
+
+        sentiment_scores = cd["sentiment_scores"]
+        avg_sentiment = sum(sentiment_scores) / len(sentiment_scores)
+        sentiment_std = (sum((s - avg_sentiment)**2 for s in sentiment_scores) / len(sentiment_scores))**0.5
+        sentiment_consensus = max(0, 1.0 - sentiment_std)
+
+        user_sentiments = {}
+        for user, scores in cd["user_sentiments"].items():
+            user_sentiments[user] = sum(scores) / len(scores)
+
+        if len(user_sentiments) >= 2:
+            vals = list(user_sentiments.values())
+            mean_vals = sum(vals) / len(vals)
+            user_std = (sum((v - mean_vals)**2 for v in vals) / len(vals))**0.5
+            opinion_homogeneity = max(0, 1.0 - user_std)
+        else:
+            opinion_homogeneity = 1.0
+
+        total_responses = cd["agreement_count"] + cd["dissent_count"] + cd["attack_count"]
+        agreement_ratio = cd["agreement_count"] / max(total_responses, 1)
+        dissent_ratio = cd["dissent_count"] / max(total_responses, 1)
+        attack_ratio = cd["attack_count"] / max(total_responses, 1)
+
+        dissent_suppression = 1.0 if (attack_ratio > 0.3 and dissent_ratio < 0.1) else (attack_ratio * 2)
+
+        cross_channel_scores = []
+        for user in cd["users"]:
+            user_channels = self._user_channel_map.get(user, set())
+            cross_channel_scores.append(len(user_channels))
+        avg_cross_channel = sum(cross_channel_scores) / max(len(cross_channel_scores), 1)
+        cross_channel_exposure = min(avg_cross_channel / 5.0, 1.0)
+
+        topic_diversity = min(len(cd["topic_set"]) / 10.0, 1.0)
+
+        echo_score = (
+            sentiment_consensus * 0.20 +
+            opinion_homogeneity * 0.25 +
+            agreement_ratio * 0.20 +
+            dissent_suppression * 0.15 +
+            (1.0 - cross_channel_exposure) * 0.10 +
+            (1.0 - topic_diversity) * 0.10
+        )
+
+        if echo_score >= 0.7:
+            severity = "strong"
+        elif echo_score >= 0.5:
+            severity = "moderate"
+        elif echo_score >= 0.3:
+            severity = "mild"
+        else:
+            severity = "open"
+
+        return {
+            "channel": channel,
+            "echo_score": round(echo_score, 3),
+            "severity": severity,
+            "metrics": {
+                "sentiment_consensus": round(sentiment_consensus, 3),
+                "opinion_homogeneity": round(opinion_homogeneity, 3),
+                "agreement_ratio": round(agreement_ratio, 3),
+                "dissent_ratio": round(dissent_ratio, 3),
+                "attack_ratio": round(attack_ratio, 3),
+                "dissent_suppression": round(dissent_suppression, 3),
+                "cross_channel_exposure": round(cross_channel_exposure, 3),
+                "topic_diversity": round(topic_diversity, 3),
+            },
+            "user_count": len(cd["users"]),
+            "msg_count": cd["msg_count"],
+        }
+
+    def analyze_all(self) -> List[Dict]:
+        results = []
+        for ch in self._channel_data:
+            result = self.analyze(ch)
+            if result:
+                results.append(result)
+        results.sort(key=lambda x: -x["echo_score"])
+        return results
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "channel_data": {k: {**v, "vocab": list(v["vocab"])[:500], "topic_set": list(v["topic_set"])[:200], "users": list(v["users"])} for k, v in self._channel_data.items()},
+                "user_channel_map": {k: list(v) for k, v in self._user_channel_map.items()},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in data.get("channel_data", {}).items():
+                v["vocab"] = set(v.get("vocab", []))
+                v["topic_set"] = set(v.get("topic_set", []))
+                v["users"] = set(v.get("users", []))
+                self._channel_data[k] = v
+            for k, v in data.get("user_channel_map", {}).items():
+                self._user_channel_map[k] = set(v)
+        except Exception:
+            pass
+
+
+# =========================
+# Achievement Badges
+# =========================
+
+class AchievementBadges:
+    """Tracks and awards achievement badges based on user behavior.
+
+    Badge Categories:
+      • Participation    — First Post, Regular, Marathon, Night Owl, Early Bird
+      • Social           — Welcomer, Connector, Peacemaker, Popular
+      • Knowledge        — Expert, Helper, Source Citer, Fact Checker
+      • Communication    — Wordsmith, Concise, Multilingual, Storyteller
+      • Dedication       — Veteran, Streak Master, Daily Driver, Year Club
+      • Special          — Comeback Kid, Channel Hopper, Meme Lord, Emoji Master
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "achievements.json")
+
+    _BADGE_DEFS = {
+        "first_post":       {"name": "First Post",       "icon": "🌟", "desc": "Sent your first message", "category": "Participation"},
+        "regular":          {"name": "Regular",          "icon": "⭐", "desc": "Sent 100 messages", "category": "Participation"},
+        "marathon":         {"name": "Marathon",         "icon": "🏃", "desc": "Sent 1000 messages", "category": "Participation"},
+        "night_owl":        {"name": "Night Owl",        "icon": "🦉", "desc": "Active between 2-5 AM", "category": "Participation"},
+        "early_bird":       {"name": "Early Bird",       "icon": "🐦", "desc": "Active between 5-8 AM", "category": "Participation"},
+        "welcomer":         {"name": "Welcomer",         "icon": "👋", "desc": "Welcomed 10 new users", "category": "Social"},
+        "connector":        {"name": "Connector",        "icon": "🔗", "desc": "Active in 5+ channels", "category": "Social"},
+        "peacemaker":       {"name": "Peacemaker",       "icon": "☮️", "desc": "Resolved 5 conflicts", "category": "Social"},
+        "popular":          {"name": "Popular",          "icon": "💫", "desc": "Replied to by 20+ users", "category": "Social"},
+        "expert":           {"name": "Expert",           "icon": "🎓", "desc": "High technical vocabulary score", "category": "Knowledge"},
+        "helper":           {"name": "Helper",           "icon": "🤝", "desc": "Answered 50 questions", "category": "Knowledge"},
+        "source_citer":     {"name": "Source Citer",     "icon": "📚", "desc": "Cited 25 sources", "category": "Knowledge"},
+        "fact_checker":     {"name": "Fact Checker",     "icon": "🔍", "desc": "Corrected 10 misinformation claims", "category": "Knowledge"},
+        "wordsmith":        {"name": "Wordsmith",        "icon": "✍️", "desc": "Sent 10,000 words", "category": "Communication"},
+        "concise":          {"name": "Concise",          "icon": "📌", "desc": "Sent 50 messages under 10 chars", "category": "Communication"},
+        "multilingual":     {"name": "Multilingual",     "icon": "🌐", "desc": "Used 3+ languages", "category": "Communication"},
+        "storyteller":      {"name": "Storyteller",      "icon": "📖", "desc": "Sent 20 messages over 500 chars", "category": "Communication"},
+        "veteran":          {"name": "Veteran",          "icon": "🏅", "desc": "Active for 30+ days", "category": "Dedication"},
+        "streak_master":    {"name": "Streak Master",    "icon": "🔥", "desc": "7-day activity streak", "category": "Dedication"},
+        "daily_driver":     {"name": "Daily Driver",     "icon": "📅", "desc": "Active every day for 14 days", "category": "Dedication"},
+        "year_club":        {"name": "Year Club",        "icon": "🎂", "desc": "Active for 365 days", "category": "Dedication"},
+        "comeback_kid":     {"name": "Comeback Kid",     "icon": "🔄", "desc": "Returned after 30 days absence", "category": "Special"},
+        "channel_hopper":   {"name": "Channel Hopper",   "icon": "🦘", "desc": "Active in 10+ channels", "category": "Special"},
+        "meme_lord":        {"name": "Meme Lord",        "icon": "😂", "desc": "Used 50 meme phrases", "category": "Special"},
+        "emoji_master":     {"name": "Emoji Master",     "icon": "😀", "desc": "Used 100 unique emojis", "category": "Special"},
+    }
+
+    def __init__(self):
+        self._user_stats: Dict[str, Dict] = {}
+        self._awarded: Dict[str, set] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def observe(self, nick: str, channel: str, text: str, ts: float, replied_to_by: List[str] = None) -> None:
+        nl = nick.lower()
+        d = self._user_stats.setdefault(nl, {
+            "msg_count": 0, "word_count": 0, "total_chars": 0,
+            "channels": set(), "first_seen": ts, "last_seen": ts,
+            "night_msgs": 0, "morning_msgs": 0, "short_msgs": 0,
+            "long_msgs": 0, "welcome_count": 0, "conflict_resolved": 0,
+            "questions_answered": 0, "sources_cited": 0, "facts_corrected": 0,
+            "unique_emojis": set(), "meme_count": 0, "languages": set(),
+            "active_days": set(), "reply_targets": set(), "streak_days": 0,
+            "last_active_date": "", "absence_days": 0,
+        })
+        d["msg_count"] += 1
+        d["word_count"] += len(text.split())
+        d["total_chars"] += len(text)
+        d["last_seen"] = ts
+        d["channels"].add(channel.lower())
+
+        hour = time.localtime(ts).tm_hour
+        if 2 <= hour < 5:
+            d["night_msgs"] += 1
+        if 5 <= hour < 8:
+            d["morning_msgs"] += 1
+        if len(text) < 10:
+            d["short_msgs"] += 1
+        if len(text) > 500:
+            d["long_msgs"] += 1
+
+        day_str = time.strftime("%Y-%m-%d", time.localtime(ts))
+        d["active_days"].add(day_str)
+
+        if replied_to_by:
+            d["reply_targets"].update(n.lower() for n in replied_to_by)
+
+        lower = text.lower()
+        emojis = re.findall(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]', text)
+        d["unique_emojis"].update(emojis)
+
+        if any(lower.startswith(p) for p in {"welcome", "hi ", "hey ", "greetings", "wb "}):
+            d["welcome_count"] += 1
+        if any(w in lower for w in {"study", "research", "paper", "source", "according to", "citation"}):
+            d["sources_cited"] += 1
+        if "?" in text and any(lower.startswith(q) for q in {"because", "actually", "the answer", "it's", "you can", "try"}):
+            d["questions_answered"] += 1
+
+    def check_achievements(self, nick: str) -> List[Dict]:
+        nl = nick.lower()
+        d = self._user_stats.get(nl)
+        if not d:
+            return []
+
+        awarded = self._awarded.setdefault(nl, set())
+        new_badges = []
+
+        checks = {
+            "first_post": d["msg_count"] >= 1,
+            "regular": d["msg_count"] >= 100,
+            "marathon": d["msg_count"] >= 1000,
+            "night_owl": d["night_msgs"] >= 10,
+            "early_bird": d["morning_msgs"] >= 10,
+            "welcomer": d["welcome_count"] >= 10,
+            "connector": len(d["channels"]) >= 5,
+            "peacemaker": d["conflict_resolved"] >= 5,
+            "popular": len(d["reply_targets"]) >= 20,
+            "expert": d["word_count"] >= 5000 and len(d["channels"]) >= 2,
+            "helper": d["questions_answered"] >= 50,
+            "source_citer": d["sources_cited"] >= 25,
+            "fact_checker": d["facts_corrected"] >= 10,
+            "wordsmith": d["word_count"] >= 10000,
+            "concise": d["short_msgs"] >= 50,
+            "multilingual": len(d["languages"]) >= 3,
+            "storyteller": d["long_msgs"] >= 20,
+            "veteran": (d["last_seen"] - d["first_seen"]) >= 86400 * 30,
+            "streak_master": d["streak_days"] >= 7,
+            "daily_driver": len(d["active_days"]) >= 14,
+            "year_club": (d["last_seen"] - d["first_seen"]) >= 86400 * 365,
+            "comeback_kid": d["absence_days"] >= 30,
+            "channel_hopper": len(d["channels"]) >= 10,
+            "meme_lord": d["meme_count"] >= 50,
+            "emoji_master": len(d["unique_emojis"]) >= 100,
+        }
+
+        for badge_id, earned in checks.items():
+            if earned and badge_id not in awarded:
+                awarded.add(badge_id)
+                new_badges.append({**self._BADGE_DEFS[badge_id], "id": badge_id, "earned_at": time.time()})
+
+        if new_badges:
+            self._maybe_save()
+        return new_badges
+
+    def get_badges(self, nick: str) -> List[Dict]:
+        nl = nick.lower()
+        awarded = self._awarded.get(nl, set())
+        return [{**self._BADGE_DEFS[bid], "id": bid} for bid in sorted(awarded)]
+
+    def get_leaderboard(self, limit: int = 20) -> List[Dict]:
+        results = []
+        for nl, awarded in self._awarded.items():
+            d = self._user_stats.get(nl, {})
+            results.append({
+                "nick": nl,
+                "badge_count": len(awarded),
+                "badges": list(awarded),
+                "msg_count": d.get("msg_count", 0),
+                "channels": len(d.get("channels", set())),
+            })
+        results.sort(key=lambda x: -x["badge_count"])
+        return results[:limit]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "user_stats": {k: {**v, "channels": list(v["channels"]), "unique_emojis": list(v["unique_emojis"]), "active_days": list(v["active_days"]), "languages": list(v["languages"]), "reply_targets": list(v["reply_targets"])} for k, v in self._user_stats.items()},
+                "awarded": {k: list(v) for k, v in self._awarded.items()},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in data.get("user_stats", {}).items():
+                v["channels"] = set(v.get("channels", []))
+                v["unique_emojis"] = set(v.get("unique_emojis", []))
+                v["active_days"] = set(v.get("active_days", []))
+                v["languages"] = set(v.get("languages", []))
+                v["reply_targets"] = set(v.get("reply_targets", []))
+                self._user_stats[k] = v
+            for k, v in data.get("awarded", {}).items():
+                self._awarded[k] = set(v)
+        except Exception:
+            pass
+
+
+# =========================
+# Sarcasm Detector
+# =========================
+
+class SarcasmDetector:
+    """Detects sarcastic messages via sentiment-text mismatch and linguistic markers.
+
+    Signals:
+      • Sentiment mismatch — positive words in negative context (or vice versa)
+      • Exaggeration markers — "oh great", "fantastic", "just what I needed"
+      • Punctuation cues — excessive ellipsis, quotes, exclamation marks
+      • Emotion-word inversion — positive adjectives with negative verbs
+      • Context contradiction — agrees then immediately contradicts
+      • Sarcasm lexicon — known sarcastic phrases and patterns
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "sarcasm.json")
+    _SARCASM_THRESHOLD = 0.60
+
+    _SARCASM_PHRASES = {
+        "oh great", "oh wonderful", "oh fantastic", "oh brilliant", "oh perfect",
+        "just what i needed", "just what i wanted", "just what i always wanted",
+        "yeah right", "sure thing", "of course", "naturally", "obviously",
+        "thanks a lot", "thanks for nothing", "real helpful", "very helpful",
+        "good to know", "good job", "well done", "nice going", "way to go",
+        "i'm so impressed", "how original", "how unique", "how creative",
+        "big surprise", "no way", "you don't say", "tell me something i don't know",
+        "fascinating", "riveting", "groundbreaking", "revolutionary",
+        "shocking", "unbelievable", "incredible", "amazing",
+    }
+
+    _EXAGGERATION_MARKERS = {"so", "very", "extremely", "incredibly", "absolutely", "totally", "completely", "utterly", "really", "super", "mega", "hyper"}
+    _POSITIVE_WORDS = {"great", "wonderful", "fantastic", "amazing", "awesome", "excellent", "perfect", "brilliant", "superb", "outstanding", "love", "best", "good", "nice", "happy", "glad", "thrilled", "delighted", "pleased"}
+    _NEGATIVE_WORDS = {"terrible", "awful", "horrible", "disgusting", "worst", "bad", "hate", "stupid", "idiotic", "ridiculous", "absurd", "pathetic", "useless", "worthless", "dreadful", "miserable", "annoying", "frustrating"}
+
+    _PUNCTUATION_PATTERNS = [
+        (re.compile(r'\.{3,}'), "ellipsis"),
+        (re.compile(r'!{2,}'), "exclamation"),
+        (re.compile(r'".*?"'), "quotes"),
+        (re.compile(r'\(sarcasm\)|\/s|<sarcasm>', re.IGNORECASE), "explicit"),
+    ]
+
+    def __init__(self):
+        self._user_messages: Dict[str, List[Dict]] = {}
+        self._detected: List[Dict] = []
+        self._last_save: float = 0.0
+        self.load()
+
+    def analyze(self, nick: str, text: str, sentiment_score: float) -> Dict:
+        nl = nick.lower()
+        lower = text.lower()
+        words = set(lower.split())
+        score = 0.0
+        signals = []
+
+        # 1. Sarcasm phrase match
+        phrase_matches = sum(1 for p in self._SARCASM_PHRASES if p in lower)
+        if phrase_matches > 0:
+            score += min(phrase_matches * 0.25, 0.5)
+            signals.append(f"phrase_match({phrase_matches})")
+
+        # 2. Sentiment mismatch
+        has_positive = bool(words & self._POSITIVE_WORDS)
+        has_negative = bool(words & self._NEGATIVE_WORDS)
+        if has_positive and sentiment_score < -0.3:
+            score += 0.3
+            signals.append("positive_words_negative_sentiment")
+        elif has_negative and sentiment_score > 0.3:
+            score += 0.3
+            signals.append("negative_words_positive_sentiment")
+
+        # 3. Exaggeration + positive/negative combo
+        has_exaggeration = bool(words & self._EXAGGERATION_MARKERS)
+        if has_exaggeration and (has_positive or has_negative):
+            score += 0.15
+            signals.append("exaggeration")
+
+        # 4. Punctuation patterns
+        punct_signals = []
+        for pattern, name in self._PUNCTUATION_PATTERNS:
+            if pattern.search(text):
+                punct_signals.append(name)
+                if name == "explicit":
+                    score += 0.8
+                else:
+                    score += 0.1
+        if punct_signals:
+            signals.append(f"punctuation({','.join(punct_signals)})")
+
+        # 5. Context contradiction (check recent messages)
+        user_msgs = self._user_messages.get(nl, [])[-5:]
+        if len(user_msgs) >= 2:
+            recent_sentiments = [m["sentiment"] for m in user_msgs]
+            if len(recent_sentiments) >= 2:
+                avg_recent = sum(recent_sentiments[:-1]) / len(recent_sentiments[:-1])
+                if (avg_recent > 0.3 and sentiment_score < -0.3) or \
+                   (avg_recent < -0.3 and sentiment_score > 0.3):
+                    score += 0.2
+                    signals.append("context_contradiction")
+
+        # 6. Question + statement mismatch
+        if "?" in text and has_positive:
+            score += 0.1
+            signals.append("rhetorical_question")
+
+        score = min(score, 1.0)
+        is_sarcastic = score >= self._SARCASM_THRESHOLD
+
+        result = {
+            "nick": nick,
+            "text": text[:100],
+            "score": round(score, 3),
+            "is_sarcastic": is_sarcastic,
+            "signals": signals,
+            "ts": time.time(),
+        }
+
+        self._user_messages.setdefault(nl, []).append({
+            "text": text,
+            "sentiment": sentiment_score,
+            "score": score,
+            "ts": time.time(),
+        })
+        if len(self._user_messages.get(nl, [])) > 100:
+            self._user_messages[nl] = self._user_messages[nl][-50:]
+
+        if is_sarcastic:
+            self._detected.append(result)
+            if len(self._detected) > 200:
+                self._detected = self._detected[-100:]
+            self._maybe_save()
+
+        return result
+
+    def get_user_sarcasm_rate(self, nick: str, limit: int = 50) -> Dict:
+        nl = nick.lower()
+        msgs = self._user_messages.get(nl, [])[-limit:]
+        if not msgs:
+            return {"nick": nick, "sarcasm_rate": 0.0, "total_analyzed": 0}
+        sarcastic = sum(1 for m in msgs if m["score"] >= self._SARCASM_THRESHOLD)
+        return {
+            "nick": nick,
+            "sarcasm_rate": round(sarcastic / len(msgs), 3),
+            "total_analyzed": len(msgs),
+            "sarcastic_count": sarcastic,
+            "avg_score": round(sum(m["score"] for m in msgs) / len(msgs), 3),
+        }
+
+    def get_recent_detections(self, limit: int = 20) -> List[Dict]:
+        return self._detected[-limit:]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "user_messages": {k: v[-20:] for k, v in self._user_messages.items()},
+                "detected": self._detected[-50:],
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._user_messages = data.get("user_messages", {})
+            self._detected = data.get("detected", [])
+        except Exception:
+            pass
+
+
+# =========================
+# Emotion Arc
+# =========================
+
+class EmotionArc:
+    """Tracks emotional journey over time for users.
+
+    Emotions tracked:
+      • joy        — happiness, excitement, satisfaction
+      • anger      — frustration, rage, annoyance
+      • sadness    — disappointment, grief, melancholy
+      • fear       — anxiety, worry, concern
+      • surprise   — shock, amazement, disbelief
+      • disgust    — contempt, revulsion, disapproval
+      • neutral    — baseline, factual, unemotional
+
+    Provides:
+      • Per-user emotion timeline
+      • Emotion transition patterns
+      • Dominant emotion per time window
+      • Emotional volatility scoring
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "emotion_arc.json")
+
+    _EMOTION_LEXICON = {
+        "joy": {"happy", "joy", "excited", "great", "awesome", "love", "wonderful", "amazing", "fantastic", "excellent", "celebrate", "yay", "woohoo", "thrilled", "delighted", "pleased", "glad", "smile", "laugh", "fun", "enjoy", "beautiful", "perfect", "brilliant", "superb", "outstanding", "magnificent", "marvelous", "splendid", "grateful", "thankful", "blessed", "fortunate", "lucky"},
+        "anger": {"angry", "mad", "furious", "rage", "hate", "annoyed", "frustrated", "irritated", "pissed", "outraged", "infuriated", "livid", "enraged", "hostile", "aggressive", "violent", "threat", "attack", "destroy", "kill", "stupid", "idiot", "moron", "dumb", "useless", "worthless", "garbage", "trash", "disgusting", "revolting", "sickening"},
+        "sadness": {"sad", "depressed", "unhappy", "miserable", "grief", "sorrow", "cry", "tears", "lonely", "alone", "lost", "hopeless", "despair", "heartbroken", "devastated", "crushed", "disappointed", "regret", "sorry", "miss", "missing", "pain", "hurt", "suffering", "tragic", "tragedy", "unfortunate", "pity", "poor"},
+        "fear": {"scared", "afraid", "fear", "terrified", "anxious", "worried", "nervous", "panic", "dread", "horror", "frightened", "alarmed", "concerned", "uneasy", "tense", "stress", "paranoid", "phobia", "threatened", "danger", "dangerous", "risk", "unsafe", "insecure", "vulnerable", "helpless"},
+        "surprise": {"surprised", "shocked", "amazed", "astonished", "stunned", "wow", "omg", "unbelievable", "incredible", "unexpected", "suddenly", "whoa", "gasp", "jaw-dropping", "mind-blowing", "remarkable", "extraordinary", "phenomenal", "miracle", "miraculous"},
+        "disgust": {"disgust", "disgusting", "gross", "nasty", "revolting", "sickening", "repulsive", "contempt", "despise", "loathe", "abhor", "detest", "vile", "foul", "repugnant", "offensive", "obnoxious", "awful", "horrible", "terrible", "dreadful", "atrocious", "abysmal", "appalling"},
+    }
+
+    _EMOTION_TRANSITIONS = {
+        ("joy", "anger"): "frustrated happiness",
+        ("anger", "joy"): "reconciliation",
+        ("sadness", "joy"): "recovery",
+        ("joy", "sadness"): "disappointment",
+        ("fear", "anger"): "defensive aggression",
+        ("anger", "sadness"): "defeat",
+        ("surprise", "joy"): "delight",
+        ("surprise", "fear"): "alarm",
+        ("disgust", "anger"): "moral outrage",
+    }
+
+    def __init__(self):
+        self._user_emotions: Dict[str, List[Dict]] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def analyze(self, nick: str, text: str, ts: float = None) -> Dict:
+        if ts is None:
+            ts = time.time()
+        nl = nick.lower()
+        lower = text.lower()
+        words = set(lower.split())
+
+        emotion_scores = {}
+        for emotion, lexicon in self._EMOTION_LEXICON.items():
+            matches = words & lexicon
+            emotion_scores[emotion] = len(matches) / max(len(words), 1)
+
+        # Normalize to get dominant emotion
+        total = sum(emotion_scores.values())
+        if total > 0:
+            for e in emotion_scores:
+                emotion_scores[e] = emotion_scores[e] / total
+        else:
+            emotion_scores["neutral"] = 1.0
+
+        dominant = max(emotion_scores, key=emotion_scores.get)
+        confidence = emotion_scores[dominant]
+
+        # Track transition
+        prev_emotion = None
+        user_history = self._user_emotions.get(nl, [])
+        if user_history:
+            prev_emotion = user_history[-1]["dominant"]
+
+        transition = None
+        if prev_emotion and prev_emotion != dominant:
+            transition = self._EMOTION_TRANSITIONS.get((prev_emotion, dominant), f"{prev_emotion}→{dominant}")
+
+        result = {
+            "nick": nick,
+            "text": text[:80],
+            "emotions": {k: round(v, 3) for k, v in sorted(emotion_scores.items(), key=lambda x: -x[1])},
+            "dominant": dominant,
+            "confidence": round(confidence, 3),
+            "prev_emotion": prev_emotion,
+            "transition": transition,
+            "ts": ts,
+        }
+
+        self._user_emotions.setdefault(nl, []).append(result)
+        if len(self._user_emotions.get(nl, [])) > 200:
+            self._user_emotions[nl] = self._user_emotions[nl][-100:]
+
+        self._maybe_save()
+        return result
+
+    def get_arc(self, nick: str, window: int = 50) -> Dict:
+        nl = nick.lower()
+        history = self._user_emotions.get(nl, [])[-window:]
+        if not history:
+            return {"nick": nick, "arc": [], "summary": {}}
+
+        emotion_counts = Counter(h["dominant"] for h in history)
+        total = len(history)
+
+        # Volatility: how often emotions change
+        changes = sum(1 for i in range(1, len(history)) if history[i]["dominant"] != history[i-1]["dominant"])
+        volatility = changes / max(total - 1, 1)
+
+        # Transitions
+        transitions = [h["transition"] for h in history if h.get("transition")]
+        transition_counts = Counter(transitions)
+
+        # Time-based summary
+        time_buckets = {}
+        for h in history:
+            hour = time.localtime(h["ts"]).tm_hour
+            bucket = hour // 4
+            time_buckets.setdefault(bucket, []).append(h["dominant"])
+
+        dominant_by_period = {}
+        period_names = {"0": "night (0-4)", "1": "morning (4-8)", "2": "day (8-16)", "3": "evening (16-24)"}
+        for bucket, emotions in time_buckets.items():
+            dominant_by_period[period_names[str(bucket)]] = Counter(emotions).most_common(1)[0][0]
+
+        return {
+            "nick": nick,
+            "arc": [{"dominant": h["dominant"], "confidence": h["confidence"], "ts": h["ts"], "transition": h.get("transition")} for h in history],
+            "summary": {
+                "total_messages": total,
+                "emotion_distribution": {k: round(v / total, 3) for k, v in emotion_counts.items()},
+                "volatility": round(volatility, 3),
+                "top_transitions": dict(transition_counts.most_common(5)),
+                "dominant_by_period": dominant_by_period,
+                "most_common_emotion": emotion_counts.most_common(1)[0][0] if emotion_counts else "neutral",
+            },
+        }
+
+    def compare_arcs(self, nick1: str, nick2: str, window: int = 50) -> Dict:
+        arc1 = self.get_arc(nick1, window)
+        arc2 = self.get_arc(nick2, window)
+        if not arc1["arc"] or not arc2["arc"]:
+            return {"error": "Not enough data for both users"}
+
+        # Emotional alignment: how often they share the same dominant emotion
+        times1 = {h["ts"]: h["dominant"] for h in arc1["arc"]}
+        times2 = {h["ts"]: h["dominant"] for h in arc2["arc"]}
+        common_times = set(times1.keys()) & set(times2.keys())
+        if common_times:
+            matches = sum(1 for t in common_times if times1[t] == times2[t])
+            alignment = matches / len(common_times)
+        else:
+            alignment = 0.0
+
+        return {
+            "nick1": nick1,
+            "nick2": nick2,
+            "alignment": round(alignment, 3),
+            "nick1_dominant": arc1["summary"]["most_common_emotion"],
+            "nick2_dominant": arc2["summary"]["most_common_emotion"],
+            "nick1_volatility": arc1["summary"]["volatility"],
+            "nick2_volatility": arc2["summary"]["volatility"],
+        }
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "user_emotions": {k: [{"dominant": h["dominant"], "confidence": h["confidence"], "ts": h["ts"], "transition": h.get("transition")} for h in v] for k, v in self._user_emotions.items()},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._user_emotions = data.get("user_emotions", {})
+        except Exception:
+            pass
+
+
+# =========================
 # Ban Evasion Detector
 # =========================
 
@@ -7640,6 +8744,85 @@ class ChatLogImporter:
 
 
 # =========================
+# Real-time Stats Panel
+# =========================
+
+class RealtimeStats:
+    """Tracks and computes real-time channel/session statistics for the stats panel."""
+
+    def __init__(self):
+        self._msg_timestamps: deque = deque(maxlen=5000)
+        self._channel_msg_counts: Dict[str, int] = {}
+        self._hourly_activity: List[int] = [0] * 24
+        self._session_start: float = time.time()
+        self._total_msgs: int = 0
+        self._total_suspects_seen: int = 0
+        self._ai_scores_in_window: deque = deque(maxlen=200)
+        self._sentiment_samples: deque = deque(maxlen=200)
+        self._last_compute: float = 0.0
+        self._cached_lines: List[str] = []
+
+    def record_message(self, nick: str, channel: str, ai_score: int = 0, sentiment: float = 0.0) -> None:
+        now = time.time()
+        self._msg_timestamps.append(now)
+        self._channel_msg_counts[channel] = self._channel_msg_counts.get(channel, 0) + 1
+        self._hourly_activity[time.localtime().tm_hour] += 1
+        self._total_msgs += 1
+        if ai_score >= AI_SUSPECT_THRESHOLD:
+            self._total_suspects_seen += 1
+        self._ai_scores_in_window.append(ai_score)
+        self._sentiment_samples.append(sentiment)
+        self._last_compute = 0.0
+
+    def get_panel_lines(self, current_channel: str, total_users: int, suspect_count: int, channels_joined: int) -> List[str]:
+        now = time.monotonic()
+        if now - self._last_compute < 1.0 and self._cached_lines:
+            return self._cached_lines
+
+        lines = []
+        uptime = time.time() - self._session_start
+        hours, rem = divmod(int(uptime), 3600)
+        mins, secs = divmod(rem, 60)
+
+        lines.append(" Stats ")
+        lines.append(f" {int(hours)}h {mins}m {secs}s")
+        lines.append(f" {self._total_msgs} msgs")
+
+        msgs_per_min = self._compute_rate(60)
+        lines.append(f" {msgs_per_min:.1f}/min")
+
+        lines.append(f" {total_users} users")
+        lines.append(f" {suspect_count} suspects")
+        lines.append(f" {channels_joined} channels")
+
+        if current_channel and current_channel.startswith("#"):
+            ch_msgs = self._channel_msg_counts.get(current_channel, 0)
+            lines.append(f" {ch_msgs} in {current_channel}")
+
+        avg_ai = sum(self._ai_scores_in_window) / len(self._ai_scores_in_window) if self._ai_scores_in_window else 0
+        lines.append(f" AI avg: {avg_ai:.0f}%")
+
+        if self._sentiment_samples:
+            avg_sent = sum(self._sentiment_samples) / len(self._sentiment_samples)
+            sent_label = "+" if avg_sent > 0.2 else "-" if avg_sent < -0.2 else "~"
+            lines.append(f" mood: {sent_label}{abs(avg_sent):.2f}")
+
+        peak_hour = max(range(24), key=lambda h: self._hourly_activity[h])
+        if self._hourly_activity[peak_hour] > 0:
+            lines.append(f" peak: {peak_hour:02d}:00")
+
+        self._cached_lines = lines
+        self._last_compute = now
+        return lines
+
+    def _compute_rate(self, window_seconds: int) -> float:
+        now = time.time()
+        cutoff = now - window_seconds
+        count = sum(1 for t in self._msg_timestamps if t >= cutoff)
+        return count / (window_seconds / 60.0)
+
+
+# =========================
 # AICalibrationManager
 # =========================
 
@@ -8929,6 +10112,14 @@ class ScoringEngine:
         self.fact_checker = RealtimeFactChecker()
         self.research_agent = AutonomousResearchAgent()
         self.conversational_agent = ConversationalAgent()
+        self.role_inference = RoleInference()
+        self.debate_analyzer = DebateAnalyzer()
+        self.echo_chamber = EchoChamberDetector()
+        self.achievements = AchievementBadges()
+        self.sarcasm = SarcasmDetector()
+        self.emotion_arc = EmotionArc()
+        # Real-time stats panel
+        self.stats = RealtimeStats()
 
     def _load_fingerprints(self) -> None:
         """Load persisted bot fingerprints from disk."""
@@ -12468,12 +13659,12 @@ class TUI:
         self.userlist_width = 30
         self._show_userlist = True
 
-        try:
-            self.chat_win  = curses.newwin(self.chat_height, max(1, self.width - self.userlist_width), 0, 0)
-            self.user_win  = curses.newwin(self.chat_height, self.userlist_width, 0, max(0, self.width - self.userlist_width))
-            self.input_win = curses.newwin(4, max(1, self.width), max(0, self.height - 4), 0)
-        except curses.error as e:
-            raise SystemExit(f"Terminal too small to initialise windows: {e}")
+        # Real-time stats panel
+        self._show_stats_panel = False
+        self._stats_width = 22
+        self._stats_win: Optional[Any] = None
+
+        self._create_windows()
 
         # Multi-server state: primary server is client passed to __init__
         self._primary_server_id: str = client.server_id
@@ -12635,6 +13826,7 @@ class TUI:
         self._chat_dirty    = True
         self._userlist_dirty = True
         self._input_dirty   = True
+        self._stats_dirty   = True
 
         # Cached window dimensions (updated only on resize)
         # Compute _tw from the logical expected width, not getmaxyx(), so that a
@@ -13588,13 +14780,29 @@ class TUI:
             self.window_by_name["*status*"].add_line(
                 f"Theme → {name} ({self.current_theme}/{len(THEMES)})  {theme_list}")
 
+    def _create_windows(self) -> None:
+        """Create all subwindows including the optional stats panel."""
+        try:
+            self.chat_win  = curses.newwin(self.chat_height, max(1, self.width - self.userlist_width), 0, 0)
+            self.user_win  = curses.newwin(self.chat_height, self.userlist_width, 0, max(0, self.width - self.userlist_width))
+            self.input_win = curses.newwin(4, max(1, self.width), max(0, self.height - 4), 0)
+            if self._show_stats_panel:
+                stats_x = self.width - self.userlist_width - self._stats_width
+                self._stats_win = curses.newwin(self.chat_height, self._stats_width, 0, max(0, stats_x))
+            else:
+                self._stats_win = None
+        except curses.error as e:
+            raise SystemExit(f"Terminal too small to initialise windows: {e}")
+
     def _resize_windows(self) -> None:
         """Resize/reposition subwindows and refresh cached dimensions."""
+        stats_offset = self._stats_width if self._show_stats_panel else 0
         if self._show_userlist:
-            chat_w = max(1, self.width - self.userlist_width)
+            chat_w = max(1, self.width - self.userlist_width - stats_offset)
         else:
-            chat_w = max(1, self.width)
+            chat_w = max(1, self.width - stats_offset)
         user_x = self.width - self.userlist_width
+        stats_x = user_x - self._stats_width
         try:
             self.chat_win.resize(self.chat_height, chat_w)
         except curses.error:
@@ -13604,19 +14812,22 @@ class TUI:
             self.user_win.mvwin(0, user_x)
         except curses.error:
             pass
+        if self._show_stats_panel and self._stats_win:
+            try:
+                self._stats_win.resize(self.chat_height, self._stats_width)
+                self._stats_win.mvwin(0, max(0, stats_x))
+            except curses.error:
+                pass
         try:
             self.input_win.resize(4, self.width)
             self.input_win.mvwin(self.height - 4, 0)
         except curses.error:
             pass
-        # Refresh cached dimension values and force full repaint.
-        # Use the expected logical width (not getmaxyx) so a silently-failed
-        # resize can't leave _tw pointing at the old oversized chat window.
         self._tw             = max(1, chat_w - 1)
         self._uw             = max(1, self.userlist_width - 2)
         self._input_w        = max(1, self.input_win.getmaxyx()[1] - 4)
         self._content_height = max(1, self.chat_height - 1)
-        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
 
     def _render_irc_line(self, row: int, line: str, base_attr: int, tw: int) -> None:
         """Write *line* to chat_win at *row*, applying IRC inline formatting.
@@ -13824,6 +15035,64 @@ class TUI:
                         self.user_win.addstr(i + 1, 1, line[:uw], attr_normal)
                 except curses.error:
                     break
+
+    def _draw_stats_panel(self) -> None:
+        if not self._show_stats_panel or self._stats_win is None:
+            return
+        sw = self._stats_width
+        self._stats_win.erase()
+        self._stats_win.border()
+
+        client = self._active_client()
+        if not hasattr(client, 'scoring') or not hasattr(client.scoring, 'stats'):
+            return
+        cur_win = self.get_current_window()
+        ch = None
+        if cur_win.is_channel and cur_win.name in self.channel_users:
+            ch = cur_win.name
+        elif self.current_channel and self.current_channel in self.channel_users:
+            ch = self.current_channel
+
+        total_users = len(self.channel_users.get(ch, set())) if ch else 0
+        suspect_count = len(self.channel_users.get(ch, set()) & self._suspect_nicks) if ch else 0
+        channels_joined = len([w for w in self.windows if w.is_channel])
+
+        lines = client.scoring.stats.get_panel_lines(ch, total_users, suspect_count, channels_joined)
+
+        try:
+            self._stats_win.addstr(0, 1, " Stats ".center(sw - 2)[:sw - 2], self._attr_userheader)
+        except curses.error:
+            pass
+
+        for i, line in enumerate(lines[1:], 1):
+            try:
+                self._stats_win.addstr(i, 1, line[:sw - 2], curses.A_NORMAL)
+            except curses.error:
+                break
+
+        # Mini activity bar (last 10 hours)
+        try:
+            bar_row = min(len(lines) + 1, self.chat_height - 3)
+            hourly = client.scoring.stats._hourly_activity
+            current_hour = time.localtime().tm_hour
+            bar_chars = []
+            for h in range(10):
+                idx = (current_hour - 9 + h) % 24
+                val = hourly[idx]
+                if val == 0:
+                    bar_chars.append(" ")
+                elif val < 5:
+                    bar_chars.append("▁")
+                elif val < 20:
+                    bar_chars.append("▃")
+                elif val < 50:
+                    bar_chars.append("▅")
+                else:
+                    bar_chars.append("▇")
+            bar_str = "".join(bar_chars)
+            self._stats_win.addstr(bar_row, 1, f" 10h:{bar_str}", curses.A_DIM)
+        except curses.error:
+            pass
 
     def _handle_tab_click(self, mx: int) -> None:
         """Switch to the window whose tab label was clicked."""
@@ -14070,6 +15339,11 @@ class TUI:
             self._draw_input()
             self._input_dirty = False
             refreshed.append(self.input_win)
+        if self._stats_dirty and self._show_stats_panel:
+            self._draw_stats_panel()
+            self._stats_dirty = False
+            if self._stats_win:
+                refreshed.append(self._stats_win)
 
         for w in refreshed:
             w.noutrefresh()
@@ -14434,10 +15708,48 @@ class TUI:
                 scoring.flow_predictor.record(nick, target, msg, reply_to)
                 scoring.sentiment_contagion.record(nick, target, msg)
                 scoring.bot_swarm.record(nick, target, msg, rolling_ai / 100.0)
+                # Real-time stats tracking
+                try:
+                    _sr = scoring.sentiment.analyze(msg)
+                    _sent = _sr.get("score", 0)
+                except Exception:
+                    _sent = 0
+                scoring.stats.record_message(nick, target, rolling_ai, _sent)
+                
+                # Role inference
+                is_reply = bool(reply_to) or nick.lower() in [t.lower() for t in reply_to.split(",")] if reply_to else False
+                first_seen = time.time()
+                scoring.role_inference.observe(nick, target, msg, is_reply, u_score / 100.0, first_seen, time.time())
+
+                # Debate analyzer: track exchanges between users
+                if reply_to:
+                    replied_nicks = [n.strip() for n in reply_to.split(",") if n.strip()]
+                    for rn in replied_nicks:
+                        scoring.debate_analyzer.record_message(nick, rn, target, msg, time.time())
+
+                # Echo chamber detection
+                scoring.echo_chamber.observe(nick, target, msg, u_score / 100.0)
+
+                # Achievement badges
+                replied_to_by = [n.strip() for n in reply_to.split(",") if n.strip()] if reply_to else []
+                scoring.achievements.observe(nick, target, msg, time.time(), replied_to_by)
+                new_badges = scoring.achievements.check_achievements(nick)
+                for badge in new_badges:
+                    await self.ui_queue.put(("status", f"[achievement] 🏆 {nick} earned: {badge['icon']} {badge['name']} - {badge['desc']}"))
+                
+                # Sarcasm detection
+                sarcasm_result = scoring.sarcasm.analyze(nick, msg, u_score / 100.0)
+                if sarcasm_result["is_sarcastic"]:
+                    await self.ui_queue.put(("status", f"[sarcasm] {nick} detected as sarcastic ({sarcasm_result['score']:.0%}) [{', '.join(sarcasm_result['signals'])}]"))
+                
+                # Emotion arc tracking
+                scoring.emotion_arc.analyze(nick, msg)
                 
                 # Ban evasion tracking & detection
+                client = self._active_client()
+                u_state = client.users.get(nick)
                 timing_gaps = []
-                if u_state.msg_times and len(u_state.msg_times) > 1:
+                if u_state and hasattr(u_state, 'msg_times') and u_state.msg_times and len(u_state.msg_times) > 1:
                     recent_times = list(u_state.msg_times)[-10:]
                     timing_gaps = [recent_times[i] - recent_times[i-1] for i in range(1, len(recent_times)) if recent_times[i] - recent_times[i-1] < 300]
                 scoring.ban_evasion.track_user(nick, target, msg, timing_gaps)
@@ -15186,6 +16498,17 @@ class TUI:
         h["research"]   = self._slash_research
         h["agent"]      = self._slash_agent
         h["convo"]      = self._slash_agent
+        h["roles"]      = self._slash_roles
+        h["role"]       = self._slash_roles
+        h["debate"]     = self._slash_debate
+        h["echo"]       = self._slash_echo
+        h["echamber"]   = self._slash_echo
+        h["badges"]     = self._slash_badges
+        h["badge"]      = self._slash_badges
+        h["achievements"] = self._slash_badges
+        h["sarcasm"] = self._slash_sarcasm
+        h["emotion"] = self._slash_emotion
+        h["emotions"] = self._slash_emotion
         h["stats"]      = self._slash_stats
         h["uptime"]     = self._slash_uptime
         h["ping"]       = self._slash_ping
@@ -18494,6 +19817,319 @@ class TUI:
         self._chat_dirty = True
         self.dirty = True
 
+    async def _slash_roles(self, args, extra, line):
+        """Role inference for channel users.
+
+        Usage:
+          /roles [channel]  — show inferred roles for all users
+          /roles <nick>     — show detailed role breakdown for a nick
+        """
+        client = self._active_client()
+        inference = client.scoring.role_inference
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if parts and not parts[0].startswith("#"):
+            nick = parts[0]
+            result = inference.get_role(nick)
+            if result:
+                sw.add_line(f"=== Role Analysis: {nick} ===")
+                sw.add_line(f"  Primary: {result['primary_role']}")
+                sw.add_line(f"  Messages: {result['msg_count']}, Tenure: {result['tenure_days']} days")
+                sw.add_line("  Scores:")
+                for role, score in result["scores"].items():
+                    bar = "█" * int(score * 20)
+                    sw.add_line(f"    {role:<15} {score:.0%} {bar}")
+            else:
+                sw.add_line(f"-!- Not enough data for {nick} (need ≥3 messages)")
+        else:
+            channel = parts[0] if parts else ""
+            results = inference.infer_roles(channel)
+            ch_key = channel.lower() if channel else "*"
+            users = results.get(ch_key, [])
+            sw.add_line(f"=== Role Inference{' for ' + channel if channel else ''} ===")
+            if not users:
+                sw.add_line("  No users with enough data to infer roles.")
+            else:
+                for u in users:
+                    sw.add_line(f"  {u['nick']:<20} {u['primary_role']:<15} ({u['scores'][u['primary_role']]:.0%}) [{u['msg_count']} msgs, {u['tenure_days']}d]")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_debate(self, args, extra, line):
+        """Debate analysis between two users.
+
+        Usage:
+          /debate <nick1> <nick2> [channel]  — analyze debate quality
+          /debate list [channel]             — show active debates
+        """
+        client = self._active_client()
+        analyzer = client.scoring.debate_analyzer
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /debate <nick1> <nick2> [channel] | /debate list [channel]"))
+            return
+
+        if parts[0].lower() == "list":
+            channel = parts[1] if len(parts) > 1 else ""
+            debates = analyzer.get_active_debates(channel, limit=10)
+            sw.add_line("=== Active Debates ===")
+            if not debates:
+                sw.add_line("  No active debates detected.")
+            else:
+                for d in debates:
+                    sw.add_line(f"  {d['nick1']} vs {d['nick2']} in {d['channel']}")
+                    sw.add_line(f"    Messages: {d['msg_count']}, Duration: {d['duration_min']}min")
+                    sw.add_line(f"    Quality: {d['overall_quality']:.0%}, Status: {d['resolution']['status']}")
+        elif len(parts) >= 2:
+            nick1, nick2 = parts[0], parts[1]
+            channel = parts[2] if len(parts) > 2 else ""
+            result = analyzer.analyze(nick1, nick2, channel)
+            if result:
+                sw.add_line(f"=== Debate: {nick1} vs {nick2} ===")
+                sw.add_line(f"  Channel: {result['channel']}, Messages: {result['msg_count']}, Duration: {result['duration_min']}min")
+                sw.add_line(f"  Overall Quality: {result['overall_quality']:.0%}")
+                sw.add_line(f"  Turn Balance: {result['turn_balance']['balance']:.0%}")
+                sw.add_line(f"  Resolution: {result['resolution']['status']}")
+                for side in ["nick1_analysis", "nick2_analysis"]:
+                    nick = result["nick1" if side == "nick1_analysis" else "nick2"]
+                    a = result[side]
+                    sw.add_line(f"  --- {nick} ---")
+                    sw.add_line(f"    Quality: {a['quality_score']:.0%}")
+                    sw.add_line(f"    Fallacy Rate: {a['fallacy_rate']:.0%}")
+                    sw.add_line(f"    Evidence Rate: {a['evidence_rate']:.0%}")
+                    sw.add_line(f"    Constructive: {a['constructive_rate']:.0%}")
+                    sw.add_line(f"    Dismissive: {a['dismissive_rate']:.0%}")
+                    if a.get("fallacies"):
+                        sw.add_line(f"    Fallacies: {', '.join(f'{k}({v})' for k, v in a['fallacies'].items())}")
+            else:
+                sw.add_line(f"-!- Not enough data for debate between {nick1} and {nick2}")
+        else:
+            await self.ui_queue.put(("status", "Usage: /debate <nick1> <nick2> [channel]"))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_echo(self, args, extra, line):
+        """Echo chamber detection.
+
+        Usage:
+          /echo [channel]   — analyze echo chamber metrics for channel
+          /echo list        — analyze all channels
+        """
+        client = self._active_client()
+        detector = client.scoring.echo_chamber
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts or parts[0].startswith("#"):
+            channel = parts[0] if parts else self.get_current_window().name
+            result = detector.analyze(channel)
+            if result:
+                sw.add_line(f"=== Echo Chamber: {result['channel']} ===")
+                sw.add_line(f"  Echo Score: {result['echo_score']:.0%} [{result['severity'].upper()}]")
+                sw.add_line(f"  Users: {result['user_count']}, Messages: {result['msg_count']}")
+                m = result["metrics"]
+                sw.add_line("  Metrics:")
+                sw.add_line(f"    Sentiment Consensus:    {m['sentiment_consensus']:.0%}")
+                sw.add_line(f"    Opinion Homogeneity:    {m['opinion_homogeneity']:.0%}")
+                sw.add_line(f"    Agreement Ratio:        {m['agreement_ratio']:.0%}")
+                sw.add_line(f"    Dissent Ratio:          {m['dissent_ratio']:.0%}")
+                sw.add_line(f"    Attack Ratio:           {m['attack_ratio']:.0%}")
+                sw.add_line(f"    Dissent Suppression:    {m['dissent_suppression']:.0%}")
+                sw.add_line(f"    Cross-Channel Exposure: {m['cross_channel_exposure']:.0%}")
+                sw.add_line(f"    Topic Diversity:        {m['topic_diversity']:.0%}")
+            else:
+                sw.add_line(f"-!- Not enough data for {channel} (need ≥10 messages)")
+        elif parts[0].lower() == "list":
+            results = detector.analyze_all()
+            sw.add_line("=== Echo Chamber Analysis (All Channels) ===")
+            if not results:
+                sw.add_line("  No channels with enough data.")
+            else:
+                for r in results:
+                    sw.add_line(f"  {r['channel']:<20} {r['echo_score']:.0%} [{r['severity'].upper()}] ({r['user_count']} users, {r['msg_count']} msgs)")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_badges(self, args, extra, line):
+        """Achievement badges.
+
+        Usage:
+          /badges [nick]      — show badges for nick (or yourself)
+          /badges list        — show all badge definitions
+          /badges leaderboard — show top badge earners
+        """
+        client = self._active_client()
+        badges = client.scoring.achievements
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts:
+            my_nick = self._active_client().nick
+            earned = badges.get_badges(my_nick)
+            sw.add_line(f"=== Badges: {my_nick} ===")
+            if not earned:
+                sw.add_line("  No badges earned yet.")
+            else:
+                for b in earned:
+                    sw.add_line(f"  {b['icon']} {b['name']:<20} {b['desc']}")
+        elif parts[0].lower() == "list":
+            sw.add_line("=== All Badge Definitions ===")
+            by_category = {}
+            for bid, bdef in badges._BADGE_DEFS.items():
+                by_category.setdefault(bdef["category"], []).append(bdef)
+            for cat in sorted(by_category):
+                sw.add_line(f"  -- {cat} --")
+                for b in by_category[cat]:
+                    sw.add_line(f"    {b['icon']} {b['name']:<20} {b['desc']}")
+        elif parts[0].lower() == "leaderboard":
+            limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 20
+            leaderboard = badges.get_leaderboard(limit)
+            sw.add_line("=== Badge Leaderboard ===")
+            if not leaderboard:
+                sw.add_line("  No badges awarded yet.")
+            else:
+                for i, entry in enumerate(leaderboard, 1):
+                    sw.add_line(f"  {i}. {entry['nick']:<20} {entry['badge_count']} badges ({entry['msg_count']} msgs, {entry['channels']} channels)")
+        else:
+            nick = parts[0]
+            earned = badges.get_badges(nick)
+            sw.add_line(f"=== Badges: {nick} ===")
+            if not earned:
+                sw.add_line(f"  {nick} has no badges yet.")
+            else:
+                for b in earned:
+                    sw.add_line(f"  {b['icon']} {b['name']:<20} {b['desc']}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_sarcasm(self, args, extra, line):
+        """Sarcasm detection.
+
+        Usage:
+          /sarcasm <nick>       — show sarcasm rate for nick
+          /sarcasm recent [n]   — show recent sarcastic messages
+          /sarcasm channel      — show top sarcastic users in current channel
+        """
+        client = self._active_client()
+        detector = client.scoring.sarcasm
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts:
+            my_nick = self._active_client().nick
+            result = detector.get_user_sarcasm_rate(my_nick)
+            sw.add_line(f"=== Sarcasm Rate: {my_nick} ===")
+            sw.add_line(f"  Rate: {result['sarcasm_rate']:.0%} ({result['sarcastic_count']}/{result['total_analyzed']} msgs)")
+            sw.add_line(f"  Avg Score: {result['avg_score']:.0%}")
+        elif parts[0].lower() == "recent":
+            limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 20
+            detections = detector.get_recent_detections(limit)
+            sw.add_line("=== Recent Sarcasm Detections ===")
+            if not detections:
+                sw.add_line("  No sarcastic messages detected.")
+            else:
+                for d in detections:
+                    sw.add_line(f"  [{time.strftime('%H:%M', time.localtime(d['ts']))}] {d['nick']}: {d['text'][:60]} (score: {d['score']:.0%}) [{', '.join(d['signals'])}]")
+        elif parts[0].lower() == "channel":
+            win = self.get_current_window()
+            channel = win.name if win else ""
+            sw.add_line(f"=== Top Sarcastic Users in {channel} ===")
+            users_in_channel = self.channel_users.get(channel, set())
+            sarcasm_rates = []
+            for nick in users_in_channel:
+                result = detector.get_user_sarcasm_rate(nick)
+                if result["total_analyzed"] >= 5:
+                    sarcasm_rates.append(result)
+            sarcasm_rates.sort(key=lambda x: -x["sarcasm_rate"])
+            if not sarcasm_rates:
+                sw.add_line("  No users with enough data.")
+            else:
+                for i, r in enumerate(sarcasm_rates[:10], 1):
+                    sw.add_line(f"  {i}. {r['nick']:<20} {r['sarcasm_rate']:.0%} ({r['sarcastic_count']}/{r['total_analyzed']})")
+        else:
+            nick = parts[0]
+            result = detector.get_user_sarcasm_rate(nick)
+            sw.add_line(f"=== Sarcasm Rate: {nick} ===")
+            sw.add_line(f"  Rate: {result['sarcasm_rate']:.0%} ({result['sarcastic_count']}/{result['total_analyzed']} msgs)")
+            sw.add_line(f"  Avg Score: {result['avg_score']:.0%}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_emotion(self, args, extra, line):
+        """Emotion arc tracking.
+
+        Usage:
+          /emotion <nick> [window]        — show emotion timeline for nick
+          /emotion compare <n1> <n2>      — compare emotional alignment between two users
+          /emotion summary <nick>         — show emotion distribution and volatility
+        """
+        client = self._active_client()
+        tracker = client.scoring.emotion_arc
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts:
+            my_nick = self._active_client().nick
+            arc = tracker.get_arc(my_nick)
+            if not arc["arc"]:
+                sw.add_line(f"-!- No emotion data for {my_nick}")
+                return
+            self._display_emotion_summary(sw, arc)
+        elif parts[0].lower() == "compare" and len(parts) >= 3:
+            comparison = tracker.compare_arcs(parts[1], parts[2])
+            if "error" in comparison:
+                sw.add_line(f"-!- {comparison['error']}")
+            else:
+                sw.add_line(f"=== Emotional Comparison: {comparison['nick1']} vs {comparison['nick2']} ===")
+                sw.add_line(f"  Alignment: {comparison['alignment']:.0%}")
+                sw.add_line(f"  {comparison['nick1']} dominant: {comparison['nick1_dominant']} (volatility: {comparison['nick1_volatility']:.0%})")
+                sw.add_line(f"  {comparison['nick2']} dominant: {comparison['nick2_dominant']} (volatility: {comparison['nick2_volatility']:.0%})")
+        elif parts[0].lower() == "summary" and len(parts) >= 2:
+            arc = tracker.get_arc(parts[1])
+            if not arc["arc"]:
+                sw.add_line(f"-!- No emotion data for {parts[1]}")
+                return
+            self._display_emotion_summary(sw, arc)
+        else:
+            nick = parts[0]
+            window = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 50
+            arc = tracker.get_arc(nick, window)
+            if not arc["arc"]:
+                sw.add_line(f"-!- No emotion data for {nick}")
+                return
+            self._display_emotion_summary(sw, arc)
+            # Show recent arc
+            sw.add_line("  Recent Arc:")
+            arc_entries = arc["arc"][-20:]
+            arc_str = ""
+            for entry in arc_entries:
+                emoji = {"joy": "😊", "anger": "😠", "sadness": "😢", "fear": "😨", "surprise": "😲", "disgust": "🤢", "neutral": "😐"}.get(entry["dominant"], "•")
+                arc_str += emoji
+            sw.add_line(f"    {arc_str}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    def _display_emotion_summary(self, sw, arc):
+        sw.add_line(f"=== Emotion Arc: {arc['nick']} ===")
+        summary = arc["summary"]
+        sw.add_line(f"  Messages: {summary['total_messages']}, Volatility: {summary['volatility']:.0%}")
+        sw.add_line(f"  Dominant Emotion: {summary['most_common_emotion']}")
+        sw.add_line("  Distribution:")
+        for emotion, pct in sorted(summary["emotion_distribution"].items(), key=lambda x: -x[1]):
+            bar = "█" * int(pct * 30)
+            sw.add_line(f"    {emotion:<12} {pct:.0%} {bar}")
+        if summary.get("top_transitions"):
+            sw.add_line("  Top Transitions:")
+            for trans, count in summary["top_transitions"].items():
+                sw.add_line(f"    {trans}: {count}")
+        if summary.get("dominant_by_period"):
+            sw.add_line("  By Time Period:")
+            for period, emotion in summary["dominant_by_period"].items():
+                sw.add_line(f"    {period:<20} {emotion}")
+
     async def _slash_factcheck(self, args, extra, line):
         """Real-time fact checking.
 
@@ -20292,7 +21928,7 @@ class TUI:
             await self.ui_queue.put(("status", f"Auto-join: removed {chan}"))
 
     async def _slash_commands(self, args, extra, line):
-        sw = self.window_by_name["*status*"]
+        sw = self._status_win()
         _C = lambda t: sw.add_line(t)
         _H = lambda title: _C(f"  ── {title} " + "─" * max(0, 38 - len(title)))
         _E = lambda c, d: _C(f"  {c:<34} {d}")
@@ -20409,6 +22045,12 @@ class TUI:
         _E("/research enable|status|recent",   "Autonomous research agent: identifies knowledge gaps")
         _E("/agent on|off|personality|nick|rate","Conversational agent: LLM-powered natural participant")
         _E("/banevasion track|check|list|matches","Ban evasion detection: catch banned users returning")
+        _E("/roles [nick|channel]",            "Role inference: classify users by behavior patterns")
+        _E("/debate <n1> <n2> [channel]",      "Debate analyzer: score argument quality and fallacies")
+        _E("/echo [channel|list]",             "Echo chamber detector: measure opinion homogeneity")
+        _E("/badges [nick|list|leaderboard]",  "Achievement badges: track user accomplishments")
+        _E("/sarcasm <nick|recent|channel>",   "Sarcasm detector: sentiment-text mismatch analysis")
+        _E("/emotion <nick|compare|summary>",  "Emotion arc: track emotional journey over time")
         _C("")
         _H("Automation & Integration")
         _E("/trigger add|list|remove",         "Auto-respond to patterns with custom actions")
@@ -20545,6 +22187,16 @@ class TUI:
             "  /aitoggle  enable/disable scoring    /logtoggle  toggle log",
             "  /aicalibrate  inspect/adjust detection calibration from feedback",
             "  /aivai  detect AI-vs-AI pairs  /saicorr  sentiment-AI correlation",
+            "  /biometrics  typing cadence  /llmfp  LLM fingerprinting",
+            "  /deepfake  relay detection  /astroturf  coordinated campaigns",
+            "  /personality <nick>  Big Five traits  /predict  reply suggestions",
+            "  /stance <nick>  topic positions  /flow  conversation prediction",
+            "  /contagion  sentiment spread  /swarm  bot swarm detection",
+            "  /factcheck  claim verification  /research  knowledge gaps",
+            "  /agent  LLM chat participant  /banevasion  catch banned users",
+            "  /roles  user role inference  /debate  argument quality analysis",
+            "  /echo  echo chamber detection  /badges  achievement tracking",
+            "  /sarcasm  sentiment-text mismatch  /emotion  emotional journey",
             "── AI  (Claude / OpenAI) ─────────────────────────────────",
             "  /askai [model] <question>  (answer in dashboard)",
             "  /summarize [n] [model]  /brief [chan]  unread channel summary",
@@ -20589,7 +22241,7 @@ class TUI:
             "  /script load <path>  load .py/.lua    /script list  loaded",
             "  /script unload <name>    /script reload  all hot-reload",
         ]:
-            self.window_by_name["*status*"].add_line(l)
+            self._status_win().add_line(l)
         self.current_window_index = 0
         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
@@ -22194,6 +23846,20 @@ class TUI:
             self._show_userlist = not self._show_userlist
             self._resize_windows()
             self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 19:   # Ctrl+S — toggle stats panel
+            self._show_stats_panel = not self._show_stats_panel
+            if self._show_stats_panel:
+                stats_x = self.width - self.userlist_width - self._stats_width
+                try:
+                    self._stats_win = curses.newwin(self.chat_height, self._stats_width, 0, max(0, stats_x))
+                except curses.error:
+                    self._stats_win = None
+            else:
+                self._stats_win = None
+            self._resize_windows()
+            self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
             self.dirty = True
 
         elif ch == 7:    # Ctrl+G — go to window by number
