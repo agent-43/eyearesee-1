@@ -14272,9 +14272,10 @@ class TUI:
 
                 # Conversational agent: observe and respond
                 if target.startswith("#"):
+                    ca = scoring.conversational_agent
                     is_mention = bool(mention) or (
-                        agent._nick and re.search(r'\b' + re.escape(agent._nick) + r'\b', msg, re.IGNORECASE))
-                    agent_response = scoring.conversational_agent.observe(nick, target, msg, is_mention)
+                        ca._nick and re.search(r'\b' + re.escape(ca._nick) + r'\b', msg, re.IGNORECASE))
+                    agent_response = ca.observe(nick, target, msg, is_mention)
                     if agent_response:
                         client = self._active_client()
                         client.cmd_msg(target, agent_response)
