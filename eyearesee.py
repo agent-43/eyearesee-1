@@ -1339,6 +1339,180 @@ class BotSwarmDetector:
 
 
 # =========================
+# Ban Evasion Detector
+# =========================
+
+class BanEvasionDetector:
+    """Detects banned users returning with new nicks using biometric and linguistic fingerprints.
+
+    Tracks:
+      • Vocabulary overlap (Jaccard similarity)
+      • N-gram patterns (bigram/trigram similarity)
+      • Timing regularity (inter-message gap distribution)
+      • Channel affinity (shared channels, join times)
+      • Behavioral markers (message length, punctuation habits)
+    
+    Provides real-time alerts when a new nick strongly matches a banned profile.
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "ban_evasion.json")
+    _EVASION_THRESHOLD = 0.65
+
+    def __init__(self):
+        self._banned_profiles: Dict[str, Dict] = {}
+        self._user_stats: Dict[str, Dict] = {}
+        self._detected_matches: List[Dict] = []
+        self._last_save: float = 0.0
+        self.load()
+
+    def track_user(self, nick: str, channel: str, text: str, timing_gaps: List[float]) -> None:
+        nl = nick.lower()
+        stats = self._user_stats.setdefault(nl, {
+            "channels": set(), "vocab": set(), "bigrams": Counter(),
+            "timing_gaps": deque(maxlen=100), "msg_count": 0,
+            "total_chars": 0, "punct_count": 0, "first_seen": time.time(),
+        })
+        stats["channels"].add(channel.lower())
+        stats["msg_count"] += 1
+        stats["total_chars"] += len(text)
+        stats["punct_count"] += sum(1 for c in text if c in ".,;:!?")
+
+        words = text.lower().split()
+        stats["vocab"].update(w.strip(".,;:!?\"'()[]") for w in words if len(w) > 2)
+        for i in range(len(words) - 1):
+            stats["bigrams"][(words[i], words[i + 1])] += 1
+
+        stats["timing_gaps"].extend(timing_gaps)
+
+    def snapshot_banned(self, nick: str, reason: str = "") -> Optional[Dict]:
+        nl = nick.lower()
+        stats = self._user_stats.get(nl)
+        if not stats or stats["msg_count"] < 3:
+            return None
+
+        profile = {
+            "nick": nl, "reason": reason, "banned_at": time.time(),
+            "channels": set(stats["channels"]), "vocab": set(stats["vocab"]),
+            "bigrams": dict(stats["bigrams"].most_common(500)),
+            "timing_mean": sum(stats["timing_gaps"]) / max(len(stats["timing_gaps"]), 1),
+            "timing_std": (sum((g - sum(stats["timing_gaps"])/len(stats["timing_gaps"]))**2 for g in stats["timing_gaps"]) / max(len(stats["timing_gaps"]), 1))**0.5,
+            "avg_msg_len": stats["total_chars"] / max(stats["msg_count"], 1),
+            "punct_ratio": stats["punct_count"] / max(stats["total_chars"], 1),
+            "msg_count": stats["msg_count"],
+        }
+        self._banned_profiles[nl] = profile
+        self._maybe_save()
+        return profile
+
+    def check_evasion(self, nick: str) -> Optional[Dict]:
+        nl = nick.lower()
+        stats = self._user_stats.get(nl)
+        if not stats or stats["msg_count"] < 3:
+            return None
+
+        best_match = None
+        best_score = 0.0
+
+        for b_nick, b_profile in self._banned_profiles.items():
+            if b_nick == nl:
+                continue
+
+            # 1. Vocabulary Overlap (Jaccard)
+            vocab_sim = len(stats["vocab"] & b_profile["vocab"]) / max(len(stats["vocab"] | b_profile["vocab"]), 1)
+
+            # 2. Bigram Overlap
+            user_bigrams = Counter(stats["bigrams"])
+            banned_bigrams = Counter(b_profile["bigrams"])
+            overlap = sum((user_bigrams & banned_bigrams).values())
+            total = sum(user_bigrams.values())
+            bigram_sim = overlap / max(total, 1)
+
+            # 3. Timing Similarity
+            if stats["timing_gaps"] and b_profile["timing_mean"] > 0:
+                u_mean = sum(stats["timing_gaps"]) / len(stats["timing_gaps"])
+                u_std = (sum((g - u_mean)**2 for g in stats["timing_gaps"]) / len(stats["timing_gaps"]))**0.5
+                mean_diff = abs(u_mean - b_profile["timing_mean"]) / max(b_profile["timing_mean"], 1)
+                std_diff = abs(u_std - b_profile["timing_std"]) / max(b_profile["timing_std"], 1)
+                timing_sim = max(0, 1.0 - (mean_diff + std_diff) / 2)
+            else:
+                timing_sim = 0.0
+
+            # 4. Channel Affinity
+            chan_sim = len(stats["channels"] & b_profile["channels"]) / max(len(stats["channels"] | b_profile["channels"]), 1)
+
+            # 5. Behavioral Similarity
+            len_diff = abs(stats["total_chars"]/max(stats["msg_count"],1) - b_profile["avg_msg_len"]) / max(b_profile["avg_msg_len"], 1)
+            punct_diff = abs(stats["punct_count"]/max(stats["total_chars"],1) - b_profile["punct_ratio"])
+            behavior_sim = max(0, 1.0 - (len_diff + punct_diff) / 2)
+
+            # Weighted Score
+            score = (vocab_sim * 0.30 + bigram_sim * 0.25 + timing_sim * 0.20 + chan_sim * 0.15 + behavior_sim * 0.10)
+
+            if score > best_score and score >= self._EVASION_THRESHOLD:
+                best_score = score
+                best_match = {
+                    "suspect": nick, "banned_nick": b_nick,
+                    "score": round(score, 3), "reason": b_profile.get("reason", ""),
+                    "details": {
+                        "vocab": round(vocab_sim, 3), "bigram": round(bigram_sim, 3),
+                        "timing": round(timing_sim, 3), "channel": round(chan_sim, 3), "behavior": round(behavior_sim, 3)
+                    },
+                    "ts": time.time(),
+                }
+
+        if best_match:
+            self._detected_matches.append(best_match)
+            if len(self._detected_matches) > 50:
+                self._detected_matches.pop(0)
+            return best_match
+        return None
+
+    def list_banned(self) -> List[Dict]:
+        return [{"nick": k, **v} for k, v in self._banned_profiles.items()]
+
+    def remove_banned(self, nick: str) -> bool:
+        nl = nick.lower()
+        if nl in self._banned_profiles:
+            del self._banned_profiles[nl]
+            self._maybe_save()
+            return True
+        return False
+
+    def get_matches(self, limit: int = 10) -> List[Dict]:
+        return self._detected_matches[-limit:]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "banned_profiles": {k: {**v, "channels": list(v["channels"]), "vocab": list(v["vocab"])} for k, v in self._banned_profiles.items()},
+                "matches": self._detected_matches[-20:],
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in data.get("banned_profiles", {}).items():
+                v["channels"] = set(v.get("channels", []))
+                v["vocab"] = set(v.get("vocab", []))
+                self._banned_profiles[k] = v
+            self._detected_matches = data.get("matches", [])
+        except Exception:
+            pass
+
+
+# =========================
 # Real-time Fact Checker
 # =========================
 
@@ -8751,6 +8925,7 @@ class ScoringEngine:
         self.flow_predictor = ConversationFlowPredictor()
         self.sentiment_contagion = SentimentContagionMap()
         self.bot_swarm = BotSwarmDetector()
+        self.ban_evasion = BanEvasionDetector()
         self.fact_checker = RealtimeFactChecker()
         self.research_agent = AutonomousResearchAgent()
         self.conversational_agent = ConversationalAgent()
@@ -14259,6 +14434,16 @@ class TUI:
                 scoring.flow_predictor.record(nick, target, msg, reply_to)
                 scoring.sentiment_contagion.record(nick, target, msg)
                 scoring.bot_swarm.record(nick, target, msg, rolling_ai / 100.0)
+                
+                # Ban evasion tracking & detection
+                timing_gaps = []
+                if u_state.msg_times and len(u_state.msg_times) > 1:
+                    recent_times = list(u_state.msg_times)[-10:]
+                    timing_gaps = [recent_times[i] - recent_times[i-1] for i in range(1, len(recent_times)) if recent_times[i] - recent_times[i-1] < 300]
+                scoring.ban_evasion.track_user(nick, target, msg, timing_gaps)
+                evasion_match = scoring.ban_evasion.check_evasion(nick)
+                if evasion_match:
+                    await self.ui_queue.put(("status", f"[ban-evasion] ⚠️ {nick} matches banned user {evasion_match['banned_nick']} (score: {evasion_match['score']:.0%})"))
                 research_results = scoring.research_agent.observe(nick, target, msg)
                 for rr in research_results:
                     if rr.get("summary"):
@@ -14995,6 +15180,8 @@ class TUI:
         h["flow"]       = self._slash_flow
         h["contagion"]  = self._slash_contagion
         h["swarm"]      = self._slash_swarm
+        h["banevasion"] = self._slash_banevasion
+        h["banev"]      = self._slash_banevasion
         h["factcheck"]  = self._slash_factcheck
         h["research"]   = self._slash_research
         h["agent"]      = self._slash_agent
@@ -18233,6 +18420,77 @@ class TUI:
             sw.add_line("=== Bot Swarm Detector Status ===")
             sw.add_line(f"  Tracked accounts: {total_accounts}")
             sw.add_line(f"  Detected swarms: {len(client.scoring.bot_swarm._swarm_clusters)}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_banevasion(self, args, extra, line):
+        """Ban evasion detection.
+
+        Usage:
+          /banevasion track <nick> [reason]  — snapshot nick as banned
+          /banevasion check <nick>           — manually check nick against banned list
+          /banevasion list                   — show tracked banned nicks
+          /banevasion matches                — show detected evasion attempts
+          /banevasion clear <nick>           — remove nick from banned list
+        """
+        client = self._active_client()
+        detector = client.scoring.ban_evasion
+        parts = (args + " " + extra).strip().split(maxsplit=2)
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /banevasion <track|check|list|matches|clear> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "track":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /banevasion track <nick> [reason]"))
+                return
+            nick = parts[1]
+            reason = parts[2] if len(parts) > 2 else "Manually tracked"
+            profile = detector.snapshot_banned(nick, reason)
+            if profile:
+                sw.add_line(f"-!- Tracked banned user: {nick} ({reason})")
+            else:
+                sw.add_line(f"-!- Not enough data to track {nick} (need ≥3 messages)")
+        elif action == "check":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /banevasion check <nick>"))
+                return
+            match = detector.check_evasion(parts[1])
+            if match:
+                sw.add_line(f"=== Ban Evasion Alert ===")
+                sw.add_line(f"  Suspect: {match['suspect']}")
+                sw.add_line(f"  Matches: {match['banned_nick']} (score: {match['score']:.0%})")
+                sw.add_line(f"  Reason: {match['reason']}")
+                sw.add_line(f"  Details: vocab={match['details']['vocab']}, bigram={match['details']['bigram']}, timing={match['details']['timing']}")
+            else:
+                sw.add_line(f"-!- No evasion match for {parts[1]}")
+        elif action == "list":
+            banned = detector.list_banned()
+            sw.add_line("=== Tracked Banned Users ===")
+            if not banned:
+                sw.add_line("  No banned users tracked.")
+            else:
+                for b in banned:
+                    sw.add_line(f"  {b['nick']} (banned: {time.strftime('%Y-%m-%d', time.localtime(b['banned_at']))}) - {b['reason']}")
+        elif action == "matches":
+            matches = detector.get_matches(limit=10)
+            sw.add_line("=== Detected Evasion Attempts ===")
+            if not matches:
+                sw.add_line("  No evasion attempts detected.")
+            else:
+                for m in matches:
+                    sw.add_line(f"  {m['suspect']} → {m['banned_nick']} ({m['score']:.0%}) [{m['reason']}]")
+        elif action == "clear":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /banevasion clear <nick>"))
+                return
+            if detector.remove_banned(parts[1]):
+                sw.add_line(f"-!- Removed {parts[1]} from banned list")
+            else:
+                sw.add_line(f"-!- {parts[1]} not found in banned list")
         self._chat_dirty = True
         self.dirty = True
 
