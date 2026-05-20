@@ -7912,8 +7912,6 @@ class AsyncDNSResolver:
         try:
             results = await fut
             ttl = self._DEFAULT_TTL
-            if results:
-                ttl = max(self._DEFAULT_TTL, min(r[4][0] if isinstance(r[4], tuple) else 0 for r in results[:3]) or self._DEFAULT_TTL)
             self._cache[cache_key] = {
                 "results": results,
                 "expires": now + ttl,
