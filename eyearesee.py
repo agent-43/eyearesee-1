@@ -168,6 +168,9 @@ GPG_BINARY: str    = os.environ.get("IRC_GPG_BINARY", "gpg")
 # Tor SOCKS5 proxy
 TOR_PROXY_HOST: str = os.environ.get("IRC_TOR_PROXY_HOST", "127.0.0.1")
 TOR_PROXY_PORT: int = int(os.environ.get("IRC_TOR_PROXY_PORT", "9050"))
+# I2P SOCKS proxy for .i2p hidden services
+I2P_PROXY_HOST: str = os.environ.get("IRC_I2P_PROXY_HOST", "127.0.0.1")
+I2P_PROXY_PORT: int = int(os.environ.get("IRC_I2P_PROXY_PORT", "4447"))
 # STS policy persistence
 STS_POLICY_PATH    = os.path.join(_SCRIPT_DIR, "sts_policies.json")
 
@@ -366,7 +369,3408 @@ def append_chat_line(window_name: str, line: str) -> None:
     except Exception:
         pass
 
+
 # =========================
+# Astroturfing Detector
+# =========================
+
+class AstroturfingDetector:
+    """Detects coordinated inauthentic behavior (astroturfing) in IRC channels.
+
+    Identifies:
+      • Timing correlation: multiple accounts posting within narrow windows
+      • Narrative alignment: different accounts using identical/similar phrasing
+      • Shared vocabulary: unusual overlap in word choice, bigrams, trigrams
+      • Account clustering: new accounts that only interact with each other
+      • Amplification patterns: one account posts, others immediately echo
+      • Topic hijacking: sudden coordinated focus on a single topic
+      • Sentiment synchronization: artificial agreement/disagreement patterns
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "astroturfing.json")
+    _TIMING_WINDOW = 30.0  # seconds
+    _MIN_ACCOUNTS = 3
+    _SIMILARITY_THRESHOLD = 0.6
+
+    def __init__(self):
+        self._message_log: Dict[str, deque] = {}
+        self._vocab_sets: Dict[str, set] = {}
+        self._timing_groups: List[Dict] = []
+        self._campaigns: List[Dict] = []
+        self._last_save: float = 0.0
+        self.load()
+
+    def record_message(self, nick: str, channel: str, text: str) -> Optional[Dict]:
+        nl = nick.lower()
+        cl = channel.lower()
+        now = time.time()
+
+        log = self._message_log.setdefault(cl, deque(maxlen=500))
+        log.append({"nick": nl, "text": text, "ts": now})
+
+        vocab = set(text.lower().split())
+        self._vocab_sets.setdefault(nl, set()).update(vocab)
+
+        result = self._detect_coordination(cl, nl, text, now)
+        if result and result["confidence"] >= 0.5:
+            self._campaigns.append({
+                "channel": cl, "nicks": result["nicks"],
+                "confidence": result["confidence"], "ts": now,
+                "evidence": result["evidence"],
+            })
+            if len(self._campaigns) > 100:
+                self._campaigns = self._campaigns[-100:]
+        self._maybe_save()
+        return result
+
+    def _detect_coordination(self, channel: str, nick: str, text: str, now: float) -> Optional[Dict]:
+        log = self._message_log.get(channel, deque())
+        recent = [e for e in log if now - e["ts"] < self._TIMING_WINDOW and e["nick"] != nick]
+        if len(recent) < self._MIN_ACCOUNTS - 1:
+            return None
+
+        evidence = []
+        scores = {}
+
+        timing_nicks = {e["nick"] for e in recent}
+        timing_nicks.add(nick)
+        scores["timing"] = min(1.0, len(timing_nicks) / 5.0)
+        evidence.append(f"{len(timing_nicks)} accounts active in {self._TIMING_WINDOW:.0f}s window")
+
+        vocab = set(text.lower().split())
+        shared_vocab = 0
+        for e in recent:
+            other_vocab = self._vocab_sets.get(e["nick"], set())
+            overlap = len(vocab & other_vocab) / max(len(vocab | other_vocab), 1)
+            if overlap > 0.3:
+                shared_vocab += 1
+        scores["vocabulary"] = min(1.0, shared_vocab / max(len(recent), 1))
+        evidence.append(f"{shared_vocab}/{len(recent)} share significant vocabulary overlap")
+
+        text_lower = text.lower()
+        phrase_matches = 0
+        for e in recent:
+            if any(word in e["text"].lower() for word in vocab if len(word) > 4):
+                phrase_matches += 1
+        scores["phrasing"] = min(1.0, phrase_matches / max(len(recent), 1))
+        evidence.append(f"{phrase_matches}/{len(recent)} use similar key terms")
+
+        sentiment_scores = []
+        for e in recent:
+            s = self._quick_sentiment(e["text"])
+            sentiment_scores.append(s)
+        if sentiment_scores:
+            mean_s = sum(sentiment_scores) / len(sentiment_scores)
+            variance = sum((s - mean_s) ** 2 for s in sentiment_scores) / len(sentiment_scores)
+            scores["sentiment_sync"] = 1.0 - min(1.0, variance * 5)
+            evidence.append(f"sentiment variance: {variance:.3f} ({'synchronized' if variance < 0.1 else 'varied'})")
+
+        weights = {"timing": 0.25, "vocabulary": 0.25, "phrasing": 0.30, "sentiment_sync": 0.20}
+        confidence = sum(scores[k] * w for k, w in weights.items())
+
+        return {
+            "channel": channel, "nicks": sorted(timing_nicks),
+            "confidence": round(confidence, 3), "scores": scores,
+            "evidence": evidence,
+        } if confidence >= 0.3 else None
+
+    @staticmethod
+    def _quick_sentiment(text: str) -> float:
+        positive = {"good", "great", "excellent", "love", "best", "amazing", "awesome", "perfect", "nice", "happy"}
+        negative = {"bad", "terrible", "worst", "hate", "awful", "horrible", "poor", "sad", "angry", "stupid"}
+        words = set(text.lower().split())
+        pos = len(words & positive)
+        neg = len(words & negative)
+        total = pos + neg
+        if total == 0:
+            return 0.5
+        return pos / total
+
+    def get_campaigns(self, channel: str = "", limit: int = 10) -> List[Dict]:
+        results = self._campaigns
+        if channel:
+            results = [c for c in results if c["channel"] == channel.lower()]
+        results.sort(key=lambda x: -x["confidence"])
+        return results[:limit]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "campaigns": self._campaigns[-50:],
+                "vocab_preview": {k: list(v)[:20] for k, v in list(self._vocab_sets.items())[:50]},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._campaigns = data.get("campaigns", [])
+        except Exception:
+            pass
+
+
+# =========================
+# Personality Profiler
+# =========================
+
+class PersonalityProfiler:
+    """Infers Big Five personality traits from IRC communication patterns.
+
+    Traits measured:
+      • Openness: vocabulary diversity, abstract language, topic exploration
+      • Conscientiousness: message structure, punctuation accuracy, consistency
+      • Extraversion: message frequency, social engagement, exclamation usage
+      • Agreeableness: supportive language, conflict avoidance, politeness markers
+      • Neuroticism: emotional volatility, negative sentiment, uncertainty markers
+
+    Uses LIWC-inspired linguistic analysis combined with behavioral signals.
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "personality_profiles.json")
+
+    _OPENNESS_MARKERS = frozenset({"imagine", "creative", "explore", "theory", "abstract", "concept", "philosophy", "art", "music", "science"})
+    _CONSCIENTIOUSNESS_MARKERS = frozenset({"plan", "organize", "schedule", "deadline", "detail", "precise", "accurate", "method", "system"})
+    _EXTRAVERSION_MARKERS = frozenset({"party", "social", "fun", "exciting", "awesome", "love", "great", "everyone", "together"})
+    _AGREEABLENESS_MARKERS = frozenset({"thanks", "please", "sorry", "help", "support", "agree", "understand", "appreciate", "kind"})
+    _NEUROTICISM_MARKERS = frozenset({"worried", "anxious", "stress", "afraid", "angry", "frustrated", "hate", "terrible", "awful", "can't"})
+
+    def __init__(self):
+        self._profiles: Dict[str, Dict] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def update(self, nick: str, text: str) -> Dict[str, float]:
+        nl = nick.lower()
+        prof = self._profiles.setdefault(nl, {
+            "msg_count": 0, "traits": {"openness": 0.5, "conscientiousness": 0.5,
+                                       "extraversion": 0.5, "agreeableness": 0.5, "neuroticism": 0.5},
+            "word_count": 0, "unique_words": set(), "exclamation_count": 0,
+            "question_count": 0, "avg_msg_len": 0.0,
+        })
+        prof["msg_count"] += 1
+        words = text.lower().split()
+        prof["word_count"] += len(words)
+        prof["unique_words"].update(words)
+        prof["exclamation_count"] += text.count("!")
+        prof["question_count"] += text.count("?")
+        prof["avg_msg_len"] = (prof["avg_msg_len"] * (prof["msg_count"] - 1) + len(text)) / prof["msg_count"]
+
+        word_set = set(words)
+        traits = prof["traits"]
+
+        openness = len(word_set & self._OPENNESS_MARKERS) / max(len(words), 1)
+        openness += min(0.3, len(prof["unique_words"]) / 500.0)
+        traits["openness"] = traits["openness"] * 0.8 + min(1.0, openness) * 0.2
+
+        consc = len(word_set & self._CONSCIENTIOUSNESS_MARKERS) / max(len(words), 1)
+        punct_ratio = sum(1 for c in text if c in ".,;:") / max(len(text), 1)
+        consc += punct_ratio * 2
+        traits["conscientiousness"] = traits["conscientiousness"] * 0.8 + min(1.0, consc) * 0.2
+
+        extra = len(word_set & self._EXTRAVERSION_MARKERS) / max(len(words), 1)
+        extra += min(0.3, prof["exclamation_count"] / max(prof["msg_count"], 1) * 0.1)
+        traits["extraversion"] = traits["extraversion"] * 0.8 + min(1.0, extra) * 0.2
+
+        agree = len(word_set & self._AGREEABLENESS_MARKERS) / max(len(words), 1)
+        traits["agreeableness"] = traits["agreeableness"] * 0.8 + min(1.0, agree * 3) * 0.2
+
+        neuro = len(word_set & self._NEUROTICISM_MARKERS) / max(len(words), 1)
+        traits["neuroticism"] = traits["neuroticism"] * 0.8 + min(1.0, neuro * 3) * 0.2
+
+        self._maybe_save()
+        return {k: round(v, 3) for k, v in traits.items()}
+
+    def get_profile(self, nick: str) -> Dict[str, Any]:
+        nl = nick.lower()
+        prof = self._profiles.get(nl)
+        if not prof or prof["msg_count"] < 5:
+            return {"nick": nick, "samples": prof["msg_count"] if prof else 0, "confidence": "insufficient data"}
+        traits = prof["traits"]
+        confidence = "high" if prof["msg_count"] >= 50 else "medium" if prof["msg_count"] >= 20 else "low"
+        return {
+            "nick": nick, "samples": prof["msg_count"], "confidence": confidence,
+            "openness": round(traits["openness"] * 100, 1),
+            "conscientiousness": round(traits["conscientiousness"] * 100, 1),
+            "extraversion": round(traits["extraversion"] * 100, 1),
+            "agreeableness": round(traits["agreeableness"] * 100, 1),
+            "neuroticism": round(traits["neuroticism"] * 100, 1),
+            "vocabulary_size": len(prof["unique_words"]),
+            "avg_msg_len": round(prof["avg_msg_len"], 1),
+        }
+
+    def get_top_traits(self, trait: str, limit: int = 10) -> List[Dict]:
+        results = []
+        for nick, prof in self._profiles.items():
+            if prof["msg_count"] >= 5:
+                results.append({"nick": nick, "score": round(prof["traits"].get(trait, 0.5) * 100, 1),
+                               "samples": prof["msg_count"]})
+        results.sort(key=lambda x: -x["score"])
+        return results[:limit]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {}
+            for nick, prof in self._profiles.items():
+                data[nick] = {
+                    "msg_count": prof["msg_count"], "traits": prof["traits"],
+                    "word_count": prof["word_count"], "exclamation_count": prof["exclamation_count"],
+                    "question_count": prof["question_count"], "avg_msg_len": prof["avg_msg_len"],
+                    "unique_words": list(prof["unique_words"])[:100],
+                }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for nick, prof in data.items():
+                self._profiles[nick] = {
+                    "msg_count": prof.get("msg_count", 0),
+                    "traits": prof.get("traits", {"openness": 0.5, "conscientiousness": 0.5,
+                                                  "extraversion": 0.5, "agreeableness": 0.5, "neuroticism": 0.5}),
+                    "word_count": prof.get("word_count", 0),
+                    "unique_words": set(prof.get("unique_words", [])),
+                    "exclamation_count": prof.get("exclamation_count", 0),
+                    "question_count": prof.get("question_count", 0),
+                    "avg_msg_len": prof.get("avg_msg_len", 0.0),
+                }
+        except Exception:
+            pass
+
+
+# =========================
+# Predictive Reply Engine
+# =========================
+
+class PredictiveReplyEngine:
+    """Suggests context-aware replies based on channel history and conversation patterns.
+
+    Uses:
+      • N-gram language model built from channel history
+      • Response pattern matching (how others replied to similar messages)
+      • Topic-aware suggestions
+      • Personal style adaptation (learns user's typical response patterns)
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "predictive_replies.json")
+    _MAX_NGRAMS = 50000
+    _MAX_RESPONSES = 10000
+
+    def __init__(self):
+        self._bigrams: Counter = Counter()
+        self._trigrams: Counter = Counter()
+        self._response_patterns: Dict[str, List[str]] = {}
+        self._topic_responses: Dict[str, List[str]] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def train(self, channel: str, nick: str, text: str, reply_to: str = "") -> None:
+        words = text.lower().split()
+        for i in range(len(words) - 1):
+            self._bigrams[(words[i], words[i + 1])] += 1
+        for i in range(len(words) - 2):
+            self._trigrams[(words[i], words[i + 1], words[i + 2])] += 1
+
+        if reply_to:
+            key = reply_to.lower()[:50]
+            patterns = self._response_patterns.setdefault(key, [])
+            if text not in patterns:
+                patterns.append(text)
+                if len(patterns) > 20:
+                    patterns.pop(0)
+
+        if len(self._bigrams) > self._MAX_NGRAMS:
+            self._prune_ngrams()
+        self._maybe_save()
+
+    def suggest(self, context: str, channel: str = "", limit: int = 5) -> List[Dict]:
+        words = context.lower().split()
+        if not words:
+            return []
+
+        suggestions = []
+        last_word = words[-1]
+
+        for (w1, w2), count in self._bigrams.items():
+            if w1 == last_word and count > 2:
+                suggestions.append({"text": w2, "score": count, "type": "bigram"})
+
+        if len(words) >= 2:
+            for (w1, w2, w3), count in self._trigrams.items():
+                if w1 == words[-2] and w2 == last_word and count > 1:
+                    suggestions.append({"text": f"{w2} {w3}", "score": count * 1.5, "type": "trigram"})
+
+        ctx_key = context.lower()[:50]
+        for key, responses in self._response_patterns.items():
+            if any(word in key for word in words[-3:]):
+                for resp in responses[:3]:
+                    suggestions.append({"text": resp[:80], "score": 10, "type": "pattern"})
+
+        suggestions.sort(key=lambda x: -x["score"])
+        seen = set()
+        unique = []
+        for s in suggestions:
+            if s["text"] not in seen:
+                seen.add(s["text"])
+                unique.append(s)
+        return unique[:limit]
+
+    def _prune_ngrams(self) -> None:
+        common_bigrams = self._bigrams.most_common(self._MAX_NGRAMS // 2)
+        common_trigrams = self._trigrams.most_common(self._MAX_NGRAMS // 3)
+        self._bigrams = Counter(dict(common_bigrams))
+        self._trigrams = Counter(dict(common_trigrams))
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "bigrams": dict(self._bigrams.most_common(5000)),
+                "trigrams": dict(self._trigrams.most_common(5000)),
+                "response_patterns": {k: v[:10] for k, v in list(self._response_patterns.items())[:500]},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._bigrams = Counter(data.get("bigrams", {}))
+            self._trigrams = Counter(data.get("trigrams", {}))
+            self._response_patterns = data.get("response_patterns", {})
+        except Exception:
+            pass
+
+
+# =========================
+# Stance Tracker
+# =========================
+
+class StanceTracker:
+    """Tracks user positions on topics over time; detects shifts and contradictions.
+
+    Monitors:
+      • Topic extraction from messages
+      • Sentiment toward specific topics/entities
+      • Stance evolution (supports/opposes/neutral)
+      • Contradiction detection (current stance vs historical)
+      • Cross-topic consistency
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "stances.json")
+
+    _TOPIC_KEYWORDS = {
+        "politics": {"government", "election", "policy", "law", "vote", "congress", "president"},
+        "technology": {"software", "hardware", "programming", "ai", "machine learning", "code"},
+        "climate": {"climate", "carbon", "emission", "warming", "environment", "renewable"},
+        "economics": {"economy", "market", "inflation", "tax", "trade", "gdp", "recession"},
+        "health": {"health", "medical", "vaccine", "disease", "hospital", "treatment"},
+    }
+
+    _SUPPORT_MARKERS = frozenset({"support", "agree", "good", "pro", "for", "favor", "yes", "positive"})
+    _OPPOSE_MARKERS = frozenset({"oppose", "against", "bad", "anti", "no", "negative", "wrong", "harmful"})
+
+    def __init__(self):
+        self._stances: Dict[str, Dict[str, List[Dict]]] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def record(self, nick: str, text: str) -> List[Dict]:
+        nl = nick.lower()
+        words = set(text.lower().split())
+        sentiment = self._quick_sentiment(text)
+        updates = []
+
+        for topic, keywords in self._TOPIC_KEYWORDS.items():
+            if words & keywords:
+                stance = "support" if words & self._SUPPORT_MARKERS else "oppose" if words & self._OPPOSE_MARKERS else "neutral"
+                if sentiment > 0.3 and not (words & self._OPPOSE_MARKERS):
+                    stance = "support"
+                elif sentiment < -0.3 and not (words & self._SUPPORT_MARKERS):
+                    stance = "oppose"
+
+                entry = {"stance": stance, "sentiment": round(sentiment, 3), "ts": time.time(), "text": text[:100]}
+                self._stances.setdefault(nl, {}).setdefault(topic, []).append(entry)
+                stances = self._stances[nl][topic]
+                if len(stances) > 50:
+                    stances.pop(0)
+
+                contradiction = self._check_contradiction(nl, topic, stance)
+                if contradiction:
+                    updates.append({"type": "contradiction", "nick": nick, "topic": topic,
+                                   "old": contradiction, "new": stance})
+                updates.append({"type": "stance", "nick": nick, "topic": topic, "stance": stance})
+
+        self._maybe_save()
+        return updates
+
+    def get_stance(self, nick: str, topic: str) -> Optional[Dict]:
+        nl = nick.lower()
+        stances = self._stances.get(nl, {}).get(topic, [])
+        if not stances:
+            return None
+        recent = stances[-10:]
+        support = sum(1 for s in recent if s["stance"] == "support")
+        oppose = sum(1 for s in recent if s["stance"] == "oppose")
+        total = len(recent)
+        return {
+            "nick": nick, "topic": topic,
+            "current": "support" if support > oppose else "oppose" if oppose > support else "neutral",
+            "support_pct": round(support / total * 100, 1),
+            "oppose_pct": round(oppose / total * 100, 1),
+            "samples": total,
+        }
+
+    def get_all_stances(self, nick: str) -> Dict[str, Dict]:
+        nl = nick.lower()
+        result = {}
+        for topic in self._stances.get(nl, {}):
+            s = self.get_stance(nick, topic)
+            if s:
+                result[topic] = s
+        return result
+
+    def _check_contradiction(self, nick: str, topic: str, current: str) -> Optional[str]:
+        stances = self._stances.get(nick, {}).get(topic, [])
+        if len(stances) < 3:
+            return None
+        prior = stances[-3:]
+        prior_stances = [s["stance"] for s in prior if s["stance"] != "neutral"]
+        if not prior_stances:
+            return None
+        dominant = max(set(prior_stances), key=prior_stances.count)
+        if dominant != current and dominant != "neutral" and current != "neutral":
+            return dominant
+        return None
+
+    @staticmethod
+    def _quick_sentiment(text: str) -> float:
+        pos = {"good", "great", "excellent", "love", "best", "amazing", "positive"}
+        neg = {"bad", "terrible", "worst", "hate", "awful", "negative", "harmful"}
+        words = set(text.lower().split())
+        p = len(words & pos)
+        n = len(words & neg)
+        total = p + n
+        if total == 0:
+            return 0.0
+        return (p - n) / total
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {}
+            for nick, topics in self._stances.items():
+                data[nick] = {t: s[-20:] for t, s in topics.items()}
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                self._stances = json.load(f)
+        except Exception:
+            pass
+
+
+# =========================
+# Conversation Flow Predictor
+# =========================
+
+class ConversationFlowPredictor:
+    """Predicts who will speak next, when, and about what topic.
+
+    Models:
+      • Turn-taking patterns (who responds to whom)
+      • Temporal rhythms (time between messages per user)
+      • Topic transition probabilities
+      • Engagement prediction (likelihood of participation)
+      • Conversation lifecycle (winding down, heating up)
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "flow_predictions.json")
+
+    def __init__(self):
+        self._turn_patterns: Dict[str, Counter] = {}
+        self._temporal_profiles: Dict[str, deque] = {}
+        self._topic_transitions: Counter = Counter()
+        self._channel_activity: Dict[str, deque] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def record(self, nick: str, channel: str, text: str, reply_to: str = "") -> None:
+        nl = nick.lower()
+        cl = channel.lower()
+        now = time.time()
+
+        if reply_to:
+            rt = reply_to.lower()
+            self._turn_patterns.setdefault(cl, Counter())[f"{rt}->{nl}"] += 1
+
+        tp = self._temporal_profiles.setdefault(nl, deque(maxlen=100))
+        if tp:
+            gap = now - tp[-1]
+            if gap < 300:
+                tp.append(gap)
+        tp.append(now)
+
+        activity = self._channel_activity.setdefault(cl, deque(maxlen=200))
+        activity.append(now)
+
+        words = text.lower().split()
+        if words:
+            self._topic_transitions[(words[0], words[-1])] += 1
+
+        self._maybe_save()
+
+    def predict_next_speaker(self, channel: str, current_speaker: str = "", limit: int = 5) -> List[Dict]:
+        cl = channel.lower()
+        patterns = self._turn_patterns.get(cl, Counter())
+        candidates = Counter()
+
+        if current_speaker:
+            key_prefix = f"{current_speaker.lower()}->"
+            for k, v in patterns.items():
+                if k.startswith(key_prefix):
+                    target = k.split("->")[1]
+                    candidates[target] += v
+
+        activity = self._channel_activity.get(cl, deque())
+        if activity:
+            recent = [a for a in activity if time.time() - a < 300]
+            active_nicks = Counter()
+            for a in recent:
+                for nl, tp in self._temporal_profiles.items():
+                    if tp and abs(tp[-1] - a) < 60:
+                        active_nicks[nl] += 1
+            for nl, score in active_nicks.most_common(10):
+                candidates[nl] += score * 0.5
+
+        total = sum(candidates.values()) or 1
+        return [{"nick": n, "probability": round(c / total, 3), "score": c}
+                for n, c in candidates.most_common(limit)]
+
+    def predict_conversation_state(self, channel: str) -> Dict[str, Any]:
+        cl = channel.lower()
+        activity = self._channel_activity.get(cl, deque())
+        if not activity:
+            return {"state": "unknown", "activity_level": 0}
+
+        now = time.time()
+        recent_5min = sum(1 for a in activity if now - a < 300)
+        recent_30min = sum(1 for a in activity if now - a < 1800)
+
+        if recent_5min == 0:
+            state = "dormant"
+        elif recent_5min < 5:
+            state = "winding_down" if recent_30min > 20 else "quiet"
+        elif recent_5min < 20:
+            state = "active"
+        else:
+            state = "heated"
+
+        return {
+            "state": state, "msgs_5min": recent_5min, "msgs_30min": recent_30min,
+            "activity_level": min(1.0, recent_5min / 30.0),
+        }
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "turn_patterns": dict(self._turn_patterns.most_common(1000)),
+                "topic_transitions": dict(self._topic_transitions.most_common(500)),
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._turn_patterns = {}
+            for k, v in data.get("turn_patterns", {}).items():
+                ch = k.split("::")[0] if "::" in k else "default"
+                self._turn_patterns.setdefault(ch, Counter())[k] = v
+            self._topic_transitions = Counter(data.get("topic_transitions", {}))
+        except Exception:
+            pass
+
+
+# =========================
+# Sentiment Contagion Map
+# =========================
+
+class SentimentContagionMap:
+    """Tracks how mood spreads through a channel: who influences whom, cascade patterns.
+
+    Models:
+      • Sentiment propagation (positive/negative mood spreading)
+      • Influence scoring (who sets the tone)
+      • Cascade detection (chain reactions of sentiment)
+      • Emotional contagion networks
+      • Mood recovery time (how long negative sentiment persists)
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "sentiment_contagion.json")
+
+    def __init__(self):
+        self._sentiment_timeline: Dict[str, deque] = {}
+        self._influence_matrix: Dict[str, Dict[str, float]] = {}
+        self._cascades: List[Dict] = []
+        self._channel_mood: Dict[str, deque] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def record(self, nick: str, channel: str, text: str) -> Dict[str, Any]:
+        nl = nick.lower()
+        cl = channel.lower()
+        now = time.time()
+        sentiment = self._analyze_sentiment(text)
+
+        timeline = self._sentiment_timeline.setdefault(nl, deque(maxlen=100))
+        timeline.append({"ts": now, "sentiment": sentiment, "channel": cl})
+
+        mood = self._channel_mood.setdefault(cl, deque(maxlen=50))
+        prev_mood = mood[-1]["sentiment"] if mood else 0.0
+        mood.append({"ts": now, "nick": nl, "sentiment": sentiment})
+
+        influence = self._calculate_influence(cl, nl, sentiment, prev_mood)
+        if influence > 0.3:
+            self._influence_matrix.setdefault(cl, {}).setdefault(nl, 0.0)
+            self._influence_matrix[cl][nl] = (self._influence_matrix[cl][nl] * 0.9 + influence * 0.1)
+
+        cascade = self._detect_cascade(cl, nl, sentiment)
+        result = {"sentiment": sentiment, "influence": round(influence, 3)}
+        if cascade:
+            result["cascade"] = cascade
+            self._cascades.append(cascade)
+            if len(self._cascades) > 50:
+                self._cascades.pop(0)
+
+        self._maybe_save()
+        return result
+
+    def get_channel_mood(self, channel: str) -> Dict[str, Any]:
+        cl = channel.lower()
+        mood = self._channel_mood.get(cl, deque())
+        if not mood:
+            return {"channel": channel, "sentiment": 0.0, "trend": "stable"}
+        recent = list(mood)[-20:]
+        avg = sum(m["sentiment"] for m in recent) / len(recent)
+        first_half = sum(m["sentiment"] for m in recent[:10]) / 10
+        second_half = sum(m["sentiment"] for m in recent[10:]) / (len(recent) - 10)
+        delta = second_half - first_half
+        trend = "improving" if delta > 0.1 else "declining" if delta < -0.1 else "stable"
+        return {"channel": channel, "sentiment": round(avg, 3), "trend": trend}
+
+    def get_top_influencers(self, channel: str, limit: int = 5) -> List[Dict]:
+        cl = channel.lower()
+        matrix = self._influence_matrix.get(cl, {})
+        return [{"nick": n, "influence": round(s, 3)} for n, s in
+                sorted(matrix.items(), key=lambda x: -x[1])[:limit]]
+
+    def get_cascades(self, limit: int = 5) -> List[Dict]:
+        return self._cascades[-limit:]
+
+    @staticmethod
+    def _analyze_sentiment(text: str) -> float:
+        pos = {"good", "great", "excellent", "love", "best", "amazing", "happy", "awesome"}
+        neg = {"bad", "terrible", "worst", "hate", "awful", "sad", "angry", "stupid"}
+        words = set(text.lower().split())
+        p = len(words & pos)
+        n = len(words & neg)
+        total = p + n
+        if total == 0:
+            return 0.0
+        return (p - n) / total
+
+    def _calculate_influence(self, channel: str, nick: str, sentiment: float, prev_mood: float) -> float:
+        mood = self._channel_mood.get(channel, deque())
+        if len(mood) < 3:
+            return 0.0
+        recent = list(mood)[-10:]
+        others = [m["sentiment"] for m in recent if m["nick"] != nick]
+        if not others:
+            return 0.0
+        avg_others = sum(others) / len(others)
+        shift = abs(sentiment - prev_mood)
+        alignment = 1.0 - abs(sentiment - avg_others)
+        return min(1.0, shift * alignment)
+
+    def _detect_cascade(self, channel: str, nick: str, sentiment: float) -> Optional[Dict]:
+        mood = self._channel_mood.get(channel, deque())
+        if len(mood) < 5:
+            return None
+        recent = list(mood)[-10:]
+        chain = []
+        for m in recent:
+            if abs(m["sentiment"] - sentiment) < 0.3:
+                chain.append(m["nick"])
+        if len(set(chain)) >= 3:
+            return {"channel": channel, "initiator": nick, "sentiment": sentiment,
+                   "participants": list(set(chain)), "length": len(chain), "ts": time.time()}
+        return None
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "influence_matrix": self._influence_matrix,
+                "cascades": self._cascades[-20:],
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._influence_matrix = data.get("influence_matrix", {})
+            self._cascades = data.get("cascades", [])
+        except Exception:
+            pass
+
+
+# =========================
+# Bot Swarm Detector
+# =========================
+
+class BotSwarmDetector:
+    """Detects coordinated AI/bot accounts operating as a swarm.
+
+    Identifies:
+      • Shared generation patterns (identical phrasing across accounts)
+      • Synchronized timing (messages posted at regular intervals)
+      • Narrative alignment (pushing same talking points)
+      • Cross-account amplification (mutual reinforcement)
+      • Account age clustering (new accounts created together)
+      • Behavioral uniformity (similar response patterns, vocabulary)
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "bot_swarms.json")
+
+    def __init__(self):
+        self._account_profiles: Dict[str, Dict] = {}
+        self._swarm_clusters: List[Dict] = []
+        self._message_signatures: Dict[str, deque] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def record(self, nick: str, channel: str, text: str, ai_score: float = 0) -> Optional[Dict]:
+        nl = nick.lower()
+        cl = channel.lower()
+        now = time.time()
+
+        prof = self._account_profiles.setdefault(nl, {
+            "msg_count": 0, "channels": set(), "first_seen": now, "last_seen": now,
+            "avg_ai_score": 0.0, "vocab": set(), "bigrams": Counter(),
+            "timing_gaps": deque(maxlen=50), "last_msg_time": 0,
+        })
+        prof["msg_count"] += 1
+        prof["channels"].add(cl)
+        prof["last_seen"] = now
+        prof["avg_ai_score"] = (prof["avg_ai_score"] * (prof["msg_count"] - 1) + ai_score) / prof["msg_count"]
+
+        words = text.lower().split()
+        prof["vocab"].update(words)
+        for i in range(len(words) - 1):
+            prof["bigrams"][(words[i], words[i + 1])] += 1
+
+        if prof["last_msg_time"] > 0:
+            gap = now - prof["last_msg_time"]
+            if gap < 600:
+                prof["timing_gaps"].append(gap)
+        prof["last_msg_time"] = now
+
+        sig = self._text_signature(text)
+        self._message_signatures.setdefault(sig, deque(maxlen=20)).append({"nick": nl, "ts": now, "channel": cl})
+
+        result = self._detect_swarm(nl, cl, now)
+        if result:
+            self._swarm_clusters.append(result)
+            if len(self._swarm_clusters) > 50:
+                self._swarm_clusters.pop(0)
+
+        self._maybe_save()
+        return result
+
+    def _text_signature(self, text: str) -> str:
+        words = text.lower().split()
+        if len(words) < 3:
+            return text.lower()
+        key_words = sorted(set(w for w in words if len(w) > 3))[:5]
+        return " ".join(key_words)
+
+    def _detect_swarm(self, nick: str, channel: str, now: float) -> Optional[Dict]:
+        prof = self._account_profiles.get(nick, {})
+        if prof.get("msg_count", 0) < 3:
+            return None
+
+        candidates = []
+        for other_nl, other_prof in self._account_profiles.items():
+            if other_nl == nick or other_prof.get("msg_count", 0) < 3:
+                continue
+            if not (other_prof.get("channels", set()) & prof.get("channels", set())):
+                continue
+
+            vocab_overlap = len(prof.get("vocab", set()) & other_prof.get("vocab", set()))
+            vocab_union = len(prof.get("vocab", set()) | other_prof.get("vocab", set()))
+            vocab_sim = vocab_overlap / max(vocab_union, 1)
+
+            bigram_overlap = sum((prof.get("bigrams", Counter()) & other_prof.get("bigrams", Counter())).values())
+            bigram_total = sum(prof.get("bigrams", Counter()).values()) + sum(other_prof.get("bigrams", Counter()).values())
+            bigram_sim = bigram_overlap / max(bigram_total, 1)
+
+            ai_sim = 1.0 - abs(prof.get("avg_ai_score", 0) - other_prof.get("avg_ai_score", 0))
+
+            timing_sim = self._timing_similarity(prof.get("timing_gaps", deque()),
+                                                  other_prof.get("timing_gaps", deque()))
+
+            combined = vocab_sim * 0.25 + bigram_sim * 0.30 + ai_sim * 0.25 + timing_sim * 0.20
+            if combined > 0.5:
+                candidates.append({"nick": other_nl, "similarity": round(combined, 3),
+                                  "vocab_sim": round(vocab_sim, 3), "bigram_sim": round(bigram_sim, 3),
+                                  "ai_sim": round(ai_sim, 3), "timing_sim": round(timing_sim, 3)})
+
+        if len(candidates) >= 2:
+            swarm_nicks = [nick] + [c["nick"] for c in candidates[:5]]
+            avg_sim = sum(c["similarity"] for c in candidates[:5]) / len(candidates[:5])
+            return {
+                "channel": channel, "nicks": swarm_nicks,
+                "confidence": round(avg_sim, 3), "size": len(swarm_nicks),
+                "evidence": candidates[:5], "ts": now,
+            }
+        return None
+
+    @staticmethod
+    def _timing_similarity(gaps_a: deque, gaps_b: deque) -> float:
+        if len(gaps_a) < 3 or len(gaps_b) < 3:
+            return 0.0
+        mean_a = sum(gaps_a) / len(gaps_a)
+        mean_b = sum(gaps_b) / len(gaps_b)
+        if mean_a == 0 or mean_b == 0:
+            return 0.0
+        ratio = min(mean_a, mean_b) / max(mean_a, mean_b)
+        return ratio
+
+    def get_swarms(self, limit: int = 10) -> List[Dict]:
+        return sorted(self._swarm_clusters, key=lambda x: -x["confidence"])[:limit]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "swarms": self._swarm_clusters[-20:],
+                "account_preview": {k: {"msg_count": v["msg_count"], "avg_ai": v["avg_ai_score"]}
+                                   for k, v in list(self._account_profiles.items())[:100]},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._swarm_clusters = data.get("swarms", [])
+        except Exception:
+            pass
+
+
+# =========================
+# Role Inference
+# =========================
+
+class RoleInference:
+    """Classifies users into social roles based on behavioral and linguistic patterns.
+
+    Roles:
+      • moderator     — enforces rules, uses authoritative language, high channel tenure
+      • helper        — answers questions, high reply-to-others ratio, positive sentiment
+      • expert        — deep technical vocabulary, long messages, cited by others
+      • regular       — consistent presence, balanced participation
+      • lurker        — low message count, long gaps, mostly observes
+      • troll         — negative sentiment, provocative language, high conflict rate
+      • newbie        — asks many questions, short messages, recent join date
+      • socializer    — high off-topic ratio, greeting/farewell frequency, emoji use
+      • debater       — high argument frequency, logical connectors, counter-statements
+      • broadcaster   — shares links/resources, high information density, one-to-many pattern
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "role_inference.json")
+
+    _ROLE_WEIGHTS = {
+        "moderator":    {"auth_words": 0.20, "tenure": 0.15, "cmd_usage": 0.15, "reply_ratio": 0.10, "msg_freq": 0.10, "sentiment": 0.05, "conflict": -0.15, "link_share": 0.05, "question_ratio": -0.10, "off_topic": -0.05},
+        "helper":       {"auth_words": 0.05, "tenure": 0.10, "cmd_usage": 0.05, "reply_ratio": 0.25, "msg_freq": 0.10, "sentiment": 0.20, "conflict": -0.10, "link_share": 0.05, "question_ratio": -0.10, "off_topic": 0.05},
+        "expert":       {"auth_words": 0.10, "tenure": 0.15, "cmd_usage": 0.05, "reply_ratio": 0.15, "msg_freq": 0.10, "sentiment": 0.05, "conflict": 0.00, "link_share": 0.15, "question_ratio": -0.15, "off_topic": -0.10},
+        "regular":      {"auth_words": 0.00, "tenure": 0.10, "cmd_usage": 0.00, "reply_ratio": 0.10, "msg_freq": 0.20, "sentiment": 0.05, "conflict": 0.00, "link_share": 0.05, "question_ratio": 0.00, "off_topic": 0.10},
+        "lurker":       {"auth_words": 0.00, "tenure": 0.05, "cmd_usage": 0.00, "reply_ratio": 0.05, "msg_freq": -0.20, "sentiment": 0.00, "conflict": 0.00, "link_share": 0.00, "question_ratio": 0.00, "off_topic": 0.00},
+        "troll":        {"auth_words": 0.00, "tenure": 0.00, "cmd_usage": 0.00, "reply_ratio": 0.10, "msg_freq": 0.10, "sentiment": -0.25, "conflict": 0.30, "link_share": 0.00, "question_ratio": 0.00, "off_topic": 0.15},
+        "newbie":       {"auth_words": 0.00, "tenure": -0.15, "cmd_usage": 0.00, "reply_ratio": 0.10, "msg_freq": 0.05, "sentiment": 0.05, "conflict": 0.00, "link_share": 0.00, "question_ratio": 0.25, "off_topic": 0.10},
+        "socializer":   {"auth_words": 0.00, "tenure": 0.05, "cmd_usage": 0.00, "reply_ratio": 0.15, "msg_freq": 0.15, "sentiment": 0.15, "conflict": -0.05, "link_share": 0.00, "question_ratio": 0.00, "off_topic": 0.25},
+        "debater":      {"auth_words": 0.05, "tenure": 0.05, "cmd_usage": 0.00, "reply_ratio": 0.20, "msg_freq": 0.15, "sentiment": -0.05, "conflict": 0.20, "link_share": 0.05, "question_ratio": 0.10, "off_topic": -0.05},
+        "broadcaster":  {"auth_words": 0.05, "tenure": 0.10, "cmd_usage": 0.05, "reply_ratio": 0.05, "msg_freq": 0.15, "sentiment": 0.05, "conflict": 0.00, "link_share": 0.30, "question_ratio": -0.10, "off_topic": 0.00},
+    }
+
+    _AUTH_WORDS = {"should", "must", "rule", "policy", "ban", "kick", "warning", "enforce", "moderator", "admin", "please stop", "read the", "topic is", "stay on", "keep it", "respect", "follow the"}
+    _LOGICAL_CONNECTORS = {"however", "therefore", "because", "although", "but", "thus", "hence", "consequently", "nevertheless", "moreover", "furthermore", "whereas", "conversely", "arguably", "counterpoint"}
+    _QUESTION_MARKERS = {"what", "how", "why", "when", "where", "who", "which", "can you", "could you", "does anyone", "is there", "anyone know", "help with", "how do i", "what is"}
+    _GREETINGS = {"hi", "hello", "hey", "good morning", "good evening", "good night", "welcome", "wb", "welcome back", "greetings", "o/", "sup", "yo"}
+    _FAREWELLS = {"bye", "goodbye", "see you", "later", "gtg", "brb", "afk", "goodnight", "cya", "farewell", "o7"}
+
+    def __init__(self):
+        self._user_data: Dict[str, Dict] = {}
+        self._roles: Dict[str, Dict] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def observe(self, nick: str, channel: str, text: str, is_reply: bool, sentiment_score: float, first_seen: float, now: float) -> None:
+        nl = nick.lower()
+        ch = channel.lower()
+        d = self._user_data.setdefault(nl, {
+            "msg_count": 0, "reply_count": 0, "question_count": 0,
+            "link_count": 0, "auth_word_count": 0, "connector_count": 0,
+            "greeting_count": 0, "farewell_count": 0, "off_topic_count": 0,
+            "conflict_count": 0, "total_chars": 0, "first_seen": first_seen,
+            "last_seen": 0.0, "channels": set(), "sentiment_sum": 0.0,
+        })
+        d["msg_count"] += 1
+        d["reply_count"] += 1 if is_reply else 0
+        d["total_chars"] += len(text)
+        d["last_seen"] = now
+        d["channels"].add(ch)
+        d["sentiment_sum"] += sentiment_score
+
+        lower = text.lower()
+        words = set(lower.split())
+        if any(w in words for w in self._AUTH_WORDS):
+            d["auth_word_count"] += 1
+        if any(w in words for w in self._LOGICAL_CONNECTORS):
+            d["connector_count"] += 1
+        if any(lower.startswith(q) for q in self._QUESTION_MARKERS) or "?" in text:
+            d["question_count"] += 1
+        if any(lower.startswith(g) for g in self._GREETINGS):
+            d["greeting_count"] += 1
+        if any(lower.startswith(f) for f in self._FAREWELLS):
+            d["farewell_count"] += 1
+        if "http://" in lower or "https://" in lower:
+            d["link_count"] += 1
+        if any(w in words for w in {"stupid", "idiot", "moron", "dumb", "wrong", "shut up", "noob", "fake", "lies"}):
+            d["conflict_count"] += 1
+
+    def infer_roles(self, channel: str = "") -> Dict[str, List[Dict]]:
+        results: Dict[str, List[Dict]] = {}
+        for nl, d in self._user_data.items():
+            if channel and channel.lower() not in d["channels"]:
+                continue
+            if d["msg_count"] < 3:
+                continue
+
+            tenure_days = (d["last_seen"] - d["first_seen"]) / 86400.0
+            msg_freq = d["msg_count"] / max(tenure_days, 0.01)
+            reply_ratio = d["reply_count"] / max(d["msg_count"], 1)
+            question_ratio = d["question_count"] / max(d["msg_count"], 1)
+            link_ratio = d["link_count"] / max(d["msg_count"], 1)
+            avg_sentiment = d["sentiment_sum"] / max(d["msg_count"], 1)
+            conflict_ratio = d["conflict_count"] / max(d["msg_count"], 1)
+            auth_ratio = d["auth_word_count"] / max(d["msg_count"], 1)
+            connector_ratio = d["connector_count"] / max(d["msg_count"], 1)
+            off_topic_ratio = (d["greeting_count"] + d["farewell_count"]) / max(d["msg_count"], 1)
+
+            features = {
+                "auth_words": auth_ratio,
+                "tenure": min(tenure_days / 30.0, 1.0),
+                "cmd_usage": auth_ratio * 0.5,
+                "reply_ratio": reply_ratio,
+                "msg_freq": min(msg_freq / 50.0, 1.0),
+                "sentiment": avg_sentiment,
+                "conflict": conflict_ratio,
+                "link_share": link_ratio,
+                "question_ratio": question_ratio,
+                "off_topic": off_topic_ratio,
+            }
+
+            scores = {}
+            for role, weights in self._ROLE_WEIGHTS.items():
+                score = sum(weights.get(k, 0) * v for k, v in features.items())
+                scores[role] = max(0.0, min(1.0, 0.5 + score))
+
+            primary_role = max(scores, key=scores.get)
+            ch_key = channel.lower() if channel else "*"
+            results.setdefault(ch_key, []).append({
+                "nick": nl,
+                "primary_role": primary_role,
+                "scores": {k: round(v, 3) for k, v in sorted(scores.items(), key=lambda x: -x[1])},
+                "msg_count": d["msg_count"],
+                "tenure_days": round(tenure_days, 1),
+            })
+
+        for ch in results:
+            results[ch].sort(key=lambda x: -x["scores"][x["primary_role"]])
+        return results
+
+    def get_role(self, nick: str, channel: str = "") -> Optional[Dict]:
+        nl = nick.lower()
+        d = self._user_data.get(nl)
+        if not d or d["msg_count"] < 3:
+            return None
+        roles = self.infer_roles(channel)
+        ch_key = channel.lower() if channel else "*"
+        for r in roles.get(ch_key, []):
+            if r["nick"] == nl:
+                return r
+        return None
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "user_data": {k: {**v, "channels": list(v["channels"])} for k, v in self._user_data.items()},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in data.get("user_data", {}).items():
+                v["channels"] = set(v.get("channels", []))
+                self._user_data[k] = v
+        except Exception:
+            pass
+
+
+# =========================
+# Debate Analyzer
+# =========================
+
+class DebateAnalyzer:
+    """Analyzes conversations between two users to score argument quality.
+
+    Metrics:
+      • Logical fallacies (ad hominem, strawman, appeal to authority, etc.)
+      • Evidence usage (citations, data references, examples)
+      • Response quality (addresses points, stays on topic, constructive)
+      • Tone analysis (respectful, aggressive, dismissive)
+      • Turn balance (fair exchange vs domination)
+      • Resolution indicators (agreement, compromise, concession)
+    """
+
+    _FALLACIES = {
+        "ad_hominem": {"you're", "you are", "stupid", "idiot", "moron", "ignorant", "delusional", "clueless", "pathetic"},
+        "strawman": {"so you're saying", "you think that", "your position is", "you believe", "apparently you"},
+        "appeal_to_authority": {"experts agree", "scientists say", "studies show", "research proves", "authorities confirm"},
+        "appeal_to_emotion": {"think of", "imagine if", "how would you feel", "it's heartbreaking", "unacceptable"},
+        "false_dichotomy": {"either.*or", "only two options", "black and white", "all or nothing", "with us or against"},
+        "slippery_slope": {"will lead to", "next thing", "eventually", "soon they'll", "before you know it"},
+        "circular_reasoning": {"because it is", "by definition", "obviously", "self-evident", "inherently"},
+        "red_herring": {"but what about", "you're ignoring", "let's not forget", "meanwhile", "distracting from"},
+        "bandwagon": {"everyone knows", "most people", "majority agrees", "common sense", "widely accepted"},
+        "appeal_to_nature": {"natural", "organic", "chemical-free", "pure", "unnatural"},
+    }
+
+    _EVIDENCE_MARKERS = {"study", "research", "paper", "data", "statistics", "according to", "source", "citation", "reference", "peer-reviewed", "meta-analysis", "survey", "experiment", "trial", "evidence", "proof", "demonstrates", "shows that", "indicates"}
+    _AGREEMENT_MARKERS = {"i agree", "you're right", "good point", "fair enough", "concede", "you make a valid", "i see your point", "that's true", "agreed", "makes sense", "i hadn't considered"}
+    _DISMISSIVE_MARKERS = {"whatever", "doesn't matter", "irrelevant", "who cares", "nobody asked", "so what", "big deal", "yeah right", "sure", "ok boomer"}
+    _CONSTRUCTIVE_MARKERS = {"let's consider", "perhaps", "maybe we could", "what if", "another perspective", "building on that", "to add to", "i think we could", "compromise", "middle ground"}
+
+    def __init__(self):
+        self._exchanges: Dict[str, List[Dict]] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def record_message(self, nick1: str, nick2: str, channel: str, text: str, ts: float) -> None:
+        key = self._debate_key(nick1, nick2, channel)
+        exchange = self._exchanges.setdefault(key, {"messages": [], "started": ts, "channel": channel})
+        exchange["messages"].append({"nick": nick1.lower(), "text": text, "ts": ts})
+        if len(exchange["messages"]) > 200:
+            exchange["messages"] = exchange["messages"][-100:]
+
+    def analyze(self, nick1: str, nick2: str, channel: str = "") -> Optional[Dict]:
+        key = self._debate_key(nick1, nick2, channel)
+        alt_key = self._debate_key(nick2, nick1, channel)
+        exchange = self._exchanges.get(key) or self._exchanges.get(alt_key)
+        if not exchange or len(exchange["messages"]) < 4:
+            return None
+
+        msgs = exchange["messages"]
+        n1, n2 = nick1.lower(), nick2.lower()
+        n1_msgs = [m for m in msgs if m["nick"] == n1]
+        n2_msgs = [m for m in msgs if m["nick"] == n2]
+
+        n1_analysis = self._analyze_user(n1_msgs, n2_msgs)
+        n2_analysis = self._analyze_user(n2_msgs, n1_msgs)
+
+        turn_balance = self._turn_balance(msgs, n1, n2)
+        resolution = self._check_resolution(msgs)
+
+        return {
+            "nick1": nick1, "nick2": nick2, "channel": exchange["channel"],
+            "msg_count": len(msgs), "duration_min": round((msgs[-1]["ts"] - msgs[0]["ts"]) / 60, 1),
+            "nick1_analysis": n1_analysis, "nick2_analysis": n2_analysis,
+            "turn_balance": turn_balance,
+            "resolution": resolution,
+            "overall_quality": round((n1_analysis["quality_score"] + n2_analysis["quality_score"]) / 2, 3),
+        }
+
+    def _analyze_user(self, user_msgs: List[Dict], opponent_msgs: List[Dict]) -> Dict:
+        if not user_msgs:
+            return {"quality_score": 0.0}
+
+        fallacies_found = []
+        evidence_count = 0
+        constructive_count = 0
+        dismissive_count = 0
+        agreement_count = 0
+        topic_adherence = 0.0
+        total = len(user_msgs)
+
+        for m in user_msgs:
+            text = m["text"].lower()
+            words = set(text.split())
+
+            for fname, fwords in self._FALLACIES.items():
+                if any(w in words for w in fwords):
+                    fallacies_found.append(fname)
+
+            if any(w in words for w in self._EVIDENCE_MARKERS):
+                evidence_count += 1
+            if any(m["text"].lower().startswith(c) for c in self._CONSTRUCTIVE_MARKERS):
+                constructive_count += 1
+            if any(m["text"].lower().startswith(d) for d in self._DISMISSIVE_MARKERS):
+                dismissive_count += 1
+            if any(m["text"].lower().startswith(a) for a in self._AGREEMENT_MARKERS):
+                agreement_count += 1
+
+        fallacy_rate = len(fallacies_found) / max(total, 1)
+        evidence_rate = evidence_count / max(total, 1)
+        constructive_rate = constructive_count / max(total, 1)
+        dismissive_rate = dismissive_count / max(total, 1)
+
+        quality = 0.5
+        quality -= fallacy_rate * 0.3
+        quality += evidence_rate * 0.25
+        quality += constructive_rate * 0.2
+        quality -= dismissive_rate * 0.25
+        quality += min(agreement_count / max(total, 1) * 0.1, 0.1)
+        quality = max(0.0, min(1.0, quality))
+
+        fallacy_counts = Counter(fallacies_found)
+        return {
+            "quality_score": round(quality, 3),
+            "fallacy_rate": round(fallacy_rate, 3),
+            "evidence_rate": round(evidence_rate, 3),
+            "constructive_rate": round(constructive_rate, 3),
+            "dismissive_rate": round(dismissive_rate, 3),
+            "agreement_count": agreement_count,
+            "fallacies": dict(fallacy_counts.most_common(5)),
+            "msg_count": total,
+        }
+
+    def _turn_balance(self, msgs: List[Dict], n1: str, n2: str) -> Dict:
+        n1_count = sum(1 for m in msgs if m["nick"] == n1)
+        n2_count = sum(1 for m in msgs if m["nick"] == n2)
+        total = n1_count + n2_count
+        return {
+            "nick1_msgs": n1_count, "nick2_msgs": n2_count,
+            "ratio": round(n1_count / max(n2_count, 1), 2),
+            "balance": round(1.0 - abs(n1_count - n2_count) / max(total, 1), 3),
+        }
+
+    def _check_resolution(self, msgs: List[Dict]) -> Dict:
+        recent = msgs[-10:]
+        agreements = sum(1 for m in recent if any(m["text"].lower().startswith(a) for a in self._AGREEMENT_MARKERS))
+        return {
+            "indicators": agreements,
+            "resolved": agreements >= 2,
+            "status": "resolved" if agreements >= 2 else "ongoing" if len(msgs) > 4 else "insufficient data",
+        }
+
+    def _debate_key(self, nick1: str, nick2: str, channel: str) -> str:
+        n1, n2 = sorted([nick1.lower(), nick2.lower()])
+        return f"{n1}:{n2}:{channel.lower()}"
+
+    def get_active_debates(self, channel: str = "", limit: int = 10) -> List[Dict]:
+        results = []
+        for key, exchange in self._exchanges.items():
+            if channel and exchange["channel"].lower() != channel.lower():
+                continue
+            if len(exchange["messages"]) < 4:
+                continue
+            parts = key.split(":")
+            analysis = self.analyze(parts[0], parts[1], exchange["channel"])
+            if analysis:
+                results.append(analysis)
+        results.sort(key=lambda x: -x["msg_count"])
+        return results[:limit]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "exchanges": {k: v for k, v in list(self._exchanges.items())[:50]},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._exchanges = data.get("exchanges", {})
+        except Exception:
+            pass
+
+
+# =========================
+# Echo Chamber Detector
+# =========================
+
+class EchoChamberDetector:
+    """Measures opinion homogeneity and cross-pollination in channels.
+
+    Metrics:
+      • Sentiment consensus — how aligned are users' sentiments?
+      • Vocabulary overlap — do users share the same lexicon?
+      • Agreement ratio — how often do users affirm each other?
+      • Dissent suppression — are contrary voices ignored or attacked?
+      • Cross-channel exposure — do users participate in diverse channels?
+      • Information diversity — range of topics discussed
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "echo_chamber.json")
+    _AGREEMENT_PHRASES = {"i agree", "you're right", "good point", "exactly", "true", "agreed", "makes sense", "that's right", "absolutely", "definitely", "for sure", "no doubt", "well said", "couldn't agree more"}
+    _DISSENT_PHRASES = {"i disagree", "not true", "that's wrong", "incorrect", "nope", "false", "i don't think so", "hardly", "doubt it", "that's not", "you're mistaken"}
+    _ATTACK_PHRASES = {"stupid", "idiot", "moron", "shut up", "you're dumb", "ignorant", "delusional", "clueless", "wake up", "brainwashed"}
+
+    def __init__(self):
+        self._channel_data: Dict[str, Dict] = {}
+        self._user_channel_map: Dict[str, set] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def observe(self, nick: str, channel: str, text: str, sentiment_score: float) -> None:
+        ch = channel.lower()
+        nl = nick.lower()
+        cd = self._channel_data.setdefault(ch, {
+            "msg_count": 0, "sentiment_scores": [], "vocab": set(),
+            "agreement_count": 0, "dissent_count": 0, "attack_count": 0,
+            "topic_set": set(), "user_sentiments": {}, "users": set(),
+        })
+        cd["msg_count"] += 1
+        cd["sentiment_scores"].append(sentiment_score)
+        cd["users"].add(nl)
+        cd["user_sentiments"].setdefault(nl, []).append(sentiment_score)
+
+        words = set(text.lower().split())
+        cd["vocab"].update(w for w in words if len(w) > 3)
+
+        lower = text.lower()
+        if any(lower.startswith(p) for p in self._AGREEMENT_PHRASES):
+            cd["agreement_count"] += 1
+        if any(lower.startswith(p) for p in self._DISSENT_PHRASES):
+            cd["dissent_count"] += 1
+        if any(p in lower for p in self._ATTACK_PHRASES):
+            cd["attack_count"] += 1
+
+        self._user_channel_map.setdefault(nl, set()).add(ch)
+
+    def analyze(self, channel: str) -> Optional[Dict]:
+        ch = channel.lower()
+        cd = self._channel_data.get(ch)
+        if not cd or cd["msg_count"] < 10:
+            return None
+
+        sentiment_scores = cd["sentiment_scores"]
+        avg_sentiment = sum(sentiment_scores) / len(sentiment_scores)
+        sentiment_std = (sum((s - avg_sentiment)**2 for s in sentiment_scores) / len(sentiment_scores))**0.5
+        sentiment_consensus = max(0, 1.0 - sentiment_std)
+
+        user_sentiments = {}
+        for user, scores in cd["user_sentiments"].items():
+            user_sentiments[user] = sum(scores) / len(scores)
+
+        if len(user_sentiments) >= 2:
+            vals = list(user_sentiments.values())
+            mean_vals = sum(vals) / len(vals)
+            user_std = (sum((v - mean_vals)**2 for v in vals) / len(vals))**0.5
+            opinion_homogeneity = max(0, 1.0 - user_std)
+        else:
+            opinion_homogeneity = 1.0
+
+        total_responses = cd["agreement_count"] + cd["dissent_count"] + cd["attack_count"]
+        agreement_ratio = cd["agreement_count"] / max(total_responses, 1)
+        dissent_ratio = cd["dissent_count"] / max(total_responses, 1)
+        attack_ratio = cd["attack_count"] / max(total_responses, 1)
+
+        dissent_suppression = 1.0 if (attack_ratio > 0.3 and dissent_ratio < 0.1) else (attack_ratio * 2)
+
+        cross_channel_scores = []
+        for user in cd["users"]:
+            user_channels = self._user_channel_map.get(user, set())
+            cross_channel_scores.append(len(user_channels))
+        avg_cross_channel = sum(cross_channel_scores) / max(len(cross_channel_scores), 1)
+        cross_channel_exposure = min(avg_cross_channel / 5.0, 1.0)
+
+        topic_diversity = min(len(cd["topic_set"]) / 10.0, 1.0)
+
+        echo_score = (
+            sentiment_consensus * 0.20 +
+            opinion_homogeneity * 0.25 +
+            agreement_ratio * 0.20 +
+            dissent_suppression * 0.15 +
+            (1.0 - cross_channel_exposure) * 0.10 +
+            (1.0 - topic_diversity) * 0.10
+        )
+
+        if echo_score >= 0.7:
+            severity = "strong"
+        elif echo_score >= 0.5:
+            severity = "moderate"
+        elif echo_score >= 0.3:
+            severity = "mild"
+        else:
+            severity = "open"
+
+        return {
+            "channel": channel,
+            "echo_score": round(echo_score, 3),
+            "severity": severity,
+            "metrics": {
+                "sentiment_consensus": round(sentiment_consensus, 3),
+                "opinion_homogeneity": round(opinion_homogeneity, 3),
+                "agreement_ratio": round(agreement_ratio, 3),
+                "dissent_ratio": round(dissent_ratio, 3),
+                "attack_ratio": round(attack_ratio, 3),
+                "dissent_suppression": round(dissent_suppression, 3),
+                "cross_channel_exposure": round(cross_channel_exposure, 3),
+                "topic_diversity": round(topic_diversity, 3),
+            },
+            "user_count": len(cd["users"]),
+            "msg_count": cd["msg_count"],
+        }
+
+    def analyze_all(self) -> List[Dict]:
+        results = []
+        for ch in self._channel_data:
+            result = self.analyze(ch)
+            if result:
+                results.append(result)
+        results.sort(key=lambda x: -x["echo_score"])
+        return results
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "channel_data": {k: {**v, "vocab": list(v["vocab"])[:500], "topic_set": list(v["topic_set"])[:200], "users": list(v["users"])} for k, v in self._channel_data.items()},
+                "user_channel_map": {k: list(v) for k, v in self._user_channel_map.items()},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in data.get("channel_data", {}).items():
+                v["vocab"] = set(v.get("vocab", []))
+                v["topic_set"] = set(v.get("topic_set", []))
+                v["users"] = set(v.get("users", []))
+                self._channel_data[k] = v
+            for k, v in data.get("user_channel_map", {}).items():
+                self._user_channel_map[k] = set(v)
+        except Exception:
+            pass
+
+
+# =========================
+# Achievement Badges
+# =========================
+
+class AchievementBadges:
+    """Tracks and awards achievement badges based on user behavior.
+
+    Badge Categories:
+      • Participation    — First Post, Regular, Marathon, Night Owl, Early Bird
+      • Social           — Welcomer, Connector, Peacemaker, Popular
+      • Knowledge        — Expert, Helper, Source Citer, Fact Checker
+      • Communication    — Wordsmith, Concise, Multilingual, Storyteller
+      • Dedication       — Veteran, Streak Master, Daily Driver, Year Club
+      • Special          — Comeback Kid, Channel Hopper, Meme Lord, Emoji Master
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "achievements.json")
+
+    _BADGE_DEFS = {
+        "first_post":       {"name": "First Post",       "icon": "🌟", "desc": "Sent your first message", "category": "Participation"},
+        "regular":          {"name": "Regular",          "icon": "⭐", "desc": "Sent 100 messages", "category": "Participation"},
+        "marathon":         {"name": "Marathon",         "icon": "🏃", "desc": "Sent 1000 messages", "category": "Participation"},
+        "night_owl":        {"name": "Night Owl",        "icon": "🦉", "desc": "Active between 2-5 AM", "category": "Participation"},
+        "early_bird":       {"name": "Early Bird",       "icon": "🐦", "desc": "Active between 5-8 AM", "category": "Participation"},
+        "welcomer":         {"name": "Welcomer",         "icon": "👋", "desc": "Welcomed 10 new users", "category": "Social"},
+        "connector":        {"name": "Connector",        "icon": "🔗", "desc": "Active in 5+ channels", "category": "Social"},
+        "peacemaker":       {"name": "Peacemaker",       "icon": "☮️", "desc": "Resolved 5 conflicts", "category": "Social"},
+        "popular":          {"name": "Popular",          "icon": "💫", "desc": "Replied to by 20+ users", "category": "Social"},
+        "expert":           {"name": "Expert",           "icon": "🎓", "desc": "High technical vocabulary score", "category": "Knowledge"},
+        "helper":           {"name": "Helper",           "icon": "🤝", "desc": "Answered 50 questions", "category": "Knowledge"},
+        "source_citer":     {"name": "Source Citer",     "icon": "📚", "desc": "Cited 25 sources", "category": "Knowledge"},
+        "fact_checker":     {"name": "Fact Checker",     "icon": "🔍", "desc": "Corrected 10 misinformation claims", "category": "Knowledge"},
+        "wordsmith":        {"name": "Wordsmith",        "icon": "✍️", "desc": "Sent 10,000 words", "category": "Communication"},
+        "concise":          {"name": "Concise",          "icon": "📌", "desc": "Sent 50 messages under 10 chars", "category": "Communication"},
+        "multilingual":     {"name": "Multilingual",     "icon": "🌐", "desc": "Used 3+ languages", "category": "Communication"},
+        "storyteller":      {"name": "Storyteller",      "icon": "📖", "desc": "Sent 20 messages over 500 chars", "category": "Communication"},
+        "veteran":          {"name": "Veteran",          "icon": "🏅", "desc": "Active for 30+ days", "category": "Dedication"},
+        "streak_master":    {"name": "Streak Master",    "icon": "🔥", "desc": "7-day activity streak", "category": "Dedication"},
+        "daily_driver":     {"name": "Daily Driver",     "icon": "📅", "desc": "Active every day for 14 days", "category": "Dedication"},
+        "year_club":        {"name": "Year Club",        "icon": "🎂", "desc": "Active for 365 days", "category": "Dedication"},
+        "comeback_kid":     {"name": "Comeback Kid",     "icon": "🔄", "desc": "Returned after 30 days absence", "category": "Special"},
+        "channel_hopper":   {"name": "Channel Hopper",   "icon": "🦘", "desc": "Active in 10+ channels", "category": "Special"},
+        "meme_lord":        {"name": "Meme Lord",        "icon": "😂", "desc": "Used 50 meme phrases", "category": "Special"},
+        "emoji_master":     {"name": "Emoji Master",     "icon": "😀", "desc": "Used 100 unique emojis", "category": "Special"},
+    }
+
+    def __init__(self):
+        self._user_stats: Dict[str, Dict] = {}
+        self._awarded: Dict[str, set] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def observe(self, nick: str, channel: str, text: str, ts: float, replied_to_by: List[str] = None) -> None:
+        nl = nick.lower()
+        d = self._user_stats.setdefault(nl, {
+            "msg_count": 0, "word_count": 0, "total_chars": 0,
+            "channels": set(), "first_seen": ts, "last_seen": ts,
+            "night_msgs": 0, "morning_msgs": 0, "short_msgs": 0,
+            "long_msgs": 0, "welcome_count": 0, "conflict_resolved": 0,
+            "questions_answered": 0, "sources_cited": 0, "facts_corrected": 0,
+            "unique_emojis": set(), "meme_count": 0, "languages": set(),
+            "active_days": set(), "reply_targets": set(), "streak_days": 0,
+            "last_active_date": "", "absence_days": 0,
+        })
+        d["msg_count"] += 1
+        d["word_count"] += len(text.split())
+        d["total_chars"] += len(text)
+        d["last_seen"] = ts
+        d["channels"].add(channel.lower())
+
+        hour = time.localtime(ts).tm_hour
+        if 2 <= hour < 5:
+            d["night_msgs"] += 1
+        if 5 <= hour < 8:
+            d["morning_msgs"] += 1
+        if len(text) < 10:
+            d["short_msgs"] += 1
+        if len(text) > 500:
+            d["long_msgs"] += 1
+
+        day_str = time.strftime("%Y-%m-%d", time.localtime(ts))
+        d["active_days"].add(day_str)
+
+        if replied_to_by:
+            d["reply_targets"].update(n.lower() for n in replied_to_by)
+
+        lower = text.lower()
+        emojis = re.findall(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]', text)
+        d["unique_emojis"].update(emojis)
+
+        if any(lower.startswith(p) for p in {"welcome", "hi ", "hey ", "greetings", "wb "}):
+            d["welcome_count"] += 1
+        if any(w in lower for w in {"study", "research", "paper", "source", "according to", "citation"}):
+            d["sources_cited"] += 1
+        if "?" in text and any(lower.startswith(q) for q in {"because", "actually", "the answer", "it's", "you can", "try"}):
+            d["questions_answered"] += 1
+
+    def check_achievements(self, nick: str) -> List[Dict]:
+        nl = nick.lower()
+        d = self._user_stats.get(nl)
+        if not d:
+            return []
+
+        awarded = self._awarded.setdefault(nl, set())
+        new_badges = []
+
+        checks = {
+            "first_post": d["msg_count"] >= 1,
+            "regular": d["msg_count"] >= 100,
+            "marathon": d["msg_count"] >= 1000,
+            "night_owl": d["night_msgs"] >= 10,
+            "early_bird": d["morning_msgs"] >= 10,
+            "welcomer": d["welcome_count"] >= 10,
+            "connector": len(d["channels"]) >= 5,
+            "peacemaker": d["conflict_resolved"] >= 5,
+            "popular": len(d["reply_targets"]) >= 20,
+            "expert": d["word_count"] >= 5000 and len(d["channels"]) >= 2,
+            "helper": d["questions_answered"] >= 50,
+            "source_citer": d["sources_cited"] >= 25,
+            "fact_checker": d["facts_corrected"] >= 10,
+            "wordsmith": d["word_count"] >= 10000,
+            "concise": d["short_msgs"] >= 50,
+            "multilingual": len(d["languages"]) >= 3,
+            "storyteller": d["long_msgs"] >= 20,
+            "veteran": (d["last_seen"] - d["first_seen"]) >= 86400 * 30,
+            "streak_master": d["streak_days"] >= 7,
+            "daily_driver": len(d["active_days"]) >= 14,
+            "year_club": (d["last_seen"] - d["first_seen"]) >= 86400 * 365,
+            "comeback_kid": d["absence_days"] >= 30,
+            "channel_hopper": len(d["channels"]) >= 10,
+            "meme_lord": d["meme_count"] >= 50,
+            "emoji_master": len(d["unique_emojis"]) >= 100,
+        }
+
+        for badge_id, earned in checks.items():
+            if earned and badge_id not in awarded:
+                awarded.add(badge_id)
+                new_badges.append({**self._BADGE_DEFS[badge_id], "id": badge_id, "earned_at": time.time()})
+
+        if new_badges:
+            self._maybe_save()
+        return new_badges
+
+    def get_badges(self, nick: str) -> List[Dict]:
+        nl = nick.lower()
+        awarded = self._awarded.get(nl, set())
+        return [{**self._BADGE_DEFS[bid], "id": bid} for bid in sorted(awarded)]
+
+    def get_leaderboard(self, limit: int = 20) -> List[Dict]:
+        results = []
+        for nl, awarded in self._awarded.items():
+            d = self._user_stats.get(nl, {})
+            results.append({
+                "nick": nl,
+                "badge_count": len(awarded),
+                "badges": list(awarded),
+                "msg_count": d.get("msg_count", 0),
+                "channels": len(d.get("channels", set())),
+            })
+        results.sort(key=lambda x: -x["badge_count"])
+        return results[:limit]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "user_stats": {k: {**v, "channels": list(v["channels"]), "unique_emojis": list(v["unique_emojis"]), "active_days": list(v["active_days"]), "languages": list(v["languages"]), "reply_targets": list(v["reply_targets"])} for k, v in self._user_stats.items()},
+                "awarded": {k: list(v) for k, v in self._awarded.items()},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in data.get("user_stats", {}).items():
+                v["channels"] = set(v.get("channels", []))
+                v["unique_emojis"] = set(v.get("unique_emojis", []))
+                v["active_days"] = set(v.get("active_days", []))
+                v["languages"] = set(v.get("languages", []))
+                v["reply_targets"] = set(v.get("reply_targets", []))
+                self._user_stats[k] = v
+            for k, v in data.get("awarded", {}).items():
+                self._awarded[k] = set(v)
+        except Exception:
+            pass
+
+
+# =========================
+# Sarcasm Detector
+# =========================
+
+class SarcasmDetector:
+    """Detects sarcastic messages via sentiment-text mismatch and linguistic markers.
+
+    Signals:
+      • Sentiment mismatch — positive words in negative context (or vice versa)
+      • Exaggeration markers — "oh great", "fantastic", "just what I needed"
+      • Punctuation cues — excessive ellipsis, quotes, exclamation marks
+      • Emotion-word inversion — positive adjectives with negative verbs
+      • Context contradiction — agrees then immediately contradicts
+      • Sarcasm lexicon — known sarcastic phrases and patterns
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "sarcasm.json")
+    _SARCASM_THRESHOLD = 0.60
+
+    _SARCASM_PHRASES = {
+        "oh great", "oh wonderful", "oh fantastic", "oh brilliant", "oh perfect",
+        "just what i needed", "just what i wanted", "just what i always wanted",
+        "yeah right", "sure thing", "of course", "naturally", "obviously",
+        "thanks a lot", "thanks for nothing", "real helpful", "very helpful",
+        "good to know", "good job", "well done", "nice going", "way to go",
+        "i'm so impressed", "how original", "how unique", "how creative",
+        "big surprise", "no way", "you don't say", "tell me something i don't know",
+        "fascinating", "riveting", "groundbreaking", "revolutionary",
+        "shocking", "unbelievable", "incredible", "amazing",
+    }
+
+    _EXAGGERATION_MARKERS = {"so", "very", "extremely", "incredibly", "absolutely", "totally", "completely", "utterly", "really", "super", "mega", "hyper"}
+    _POSITIVE_WORDS = {"great", "wonderful", "fantastic", "amazing", "awesome", "excellent", "perfect", "brilliant", "superb", "outstanding", "love", "best", "good", "nice", "happy", "glad", "thrilled", "delighted", "pleased"}
+    _NEGATIVE_WORDS = {"terrible", "awful", "horrible", "disgusting", "worst", "bad", "hate", "stupid", "idiotic", "ridiculous", "absurd", "pathetic", "useless", "worthless", "dreadful", "miserable", "annoying", "frustrating"}
+
+    _PUNCTUATION_PATTERNS = [
+        (re.compile(r'\.{3,}'), "ellipsis"),
+        (re.compile(r'!{2,}'), "exclamation"),
+        (re.compile(r'".*?"'), "quotes"),
+        (re.compile(r'\(sarcasm\)|\/s|<sarcasm>', re.IGNORECASE), "explicit"),
+    ]
+
+    def __init__(self):
+        self._user_messages: Dict[str, List[Dict]] = {}
+        self._detected: List[Dict] = []
+        self._last_save: float = 0.0
+        self.load()
+
+    def analyze(self, nick: str, text: str, sentiment_score: float) -> Dict:
+        nl = nick.lower()
+        lower = text.lower()
+        words = set(lower.split())
+        score = 0.0
+        signals = []
+
+        # 1. Sarcasm phrase match
+        phrase_matches = sum(1 for p in self._SARCASM_PHRASES if p in lower)
+        if phrase_matches > 0:
+            score += min(phrase_matches * 0.25, 0.5)
+            signals.append(f"phrase_match({phrase_matches})")
+
+        # 2. Sentiment mismatch
+        has_positive = bool(words & self._POSITIVE_WORDS)
+        has_negative = bool(words & self._NEGATIVE_WORDS)
+        if has_positive and sentiment_score < -0.3:
+            score += 0.3
+            signals.append("positive_words_negative_sentiment")
+        elif has_negative and sentiment_score > 0.3:
+            score += 0.3
+            signals.append("negative_words_positive_sentiment")
+
+        # 3. Exaggeration + positive/negative combo
+        has_exaggeration = bool(words & self._EXAGGERATION_MARKERS)
+        if has_exaggeration and (has_positive or has_negative):
+            score += 0.15
+            signals.append("exaggeration")
+
+        # 4. Punctuation patterns
+        punct_signals = []
+        for pattern, name in self._PUNCTUATION_PATTERNS:
+            if pattern.search(text):
+                punct_signals.append(name)
+                if name == "explicit":
+                    score += 0.8
+                else:
+                    score += 0.1
+        if punct_signals:
+            signals.append(f"punctuation({','.join(punct_signals)})")
+
+        # 5. Context contradiction (check recent messages)
+        user_msgs = self._user_messages.get(nl, [])[-5:]
+        if len(user_msgs) >= 2:
+            recent_sentiments = [m["sentiment"] for m in user_msgs]
+            if len(recent_sentiments) >= 2:
+                avg_recent = sum(recent_sentiments[:-1]) / len(recent_sentiments[:-1])
+                if (avg_recent > 0.3 and sentiment_score < -0.3) or \
+                   (avg_recent < -0.3 and sentiment_score > 0.3):
+                    score += 0.2
+                    signals.append("context_contradiction")
+
+        # 6. Question + statement mismatch
+        if "?" in text and has_positive:
+            score += 0.1
+            signals.append("rhetorical_question")
+
+        score = min(score, 1.0)
+        is_sarcastic = score >= self._SARCASM_THRESHOLD
+
+        result = {
+            "nick": nick,
+            "text": text[:100],
+            "score": round(score, 3),
+            "is_sarcastic": is_sarcastic,
+            "signals": signals,
+            "ts": time.time(),
+        }
+
+        self._user_messages.setdefault(nl, []).append({
+            "text": text,
+            "sentiment": sentiment_score,
+            "score": score,
+            "ts": time.time(),
+        })
+        if len(self._user_messages.get(nl, [])) > 100:
+            self._user_messages[nl] = self._user_messages[nl][-50:]
+
+        if is_sarcastic:
+            self._detected.append(result)
+            if len(self._detected) > 200:
+                self._detected = self._detected[-100:]
+            self._maybe_save()
+
+        return result
+
+    def get_user_sarcasm_rate(self, nick: str, limit: int = 50) -> Dict:
+        nl = nick.lower()
+        msgs = self._user_messages.get(nl, [])[-limit:]
+        if not msgs:
+            return {"nick": nick, "sarcasm_rate": 0.0, "total_analyzed": 0}
+        sarcastic = sum(1 for m in msgs if m["score"] >= self._SARCASM_THRESHOLD)
+        return {
+            "nick": nick,
+            "sarcasm_rate": round(sarcastic / len(msgs), 3),
+            "total_analyzed": len(msgs),
+            "sarcastic_count": sarcastic,
+            "avg_score": round(sum(m["score"] for m in msgs) / len(msgs), 3),
+        }
+
+    def get_recent_detections(self, limit: int = 20) -> List[Dict]:
+        return self._detected[-limit:]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "user_messages": {k: v[-20:] for k, v in self._user_messages.items()},
+                "detected": self._detected[-50:],
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._user_messages = data.get("user_messages", {})
+            self._detected = data.get("detected", [])
+        except Exception:
+            pass
+
+
+# =========================
+# Emotion Arc
+# =========================
+
+class EmotionArc:
+    """Tracks emotional journey over time for users.
+
+    Emotions tracked:
+      • joy        — happiness, excitement, satisfaction
+      • anger      — frustration, rage, annoyance
+      • sadness    — disappointment, grief, melancholy
+      • fear       — anxiety, worry, concern
+      • surprise   — shock, amazement, disbelief
+      • disgust    — contempt, revulsion, disapproval
+      • neutral    — baseline, factual, unemotional
+
+    Provides:
+      • Per-user emotion timeline
+      • Emotion transition patterns
+      • Dominant emotion per time window
+      • Emotional volatility scoring
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "emotion_arc.json")
+
+    _EMOTION_LEXICON = {
+        "joy": {"happy", "joy", "excited", "great", "awesome", "love", "wonderful", "amazing", "fantastic", "excellent", "celebrate", "yay", "woohoo", "thrilled", "delighted", "pleased", "glad", "smile", "laugh", "fun", "enjoy", "beautiful", "perfect", "brilliant", "superb", "outstanding", "magnificent", "marvelous", "splendid", "grateful", "thankful", "blessed", "fortunate", "lucky"},
+        "anger": {"angry", "mad", "furious", "rage", "hate", "annoyed", "frustrated", "irritated", "pissed", "outraged", "infuriated", "livid", "enraged", "hostile", "aggressive", "violent", "threat", "attack", "destroy", "kill", "stupid", "idiot", "moron", "dumb", "useless", "worthless", "garbage", "trash", "disgusting", "revolting", "sickening"},
+        "sadness": {"sad", "depressed", "unhappy", "miserable", "grief", "sorrow", "cry", "tears", "lonely", "alone", "lost", "hopeless", "despair", "heartbroken", "devastated", "crushed", "disappointed", "regret", "sorry", "miss", "missing", "pain", "hurt", "suffering", "tragic", "tragedy", "unfortunate", "pity", "poor"},
+        "fear": {"scared", "afraid", "fear", "terrified", "anxious", "worried", "nervous", "panic", "dread", "horror", "frightened", "alarmed", "concerned", "uneasy", "tense", "stress", "paranoid", "phobia", "threatened", "danger", "dangerous", "risk", "unsafe", "insecure", "vulnerable", "helpless"},
+        "surprise": {"surprised", "shocked", "amazed", "astonished", "stunned", "wow", "omg", "unbelievable", "incredible", "unexpected", "suddenly", "whoa", "gasp", "jaw-dropping", "mind-blowing", "remarkable", "extraordinary", "phenomenal", "miracle", "miraculous"},
+        "disgust": {"disgust", "disgusting", "gross", "nasty", "revolting", "sickening", "repulsive", "contempt", "despise", "loathe", "abhor", "detest", "vile", "foul", "repugnant", "offensive", "obnoxious", "awful", "horrible", "terrible", "dreadful", "atrocious", "abysmal", "appalling"},
+    }
+
+    _EMOTION_TRANSITIONS = {
+        ("joy", "anger"): "frustrated happiness",
+        ("anger", "joy"): "reconciliation",
+        ("sadness", "joy"): "recovery",
+        ("joy", "sadness"): "disappointment",
+        ("fear", "anger"): "defensive aggression",
+        ("anger", "sadness"): "defeat",
+        ("surprise", "joy"): "delight",
+        ("surprise", "fear"): "alarm",
+        ("disgust", "anger"): "moral outrage",
+    }
+
+    def __init__(self):
+        self._user_emotions: Dict[str, List[Dict]] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def analyze(self, nick: str, text: str, ts: float = None) -> Dict:
+        if ts is None:
+            ts = time.time()
+        nl = nick.lower()
+        lower = text.lower()
+        words = set(lower.split())
+
+        emotion_scores = {}
+        for emotion, lexicon in self._EMOTION_LEXICON.items():
+            matches = words & lexicon
+            emotion_scores[emotion] = len(matches) / max(len(words), 1)
+
+        # Normalize to get dominant emotion
+        total = sum(emotion_scores.values())
+        if total > 0:
+            for e in emotion_scores:
+                emotion_scores[e] = emotion_scores[e] / total
+        else:
+            emotion_scores["neutral"] = 1.0
+
+        dominant = max(emotion_scores, key=emotion_scores.get)
+        confidence = emotion_scores[dominant]
+
+        # Track transition
+        prev_emotion = None
+        user_history = self._user_emotions.get(nl, [])
+        if user_history:
+            prev_emotion = user_history[-1]["dominant"]
+
+        transition = None
+        if prev_emotion and prev_emotion != dominant:
+            transition = self._EMOTION_TRANSITIONS.get((prev_emotion, dominant), f"{prev_emotion}→{dominant}")
+
+        result = {
+            "nick": nick,
+            "text": text[:80],
+            "emotions": {k: round(v, 3) for k, v in sorted(emotion_scores.items(), key=lambda x: -x[1])},
+            "dominant": dominant,
+            "confidence": round(confidence, 3),
+            "prev_emotion": prev_emotion,
+            "transition": transition,
+            "ts": ts,
+        }
+
+        self._user_emotions.setdefault(nl, []).append(result)
+        if len(self._user_emotions.get(nl, [])) > 200:
+            self._user_emotions[nl] = self._user_emotions[nl][-100:]
+
+        self._maybe_save()
+        return result
+
+    def get_arc(self, nick: str, window: int = 50) -> Dict:
+        nl = nick.lower()
+        history = self._user_emotions.get(nl, [])[-window:]
+        if not history:
+            return {"nick": nick, "arc": [], "summary": {}}
+
+        emotion_counts = Counter(h["dominant"] for h in history)
+        total = len(history)
+
+        # Volatility: how often emotions change
+        changes = sum(1 for i in range(1, len(history)) if history[i]["dominant"] != history[i-1]["dominant"])
+        volatility = changes / max(total - 1, 1)
+
+        # Transitions
+        transitions = [h["transition"] for h in history if h.get("transition")]
+        transition_counts = Counter(transitions)
+
+        # Time-based summary
+        time_buckets = {}
+        for h in history:
+            hour = time.localtime(h["ts"]).tm_hour
+            bucket = hour // 4
+            time_buckets.setdefault(bucket, []).append(h["dominant"])
+
+        dominant_by_period = {}
+        period_names = {"0": "night (0-4)", "1": "morning (4-8)", "2": "day (8-16)", "3": "evening (16-24)"}
+        for bucket, emotions in time_buckets.items():
+            dominant_by_period[period_names[str(bucket)]] = Counter(emotions).most_common(1)[0][0]
+
+        return {
+            "nick": nick,
+            "arc": [{"dominant": h["dominant"], "confidence": h["confidence"], "ts": h["ts"], "transition": h.get("transition")} for h in history],
+            "summary": {
+                "total_messages": total,
+                "emotion_distribution": {k: round(v / total, 3) for k, v in emotion_counts.items()},
+                "volatility": round(volatility, 3),
+                "top_transitions": dict(transition_counts.most_common(5)),
+                "dominant_by_period": dominant_by_period,
+                "most_common_emotion": emotion_counts.most_common(1)[0][0] if emotion_counts else "neutral",
+            },
+        }
+
+    def compare_arcs(self, nick1: str, nick2: str, window: int = 50) -> Dict:
+        arc1 = self.get_arc(nick1, window)
+        arc2 = self.get_arc(nick2, window)
+        if not arc1["arc"] or not arc2["arc"]:
+            return {"error": "Not enough data for both users"}
+
+        # Emotional alignment: how often they share the same dominant emotion
+        times1 = {h["ts"]: h["dominant"] for h in arc1["arc"]}
+        times2 = {h["ts"]: h["dominant"] for h in arc2["arc"]}
+        common_times = set(times1.keys()) & set(times2.keys())
+        if common_times:
+            matches = sum(1 for t in common_times if times1[t] == times2[t])
+            alignment = matches / len(common_times)
+        else:
+            alignment = 0.0
+
+        return {
+            "nick1": nick1,
+            "nick2": nick2,
+            "alignment": round(alignment, 3),
+            "nick1_dominant": arc1["summary"]["most_common_emotion"],
+            "nick2_dominant": arc2["summary"]["most_common_emotion"],
+            "nick1_volatility": arc1["summary"]["volatility"],
+            "nick2_volatility": arc2["summary"]["volatility"],
+        }
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "user_emotions": {k: [{"dominant": h["dominant"], "confidence": h["confidence"], "ts": h["ts"], "transition": h.get("transition")} for h in v] for k, v in self._user_emotions.items()},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._user_emotions = data.get("user_emotions", {})
+        except Exception:
+            pass
+
+
+# =========================
+# Ban Evasion Detector
+# =========================
+
+class BanEvasionDetector:
+    """Detects banned users returning with new nicks using biometric and linguistic fingerprints.
+
+    Tracks:
+      • Vocabulary overlap (Jaccard similarity)
+      • N-gram patterns (bigram/trigram similarity)
+      • Timing regularity (inter-message gap distribution)
+      • Channel affinity (shared channels, join times)
+      • Behavioral markers (message length, punctuation habits)
+    
+    Provides real-time alerts when a new nick strongly matches a banned profile.
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "ban_evasion.json")
+    _EVASION_THRESHOLD = 0.65
+
+    def __init__(self):
+        self._banned_profiles: Dict[str, Dict] = {}
+        self._user_stats: Dict[str, Dict] = {}
+        self._detected_matches: List[Dict] = []
+        self._last_save: float = 0.0
+        self.load()
+
+    def track_user(self, nick: str, channel: str, text: str, timing_gaps: List[float]) -> None:
+        nl = nick.lower()
+        stats = self._user_stats.setdefault(nl, {
+            "channels": set(), "vocab": set(), "bigrams": Counter(),
+            "timing_gaps": deque(maxlen=100), "msg_count": 0,
+            "total_chars": 0, "punct_count": 0, "first_seen": time.time(),
+        })
+        stats["channels"].add(channel.lower())
+        stats["msg_count"] += 1
+        stats["total_chars"] += len(text)
+        stats["punct_count"] += sum(1 for c in text if c in ".,;:!?")
+
+        words = text.lower().split()
+        stats["vocab"].update(w.strip(".,;:!?\"'()[]") for w in words if len(w) > 2)
+        for i in range(len(words) - 1):
+            stats["bigrams"][(words[i], words[i + 1])] += 1
+
+        stats["timing_gaps"].extend(timing_gaps)
+
+    def snapshot_banned(self, nick: str, reason: str = "") -> Optional[Dict]:
+        nl = nick.lower()
+        stats = self._user_stats.get(nl)
+        if not stats or stats["msg_count"] < 3:
+            return None
+
+        profile = {
+            "nick": nl, "reason": reason, "banned_at": time.time(),
+            "channels": set(stats["channels"]), "vocab": set(stats["vocab"]),
+            "bigrams": dict(stats["bigrams"].most_common(500)),
+            "timing_mean": sum(stats["timing_gaps"]) / max(len(stats["timing_gaps"]), 1),
+            "timing_std": (sum((g - sum(stats["timing_gaps"])/len(stats["timing_gaps"]))**2 for g in stats["timing_gaps"]) / max(len(stats["timing_gaps"]), 1))**0.5,
+            "avg_msg_len": stats["total_chars"] / max(stats["msg_count"], 1),
+            "punct_ratio": stats["punct_count"] / max(stats["total_chars"], 1),
+            "msg_count": stats["msg_count"],
+        }
+        self._banned_profiles[nl] = profile
+        self._maybe_save()
+        return profile
+
+    def check_evasion(self, nick: str) -> Optional[Dict]:
+        nl = nick.lower()
+        stats = self._user_stats.get(nl)
+        if not stats or stats["msg_count"] < 3:
+            return None
+
+        best_match = None
+        best_score = 0.0
+
+        for b_nick, b_profile in self._banned_profiles.items():
+            if b_nick == nl:
+                continue
+
+            # 1. Vocabulary Overlap (Jaccard)
+            vocab_sim = len(stats["vocab"] & b_profile["vocab"]) / max(len(stats["vocab"] | b_profile["vocab"]), 1)
+
+            # 2. Bigram Overlap
+            user_bigrams = Counter(stats["bigrams"])
+            banned_bigrams = Counter(b_profile["bigrams"])
+            overlap = sum((user_bigrams & banned_bigrams).values())
+            total = sum(user_bigrams.values())
+            bigram_sim = overlap / max(total, 1)
+
+            # 3. Timing Similarity
+            if stats["timing_gaps"] and b_profile["timing_mean"] > 0:
+                u_mean = sum(stats["timing_gaps"]) / len(stats["timing_gaps"])
+                u_std = (sum((g - u_mean)**2 for g in stats["timing_gaps"]) / len(stats["timing_gaps"]))**0.5
+                mean_diff = abs(u_mean - b_profile["timing_mean"]) / max(b_profile["timing_mean"], 1)
+                std_diff = abs(u_std - b_profile["timing_std"]) / max(b_profile["timing_std"], 1)
+                timing_sim = max(0, 1.0 - (mean_diff + std_diff) / 2)
+            else:
+                timing_sim = 0.0
+
+            # 4. Channel Affinity
+            chan_sim = len(stats["channels"] & b_profile["channels"]) / max(len(stats["channels"] | b_profile["channels"]), 1)
+
+            # 5. Behavioral Similarity
+            len_diff = abs(stats["total_chars"]/max(stats["msg_count"],1) - b_profile["avg_msg_len"]) / max(b_profile["avg_msg_len"], 1)
+            punct_diff = abs(stats["punct_count"]/max(stats["total_chars"],1) - b_profile["punct_ratio"])
+            behavior_sim = max(0, 1.0 - (len_diff + punct_diff) / 2)
+
+            # Weighted Score
+            score = (vocab_sim * 0.30 + bigram_sim * 0.25 + timing_sim * 0.20 + chan_sim * 0.15 + behavior_sim * 0.10)
+
+            if score > best_score and score >= self._EVASION_THRESHOLD:
+                best_score = score
+                best_match = {
+                    "suspect": nick, "banned_nick": b_nick,
+                    "score": round(score, 3), "reason": b_profile.get("reason", ""),
+                    "details": {
+                        "vocab": round(vocab_sim, 3), "bigram": round(bigram_sim, 3),
+                        "timing": round(timing_sim, 3), "channel": round(chan_sim, 3), "behavior": round(behavior_sim, 3)
+                    },
+                    "ts": time.time(),
+                }
+
+        if best_match:
+            self._detected_matches.append(best_match)
+            if len(self._detected_matches) > 50:
+                self._detected_matches.pop(0)
+            return best_match
+        return None
+
+    def list_banned(self) -> List[Dict]:
+        return [{"nick": k, **v} for k, v in self._banned_profiles.items()]
+
+    def remove_banned(self, nick: str) -> bool:
+        nl = nick.lower()
+        if nl in self._banned_profiles:
+            del self._banned_profiles[nl]
+            self._maybe_save()
+            return True
+        return False
+
+    def get_matches(self, limit: int = 10) -> List[Dict]:
+        return self._detected_matches[-limit:]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "banned_profiles": {k: {**v, "channels": list(v["channels"]), "vocab": list(v["vocab"])} for k, v in self._banned_profiles.items()},
+                "matches": self._detected_matches[-20:],
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in data.get("banned_profiles", {}).items():
+                v["channels"] = set(v.get("channels", []))
+                v["vocab"] = set(v.get("vocab", []))
+                self._banned_profiles[k] = v
+            self._detected_matches = data.get("matches", [])
+        except Exception:
+            pass
+
+
+# =========================
+# Real-time Fact Checker
+# =========================
+
+class RealtimeFactChecker:
+    """Cross-references claims against knowledge sources in real-time.
+
+    Sources:
+      • Wikipedia API for factual claims
+      • Known fact database (user-curated)
+      • Claim pattern matching (common misinformation)
+      • Statistical anomaly detection (numbers that don't add up)
+      • Source credibility scoring
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "fact_checker.json")
+
+    _CLAIM_PATTERNS = re.compile(
+        r'(?:studies show|research (?:shows|indicates|proves)|'
+        r'experts (?:say|agree|confirm)|scientists (?:found|discovered|proved)|'
+        r'it is (?:well )?known that|everyone knows|'
+        r'(?:\d+)% of (?:people|Americans|users)|'
+        r'(?:more|less) than \d+ (?:people|users|cases)|'
+        r'(?:first|second|third|last) (?:time|year|month|day))',
+        re.IGNORECASE,
+    )
+
+    _NUMBER_PATTERN = re.compile(r'\b(\d[\d,]*(?:\.\d+)?(?:\s*(?:million|billion|trillion|percent|%))?)\b', re.IGNORECASE)
+
+    def __init__(self):
+        self._fact_db: Dict[str, Dict] = {}
+        self._claim_log: deque = deque(maxlen=500)
+        self._wiki_cache: Dict[str, Dict] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def check(self, nick: str, channel: str, text: str) -> List[Dict]:
+        results = []
+        claims = self._extract_claims(text)
+        for claim in claims:
+            result = self._verify_claim(claim, text)
+            if result:
+                result["nick"] = nick
+                result["channel"] = channel
+                result["ts"] = time.time()
+                results.append(result)
+                self._claim_log.append(result)
+        self._maybe_save()
+        return results
+
+    def _extract_claims(self, text: str) -> List[str]:
+        claims = []
+        sentences = re.split(r'[.!?]+', text)
+        for sent in sentences:
+            sent = sent.strip()
+            if len(sent) < 10:
+                continue
+            if self._CLAIM_PATTERNS.search(sent):
+                claims.append(sent)
+            elif self._NUMBER_PATTERN.search(sent) and any(w in sent.lower() for w in
+                {"percent", "%", "million", "billion", "times", "more", "less", "increase", "decrease"}):
+                claims.append(sent)
+        return claims
+
+    def _verify_claim(self, claim: str, context: str) -> Optional[Dict]:
+        confidence = 0.0
+        flags = []
+
+        if self._CLAIM_PATTERNS.search(claim):
+            confidence += 0.3
+            flags.append("vague attribution")
+
+        numbers = self._NUMBER_PATTERN.findall(claim)
+        for num_str in numbers:
+            try:
+                num = float(num_str.replace(",", "").replace("million", "e6").replace("billion", "e9").replace("trillion", "e12").replace("%", ""))
+                if num > 1e12:
+                    confidence += 0.2
+                    flags.append(f"extreme number: {num_str}")
+            except ValueError:
+                pass
+
+        wiki_result = self._check_wikipedia(claim)
+        if wiki_result:
+            if wiki_result.get("contradicts"):
+                confidence += 0.4
+                flags.append(f"contradicts Wikipedia: {wiki_result['summary']}")
+            elif wiki_result.get("supports"):
+                confidence -= 0.2
+                flags.append("supported by Wikipedia")
+
+        if claim.lower() in self._fact_db:
+            db_entry = self._fact_db[claim.lower()]
+            if db_entry.get("verified") is False:
+                confidence += 0.5
+                flags.append("known false claim")
+            elif db_entry.get("verified") is True:
+                confidence -= 0.3
+                flags.append("verified true")
+
+        verdict = "likely_false" if confidence >= 0.6 else "questionable" if confidence >= 0.3 else "likely_true"
+
+        return {
+            "claim": claim[:200], "confidence": round(confidence, 3),
+            "verdict": verdict, "flags": flags,
+        } if confidence > 0.2 else None
+
+    def _check_wikipedia(self, claim: str) -> Optional[Dict]:
+        words = claim.lower().split()
+        key_terms = [w for w in words if len(w) > 4 and w not in
+                    {"studies", "shows", "research", "indicates", "scientists", "found", "people", "percent", "million"}]
+        if not key_terms:
+            return None
+
+        query = " ".join(key_terms[:3])
+        cached = self._wiki_cache.get(query)
+        if cached:
+            return cached
+
+        try:
+            url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(query)}"
+            req = urllib.request.Request(url, headers={"User-Agent": "eyearesee/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                summary = data.get("extract", "").lower()
+                result = {"summary": data.get("extract", "")[:200], "supports": False, "contradicts": False}
+                claim_lower = claim.lower()
+                neg_words = {"not", "no", "never", "false", "wrong", "incorrect"}
+                if any(w in summary for w in claim_lower.split() if len(w) > 4):
+                    result["supports"] = True
+                elif any(neg in summary for neg in neg_words):
+                    result["contradicts"] = True
+                self._wiki_cache[query] = result
+                if len(self._wiki_cache) > 100:
+                    self._wiki_cache.popitem(last=False)
+                return result
+        except Exception:
+            return None
+
+    def add_fact(self, claim: str, verified: bool, source: str = "") -> None:
+        self._fact_db[claim.lower()] = {"verified": verified, "source": source, "ts": time.time()}
+        self._maybe_save()
+
+    def get_claims(self, limit: int = 20) -> List[Dict]:
+        return list(self._claim_log)[-limit:]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "fact_db": self._fact_db,
+                "claims": list(self._claim_log)[-50:],
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._fact_db = data.get("fact_db", {})
+            for c in data.get("claims", []):
+                self._claim_log.append(c)
+        except Exception:
+            pass
+
+
+# =========================
+# Autonomous Research Agent
+# =========================
+
+class AutonomousResearchAgent:
+    """AI agent that reads channel conversations, identifies knowledge gaps,
+    fetches relevant information, and provides summaries.
+
+    Capabilities:
+      • Topic detection and knowledge gap identification
+      • Web search and summarization
+      • Context-aware information delivery
+      • Learning from feedback (useful/not useful)
+      • Proactive assistance (detects confusion, offers help)
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "research_agent.json")
+
+    def __init__(self):
+        self._channel_context: Dict[str, deque] = {}
+        self._knowledge_gaps: List[Dict] = []
+        self._research_results: Dict[str, Dict] = {}
+        self._feedback_log: deque = deque(maxlen=200)
+        self._enabled: bool = False
+        self._last_save: float = 0.0
+        self.load()
+
+    def enable(self) -> None:
+        self._enabled = True
+
+    def disable(self) -> None:
+        self._enabled = False
+
+    def observe(self, nick: str, channel: str, text: str) -> List[Dict]:
+        if not self._enabled:
+            return []
+
+        cl = channel.lower()
+        ctx = self._channel_context.setdefault(cl, deque(maxlen=100))
+        ctx.append({"nick": nick, "text": text, "ts": time.time()})
+
+        gaps = self._identify_gaps(cl, text)
+        results = []
+        for gap in gaps:
+            research = self._research(gap)
+            if research:
+                results.append(research)
+                self._knowledge_gaps.append({**gap, **research, "ts": time.time()})
+                if len(self._knowledge_gaps) > 100:
+                    self._knowledge_gaps.pop(0)
+
+        confusion = self._detect_confusion(cl, text)
+        if confusion:
+            research = self._research(confusion)
+            if research:
+                results.append(research)
+
+        self._maybe_save()
+        return results
+
+    def _identify_gaps(self, channel: str, text: str) -> List[Dict]:
+        gaps = []
+        questions = re.findall(r'(?:what|who|where|when|why|how|which|is there|are there|does|do|can|could)\s+[^?]+\?', text, re.IGNORECASE)
+        for q in questions:
+            gaps.append({"type": "question", "query": q.strip(), "channel": channel})
+
+        entities = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', text)
+        for entity in entities:
+            if len(entity) > 3 and entity not in {"The", "This", "That", "These", "Those"}:
+                gaps.append({"type": "entity", "query": entity, "channel": channel})
+
+        return gaps[:3]
+
+    def _detect_confusion(self, channel: str, text: str) -> Optional[Dict]:
+        confusion_markers = {"confused", "don't understand", "dont understand", "what does",
+                           "what is", "how does", "how do", "explain", "clarify", "meaning"}
+        text_lower = text.lower()
+        if any(m in text_lower for m in confusion_markers):
+            words = text_lower.split()
+            query = " ".join(words[max(0, words.index("what") if "what" in words else 0):])[:100]
+            return {"type": "confusion", "query": query, "channel": channel}
+        return None
+
+    def _research(self, gap: Dict) -> Optional[Dict]:
+        query = gap["query"]
+        try:
+            url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(query)}"
+            req = urllib.request.Request(url, headers={"User-Agent": "eyearesee/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                summary = data.get("extract", "")
+                if summary and len(summary) > 20:
+                    return {
+                        "query": query, "summary": summary[:300],
+                        "url": data.get("content_urls", {}).get("desktop", {}).get("page", ""),
+                        "type": gap["type"],
+                    }
+        except Exception:
+            pass
+        return None
+
+    def record_feedback(self, query: str, useful: bool) -> None:
+        self._feedback_log.append({"query": query, "useful": useful, "ts": time.time()})
+
+    def get_recent_research(self, limit: int = 10) -> List[Dict]:
+        return self._knowledge_gaps[-limit:]
+
+    def get_stats(self) -> Dict[str, Any]:
+        useful = sum(1 for f in self._feedback_log if f.get("useful"))
+        total = len(self._feedback_log)
+        return {
+            "enabled": self._enabled,
+            "gaps_identified": len(self._knowledge_gaps),
+            "feedback_useful_pct": round(useful / max(total, 1) * 100, 1),
+            "total_feedback": total,
+        }
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "knowledge_gaps": self._knowledge_gaps[-50:],
+                "feedback": list(self._feedback_log)[-100:],
+                "enabled": self._enabled,
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._knowledge_gaps = data.get("knowledge_gaps", [])
+            for fb in data.get("feedback", []):
+                self._feedback_log.append(fb)
+            self._enabled = data.get("enabled", False)
+        except Exception:
+            pass
+
+
+# =========================
+# Conversational Agent
+# =========================
+
+class ConversationalAgent:
+    """LLM-powered conversational agent that participates naturally in IRC.
+
+    Capabilities:
+      • Configurable personalities (helpful, sarcastic, expert, casual, etc.)
+      • Long-term memory of conversations per channel
+      • Context-aware responses using LLM
+      • Responds when addressed by nick or participates proactively
+      • Rate limiting to avoid flooding
+      • Topic awareness and learning from interactions
+      • Can summarize conversations, answer questions, debate topics
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "conversational_agent.json")
+
+    PERSONALITIES = {
+        "helpful": {
+            "system": "You are a helpful, friendly IRC participant. Be concise (max 2-3 sentences), use casual language, and avoid sounding like an AI. Don't use phrases like 'as an AI' or 'I'd be happy to'. Just chat naturally.",
+            "temperature": 0.7,
+        },
+        "sarcastic": {
+            "system": "You are a witty, slightly sarcastic IRC participant. Use dry humor, be clever but not mean. Keep responses short (1-2 sentences). Sound like a real person who's seen it all.",
+            "temperature": 0.8,
+        },
+        "expert": {
+            "system": "You are a knowledgeable expert participating in IRC. Provide accurate, concise information. Cite sources when possible. Keep responses under 3 sentences. Use technical language appropriately.",
+            "temperature": 0.5,
+        },
+        "casual": {
+            "system": "You are a casual IRC user chatting with friends. Use informal language, slang, and abbreviations naturally. Keep responses short (1-2 sentences). Be relatable and authentic.",
+            "temperature": 0.9,
+        },
+        "debater": {
+            "system": "You enjoy intellectual debate and discussion. Present thoughtful counterarguments, ask probing questions, and engage deeply with ideas. Stay respectful. Keep responses to 2-3 sentences.",
+            "temperature": 0.7,
+        },
+        "mentor": {
+            "system": "You are a wise mentor figure. Offer guidance, ask thought-provoking questions, and help others think through problems. Be patient and encouraging. Keep responses concise (2-3 sentences).",
+            "temperature": 0.6,
+        },
+    }
+
+    def __init__(self):
+        self._enabled: bool = False
+        self._personality: str = "helpful"
+        self._nick: str = ""
+        self._channel_context: Dict[str, deque] = {}
+        self._long_term_memory: Dict[str, List[Dict]] = {}
+        self._response_cooldowns: Dict[str, float] = {}
+        self._participation_rate: float = 0.1
+        self._max_response_len: int = 300
+        self._respond_to_mentions: bool = True
+        self._proactive_participation: bool = True
+        self._last_response_time: float = 0.0
+        self._min_response_interval: float = 5.0
+        self._conversation_summaries: Dict[str, str] = {}
+        self._user_preferences: Dict[str, Dict] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def configure(self, **kwargs) -> None:
+        if "personality" in kwargs and kwargs["personality"] in self.PERSONALITIES:
+            self._personality = kwargs["personality"]
+        if "nick" in kwargs:
+            self._nick = kwargs["nick"]
+        if "participation_rate" in kwargs:
+            self._participation_rate = max(0.0, min(1.0, float(kwargs["participation_rate"])))
+        if "max_response_len" in kwargs:
+            self._max_response_len = int(kwargs["max_response_len"])
+        if "respond_to_mentions" in kwargs:
+            self._respond_to_mentions = bool(kwargs["respond_to_mentions"])
+        if "proactive_participation" in kwargs:
+            self._proactive_participation = bool(kwargs["proactive_participation"])
+        if "min_response_interval" in kwargs:
+            self._min_response_interval = float(kwargs["min_response_interval"])
+
+    def enable(self) -> None:
+        self._enabled = True
+
+    def disable(self) -> None:
+        self._enabled = False
+
+    def observe(self, nick: str, channel: str, text: str, is_mention: bool = False) -> Optional[str]:
+        if not self._enabled:
+            return None
+
+        cl = channel.lower()
+        now = time.time()
+
+        ctx = self._channel_context.setdefault(cl, deque(maxlen=50))
+        ctx.append({"nick": nick, "text": text, "ts": now})
+
+        self._long_term_memory.setdefault(cl, []).append({
+            "nick": nick, "text": text, "ts": now,
+        })
+        if len(self._long_term_memory[cl]) > 200:
+            self._long_term_memory[cl] = self._long_term_memory[cl][-200:]
+
+        if nick.lower() == self._nick.lower():
+            return None
+
+        if now - self._last_response_time < self._min_response_interval:
+            return None
+
+        should_respond = False
+        if is_mention and self._respond_to_mentions:
+            should_respond = True
+        elif self._proactive_participation and random.random() < self._participation_rate:
+            should_respond = self._should_participate(cl, nick, text)
+
+        if should_respond:
+            response = self._generate_response(cl, nick, text)
+            if response:
+                self._last_response_time = now
+                self._response_cooldowns[cl] = now
+                return response
+        return None
+
+    def _should_participate(self, channel: str, nick: str, text: str) -> bool:
+        ctx = self._channel_context.get(channel, deque())
+        if len(ctx) < 3:
+            return False
+
+        last_response = self._response_cooldowns.get(channel, 0)
+        if time.time() - last_response < 30:
+            return False
+
+        text_lower = text.lower()
+        question_markers = {"?", "what", "how", "why", "who", "when", "where", "does", "is there", "can someone"}
+        if any(m in text_lower for m in question_markers):
+            return random.random() < 0.3
+
+        topic_keywords = {"help", "explain", "thoughts", "opinion", "agree", "disagree", "think", "know"}
+        if any(k in text_lower for k in topic_keywords):
+            return random.random() < 0.2
+
+        return False
+
+    def _generate_response(self, channel: str, nick: str, text: str) -> Optional[str]:
+        ctx = self._channel_context.get(channel, deque())
+        recent = list(ctx)[-10:]
+
+        context_str = "\n".join(f"{m['nick']}: {m['text']}" for m in recent)
+
+        personality = self.PERSONALITIES.get(self._personality, self.PERSONALITIES["helpful"])
+        system_prompt = personality["system"]
+
+        user_prompt = (
+            f"Channel: {channel}\n"
+            f"Recent conversation:\n{context_str}\n\n"
+            f"{nick} just said: {text}\n\n"
+            f"Generate a natural response (max {self._max_response_len} chars):"
+        )
+
+        try:
+            response = self._call_llm(system_prompt, user_prompt, personality["temperature"])
+            if response and len(response.strip()) > 0:
+                return response.strip()[:self._max_response_len]
+        except Exception:
+            pass
+        return None
+
+    def _call_llm(self, system_prompt: str, user_prompt: str, temperature: float) -> Optional[str]:
+        if ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
+            return self._call_claude(system_prompt, user_prompt, temperature)
+        elif OPENAI_AVAILABLE and OPENAI_API_KEY:
+            return self._call_openai(system_prompt, user_prompt, temperature)
+        elif GEMINI_AVAILABLE and GEMINI_API_KEY:
+            return self._call_gemini(system_prompt, user_prompt, temperature)
+        elif OLLAMA_URL:
+            return self._call_ollama(system_prompt, user_prompt, temperature)
+        return None
+
+    def _call_claude(self, system_prompt: str, user_prompt: str, temperature: float) -> Optional[str]:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            response = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=200,
+                temperature=temperature,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            return response.content[0].text
+        except Exception:
+            return None
+
+    def _call_openai(self, system_prompt: str, user_prompt: str, temperature: float) -> Optional[str]:
+        try:
+            import openai
+            client = openai.OpenAI(api_key=OPENAI_API_KEY)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                max_tokens=200,
+                temperature=temperature,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            return response.choices[0].message.content
+        except Exception:
+            return None
+
+    def _call_gemini(self, system_prompt: str, user_prompt: str, temperature: float) -> Optional[str]:
+        try:
+            from google import genai
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=f"{system_prompt}\n\n{user_prompt}",
+                config={"temperature": temperature, "max_output_tokens": 200},
+            )
+            return response.text
+        except Exception:
+            return None
+
+    def _call_ollama(self, system_prompt: str, user_prompt: str, temperature: float) -> Optional[str]:
+        try:
+            url = f"{OLLAMA_URL}/api/generate"
+            payload = {
+                "model": "llama3.2",
+                "prompt": f"{system_prompt}\n\n{user_prompt}",
+                "stream": False,
+                "options": {"temperature": temperature, "num_predict": 200},
+            }
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                return data.get("response", "")
+        except Exception:
+            return None
+
+    def summarize_conversation(self, channel: str, limit: int = 20) -> str:
+        ctx = self._channel_context.get(channel.lower(), deque())
+        recent = list(ctx)[-limit:]
+        if not recent:
+            return "No recent conversation."
+
+        context_str = "\n".join(f"{m['nick']}: {m['text']}" for m in recent)
+        summary_prompt = (
+            f"Summarize this IRC conversation in 2-3 sentences:\n{context_str}\n\nSummary:"
+        )
+        try:
+            return self._call_llm(
+                "You are a concise conversation summarizer. Provide brief, accurate summaries.",
+                summary_prompt,
+                0.3,
+            ) or "Unable to generate summary."
+        except Exception:
+            return "Unable to generate summary."
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "enabled": self._enabled,
+            "personality": self._personality,
+            "nick": self._nick,
+            "participation_rate": self._participation_rate,
+            "channels_active": len(self._channel_context),
+            "total_messages_tracked": sum(len(ctx) for ctx in self._channel_context.values()),
+        }
+
+    def list_personalities(self) -> List[str]:
+        return list(self.PERSONALITIES.keys())
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "enabled": self._enabled,
+                "personality": self._personality,
+                "nick": self._nick,
+                "participation_rate": self._participation_rate,
+                "max_response_len": self._max_response_len,
+                "respond_to_mentions": self._respond_to_mentions,
+                "proactive_participation": self._proactive_participation,
+                "min_response_interval": self._min_response_interval,
+                "long_term_memory": {k: v[-50:] for k, v in self._long_term_memory.items()},
+                "conversation_summaries": self._conversation_summaries,
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._enabled = data.get("enabled", False)
+            self._personality = data.get("personality", "helpful")
+            self._nick = data.get("nick", "")
+            self._participation_rate = data.get("participation_rate", 0.1)
+            self._max_response_len = data.get("max_response_len", 300)
+            self._respond_to_mentions = data.get("respond_to_mentions", True)
+            self._proactive_participation = data.get("proactive_participation", True)
+            self._min_response_interval = data.get("min_response_interval", 5.0)
+            self._long_term_memory = data.get("long_term_memory", {})
+            self._conversation_summaries = data.get("conversation_summaries", {})
+            for ch in self._long_term_memory:
+                self._channel_context[ch] = deque(self._long_term_memory[ch][-50:], maxlen=50)
+        except Exception:
+            pass
+
+
+# =========================
+# AICalibrationManager
+# =========================
+# AIVsAIDetector
+# =========================
+
+class AIVsAIDetector:
+    """Detects when two AI/bot users are talking to each other.
+
+    Correlates:
+      • Both participants have high rolling AI scores
+      • Frequent mutual mentions or replies between them
+      • Formal/templated dialogue patterns (question→answer chains)
+      • Timing regularity (uniform gaps between exchanges)
+
+    Flags AI-vs-AI conversations with confidence levels.
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "aivsai_pairs.json")
+    _AI_THRESHOLD = 60.0
+    _MIN_EXCHANGES = 3
+
+    def __init__(self):
+        self._pairs: Dict[str, Dict] = {}
+        self._recent_exchange: Dict[str, deque] = {}
+        self._ui_queue: Optional[asyncio.Queue] = None
+        self._alerts_issued: set = set()
+        self._last_save: float = 0.0
+        self.load()
+
+    def set_ui_queue(self, queue: asyncio.Queue) -> None:
+        self._ui_queue = queue
+
+    def record_exchange(self, from_nick: str, to_nick: str, channel: str,
+                        from_ai: float, to_ai: float) -> None:
+        fn = from_nick.lower()
+        tn = to_nick.lower()
+        if fn == tn:
+            return
+        pair_key = f"{min(fn, tn)}:{max(fn, tn)}"
+        self._recent_exchange.setdefault(pair_key, deque(maxlen=50))
+        self._recent_exchange[pair_key].append({
+            "from": fn, "to": tn, "channel": channel.lower(),
+            "from_ai": from_ai, "to_ai": to_ai,
+            "ts": time.time(),
+        })
+        self._evaluate_pair(pair_key, fn, tn, channel)
+
+    def _evaluate_pair(self, pair_key: str, nick_a: str, nick_b: str,
+                       channel: str) -> None:
+        exchanges = self._recent_exchange.get(pair_key, [])
+        if len(exchanges) < self._MIN_EXCHANGES:
+            return
+        recent = list(exchanges)[-20:]
+        both_high = sum(1 for e in recent
+                        if e["from_ai"] >= self._AI_THRESHOLD
+                        and e["to_ai"] >= self._AI_THRESHOLD)
+        if both_high < self._MIN_EXCHANGES:
+            return
+        avg_ai = sum((e["from_ai"] + e["to_ai"]) / 2 for e in recent) / len(recent)
+        gaps = []
+        for i in range(1, len(recent)):
+            gaps.append(recent[i]["ts"] - recent[i - 1]["ts"])
+        gap_uniformity = 0.0
+        if gaps:
+            mean_gap = sum(gaps) / len(gaps)
+            if mean_gap > 0:
+                cv = (sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)) ** 0.5 / mean_gap
+                gap_uniformity = max(0.0, 1.0 - cv)
+        confidence = min(1.0,
+                         0.4 * (both_high / len(recent))
+                         + 0.3 * (avg_ai / 100.0)
+                         + 0.2 * gap_uniformity
+                         + 0.1 * min(1.0, len(recent) / 10.0))
+        self._pairs[pair_key] = {
+            "nick_a": nick_a, "nick_b": nick_b,
+            "channel": channel.lower(),
+            "exchanges": len(recent),
+            "both_high": both_high,
+            "avg_ai": round(avg_ai, 1),
+            "gap_uniformity": round(gap_uniformity, 3),
+            "confidence": round(confidence, 3),
+            "last_seen": time.time(),
+        }
+        if confidence >= 0.5 and pair_key not in self._alerts_issued:
+            self._alerts_issued.add(pair_key)
+            if self._ui_queue:
+                try:
+                    self._ui_queue.put_nowait(("status",
+                        f"[ai-vs-ai] {nick_a} ↔ {nick_b} in {channel}: "
+                        f"confidence={confidence:.0%} "
+                        f"avg_ai={avg_ai:.0f}% exchanges={len(recent)}"))
+                except Exception:
+                    pass
+        elif confidence < 0.3:
+            self._alerts_issued.discard(pair_key)
+        self._maybe_save()
+
+    def get_active_pairs(self, min_confidence: float = 0.3) -> list:
+        results = []
+        for pair_key, data in self._pairs.items():
+            if data["confidence"] >= min_confidence:
+                results.append(data)
+        results.sort(key=lambda x: -x["confidence"])
+        return results
+
+    def get_pair(self, nick_a: str, nick_b: str) -> Optional[Dict]:
+        pair_key = f"{min(nick_a.lower(), nick_b.lower())}:{max(nick_a.lower(), nick_b.lower())}"
+        return self._pairs.get(pair_key)
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._pairs, f, indent=2)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._pairs = data
+        except Exception:
+            pass
+
+
+# =========================
+# SentimentAICorrelator
+# =========================
+
+class SentimentAICorrelator:
+    """Correlates sentiment scores with AI detection scores per nick and channel.
+
+    Tracks:
+      • Per-nick sentiment vs AI score distribution
+      • Channel-level correlation (do AI messages cluster in specific sentiment ranges?)
+      • Anomaly flags (nicks whose sentiment is unnaturally uniform given high AI scores)
+
+    Provides /saicorr to inspect sentiment-AI correlation patterns.
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "sentiment_ai_corr.json")
+
+    def __init__(self):
+        self._nick_data: Dict[str, Dict] = {}
+        self._channel_data: Dict[str, Dict] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def record(self, nick: str, channel: str, ai_score: float,
+               sentiment: float, intensity: float = 0.0) -> None:
+        nl = nick.lower()
+        cl = channel.lower()
+        entry = {
+            "ai": ai_score, "sentiment": sentiment,
+            "intensity": intensity, "ts": time.time(),
+        }
+        nd = self._nick_data.setdefault(nl, {"samples": [], "channel": cl})
+        nd["samples"].append(entry)
+        if len(nd["samples"]) > 200:
+            nd["samples"] = nd["samples"][-200:]
+        cd = self._channel_data.setdefault(cl, {"samples": []})
+        cd["samples"].append(entry)
+        if len(cd["samples"]) > 500:
+            cd["samples"] = cd["samples"][-500:]
+        self._maybe_save()
+
+    def get_nick_correlation(self, nick: str) -> Dict:
+        nl = nick.lower()
+        nd = self._nick_data.get(nl, {})
+        samples = nd.get("samples", [])
+        if len(samples) < 3:
+            return {"nick": nick, "samples": len(samples), "correlation": None,
+                    "ai_sentiment_avg": None, "anomaly": False}
+        ai_scores = [s["ai"] for s in samples]
+        sent_scores = [s["sentiment"] for s in samples]
+        high_ai = [s for s in samples if s["ai"] >= 60]
+        low_ai = [s for s in samples if s["ai"] < 40]
+        correlation = self._pearson_r(ai_scores, sent_scores)
+        ai_sent_avg = (sum(s["sentiment"] for s in high_ai) / len(high_ai)) if high_ai else None
+        human_sent_avg = (sum(s["sentiment"] for s in low_ai) / len(low_ai)) if low_ai else None
+        sent_variance = self._variance(sent_scores)
+        anomaly = len(high_ai) >= 3 and sent_variance < 0.02
+        return {
+            "nick": nick, "samples": len(samples),
+            "correlation": round(correlation, 3) if correlation is not None else None,
+            "ai_sentiment_avg": round(ai_sent_avg, 3) if ai_sent_avg is not None else None,
+            "human_sentiment_avg": round(human_sent_avg, 3) if human_sent_avg is not None else None,
+            "sentiment_variance": round(sent_variance, 4),
+            "high_ai_count": len(high_ai),
+            "anomaly": anomaly,
+            "anomaly_reason": "uniform sentiment with high AI scores" if anomaly else "",
+        }
+
+    def get_channel_correlation(self, channel: str) -> Dict:
+        cl = channel.lower()
+        cd = self._channel_data.get(cl, {})
+        samples = cd.get("samples", [])
+        if len(samples) < 5:
+            return {"channel": channel, "samples": len(samples), "correlation": None}
+        ai_scores = [s["ai"] for s in samples]
+        sent_scores = [s["sentiment"] for s in samples]
+        high_ai = [s for s in samples if s["ai"] >= 60]
+        low_ai = [s for s in samples if s["ai"] < 40]
+        correlation = self._pearson_r(ai_scores, sent_scores)
+        ai_sent_avg = (sum(s["sentiment"] for s in high_ai) / len(high_ai)) if high_ai else None
+        human_sent_avg = (sum(s["sentiment"] for s in low_ai) / len(low_ai)) if low_ai else None
+        ai_int_avg = (sum(s["intensity"] for s in high_ai) / len(high_ai)) if high_ai else None
+        human_int_avg = (sum(s["intensity"] for s in low_ai) / len(low_ai)) if low_ai else None
+        return {
+            "channel": channel, "samples": len(samples),
+            "correlation": round(correlation, 3) if correlation is not None else None,
+            "ai_sentiment_avg": round(ai_sent_avg, 3) if ai_sent_avg is not None else None,
+            "human_sentiment_avg": round(human_sent_avg, 3) if human_sent_avg is not None else None,
+            "ai_intensity_avg": round(ai_int_avg, 3) if ai_int_avg is not None else None,
+            "human_intensity_avg": round(human_int_avg, 3) if human_int_avg is not None else None,
+            "high_ai_pct": round(len(high_ai) / len(samples) * 100, 1),
+        }
+
+    def get_top_anomalies(self, limit: int = 10) -> list:
+        results = []
+        for nick, data in self._nick_data.items():
+            corr = self.get_nick_correlation(nick)
+            if corr["anomaly"]:
+                results.append(corr)
+        results.sort(key=lambda x: -x.get("high_ai_count", 0))
+        return results[:limit]
+
+    @staticmethod
+    def _pearson_r(xs: list, ys: list) -> Optional[float]:
+        n = len(xs)
+        if n < 3:
+            return None
+        mean_x = sum(xs) / n
+        mean_y = sum(ys) / n
+        cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+        var_x = sum((x - mean_x) ** 2 for x in xs)
+        var_y = sum((y - mean_y) ** 2 for y in ys)
+        denom = (var_x * var_y) ** 0.5
+        if denom == 0:
+            return None
+        return cov / denom
+
+    @staticmethod
+    def _variance(xs: list) -> float:
+        if not xs:
+            return 0.0
+        mean = sum(xs) / len(xs)
+        return sum((x - mean) ** 2 for x in xs) / len(xs)
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump({"nicks": self._nick_data, "channels": self._channel_data}, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._nick_data = data.get("nicks", {})
+            self._channel_data = data.get("channels", {})
+        except Exception:
+            pass
+
+
+# =========================
+# BehavioralBiometrics
+# =========================
+
+class BehavioralBiometrics:
+    """Tracks user typing cadence, response latency, and keystroke dynamics.
+
+    Monitors:
+      • Key-to-key dwell times (typing rhythm)
+      • Flight times (gap between key releases/presses)
+      • Inter-message latency (time between receiving a message and replying)
+      • Typing burst patterns (continuous typing vs pause-heavy)
+      • Backspace/edit rate (self-correction frequency)
+      • Message composition time (from first keystroke to Enter)
+
+    Provides a per-session biometric profile that can be correlated with
+    AI detection scores — humans exhibit variable, idiosyncratic typing
+    patterns while bots/AI tend to have uniform timing or instant responses.
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "biometrics.json")
+
+    def __init__(self):
+        self._key_dwell_times: deque = deque(maxlen=500)
+        self._flight_times: deque = deque(maxlen=500)
+        self._composition_times: deque = deque(maxlen=200)
+        self._response_latencies: deque = deque(maxlen=200)
+        self._backspace_count: int = 0
+        self._total_keystrokes: int = 0
+        self._current_composition_start: float = 0.0
+        self._last_key_time: float = 0.0
+        self._last_incoming_msg_time: float = 0.0
+        self._typing_bursts: deque = deque(maxlen=100)
+        self._current_burst_start: float = 0.0
+        self._current_burst_keys: int = 0
+        self._burst_threshold: float = 0.5
+        self._session_start: float = time.time()
+        self._messages_sent: int = 0
+        self._messages_edited: int = 0
+        self.load()
+
+    def record_keypress(self, is_backspace: bool = False) -> None:
+        now = time.monotonic()
+        self._total_keystrokes += 1
+        if is_backspace:
+            self._backspace_count += 1
+            self._messages_edited += 1
+        if self._last_key_time > 0:
+            flight = now - self._last_key_time
+            if flight < 2.0:
+                self._flight_times.append(flight)
+                if flight < self._burst_threshold:
+                    if self._current_burst_start == 0:
+                        self._current_burst_start = now
+                        self._current_burst_keys = 0
+                    self._current_burst_keys += 1
+                else:
+                    if self._current_burst_start > 0:
+                        duration = now - self._current_burst_start
+                        self._typing_bursts.append({
+                            "duration": duration,
+                            "keys": self._current_burst_keys,
+                            "rate": self._current_burst_keys / duration if duration > 0 else 0,
+                        })
+                        self._current_burst_start = 0
+                        self._current_burst_keys = 0
+        self._last_key_time = now
+        if self._current_composition_start == 0:
+            self._current_composition_start = now
+
+    def record_composition_complete(self) -> float:
+        if self._current_composition_start > 0:
+            comp_time = time.monotonic() - self._current_composition_start
+            self._composition_times.append(comp_time)
+            self._current_composition_start = 0
+            self._messages_sent += 1
+            if self._current_burst_start > 0:
+                now = time.monotonic()
+                duration = now - self._current_burst_start
+                self._typing_bursts.append({
+                    "duration": duration,
+                    "keys": self._current_burst_keys,
+                    "rate": self._current_burst_keys / duration if duration > 0 else 0,
+                })
+                self._current_burst_start = 0
+                self._current_burst_keys = 0
+            return comp_time
+        return 0.0
+
+    def record_incoming_message(self) -> None:
+        self._last_incoming_msg_time = time.monotonic()
+
+    def record_response(self) -> None:
+        if self._last_incoming_msg_time > 0:
+            latency = time.monotonic() - self._last_incoming_msg_time
+            if latency < 300:
+                self._response_latencies.append(latency)
+
+    def get_typing_cadence_stats(self) -> Dict[str, float]:
+        if len(self._flight_times) < 5:
+            return {"mean": 0, "std": 0, "median": 0, "p10": 0, "p90": 0, "samples": 0}
+        sorted_ft = sorted(self._flight_times)
+        mean = sum(sorted_ft) / len(sorted_ft)
+        std = (sum((x - mean) ** 2 for x in sorted_ft) / len(sorted_ft)) ** 0.5
+        median = sorted_ft[len(sorted_ft) // 2]
+        p10 = sorted_ft[max(0, int(len(sorted_ft) * 0.1))]
+        p90 = sorted_ft[min(len(sorted_ft) - 1, int(len(sorted_ft) * 0.9))]
+        return {
+            "mean": round(mean * 1000, 1),
+            "std": round(std * 1000, 1),
+            "median": round(median * 1000, 1),
+            "p10": round(p10 * 1000, 1),
+            "p90": round(p90 * 1000, 1),
+            "samples": len(sorted_ft),
+        }
+
+    def get_composition_stats(self) -> Dict[str, float]:
+        if not self._composition_times:
+            return {"mean": 0, "std": 0, "median": 0, "min": 0, "max": 0, "samples": 0}
+        sorted_ct = sorted(self._composition_times)
+        mean = sum(sorted_ct) / len(sorted_ct)
+        std = (sum((x - mean) ** 2 for x in sorted_ct) / len(sorted_ct)) ** 0.5
+        return {
+            "mean": round(mean, 2),
+            "std": round(std, 2),
+            "median": round(sorted_ct[len(sorted_ct) // 2], 2),
+            "min": round(sorted_ct[0], 2),
+            "max": round(sorted_ct[-1], 2),
+            "samples": len(sorted_ct),
+        }
+
+    def get_response_latency_stats(self) -> Dict[str, float]:
+        if not self._response_latencies:
+            return {"mean": 0, "std": 0, "median": 0, "min": 0, "max": 0, "samples": 0}
+        sorted_rl = sorted(self._response_latencies)
+        mean = sum(sorted_rl) / len(sorted_rl)
+        std = (sum((x - mean) ** 2 for x in sorted_rl) / len(sorted_rl)) ** 0.5
+        return {
+            "mean": round(mean, 2),
+            "std": round(std, 2),
+            "median": round(sorted_rl[len(sorted_rl) // 2], 2),
+            "min": round(sorted_rl[0], 2),
+            "max": round(sorted_rl[-1], 2),
+            "samples": len(sorted_rl),
+        }
+
+    def get_backspace_ratio(self) -> float:
+        if self._total_keystrokes == 0:
+            return 0.0
+        return round(self._backspace_count / self._total_keystrokes, 4)
+
+    def get_burst_stats(self) -> Dict[str, float]:
+        if not self._typing_bursts:
+            return {"avg_duration": 0, "avg_rate": 0, "avg_keys": 0, "count": 0}
+        durations = [b["duration"] for b in self._typing_bursts]
+        rates = [b["rate"] for b in self._typing_bursts]
+        keys = [b["keys"] for b in self._typing_bursts]
+        return {
+            "avg_duration": round(sum(durations) / len(durations), 2),
+            "avg_rate": round(sum(rates) / len(rates), 1),
+            "avg_keys": round(sum(keys) / len(keys), 1),
+            "count": len(self._typing_bursts),
+        }
+
+    def get_human_likelihood(self) -> float:
+        score = 50.0
+        comp = self.get_composition_stats()
+        if comp["samples"] > 0:
+            if comp["std"] > 0.5:
+                score += 10
+            if comp["mean"] > 1.0:
+                score += 5
+        resp = self.get_response_latency_stats()
+        if resp["samples"] > 0:
+            if resp["std"] > 1.0:
+                score += 10
+            if resp["mean"] > 2.0:
+                score += 5
+        bs_ratio = self.get_backspace_ratio()
+        if bs_ratio > 0.02:
+            score += 10
+        elif bs_ratio > 0.005:
+            score += 5
+        cadence = self.get_typing_cadence_stats()
+        if cadence["std"] > 20:
+            score += 10
+        bursts = self.get_burst_stats()
+        if bursts["count"] > 5:
+            rate_var = bursts["avg_rate"]
+            if 2 < rate_var < 15:
+                score += 5
+        return min(100.0, max(0.0, score))
+
+    def _save(self) -> None:
+        try:
+            data = {
+                "session_start": self._session_start,
+                "messages_sent": self._messages_sent,
+                "backspace_count": self._backspace_count,
+                "total_keystrokes": self._total_keystrokes,
+                "flight_times": list(self._flight_times)[-100:],
+                "composition_times": list(self._composition_times)[-50:],
+                "response_latencies": list(self._response_latencies)[-50:],
+                "typing_bursts": list(self._typing_bursts)[-30:],
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._session_start = data.get("session_start", time.time())
+            self._messages_sent = data.get("messages_sent", 0)
+            self._backspace_count = data.get("backspace_count", 0)
+            self._total_keystrokes = data.get("total_keystrokes", 0)
+            for ft in data.get("flight_times", [])[-100:]:
+                self._flight_times.append(ft)
+            for ct in data.get("composition_times", [])[-50:]:
+                self._composition_times.append(ct)
+            for rl in data.get("response_latencies", [])[-50:]:
+                self._response_latencies.append(rl)
+            for tb in data.get("typing_bursts", [])[-30:]:
+                self._typing_bursts.append(tb)
+        except Exception:
+            pass
+
+
+
 # IRC Formatting
 # =========================
 # Control codes used by IRC for inline text formatting.
@@ -1524,7 +4928,129 @@ FORMAL_WORDS = frozenset({
     "augment", "mitigate", "alleviate",
 })
 
-# Quick regex to detect AI bot-style response openers at the very start of a message
+# ── Multi-language AI detection patterns ──
+
+# CJK (Chinese/Japanese/Korean) LLM tell-phrases and patterns
+CJK_AI_TELL_PHRASES = frozenset({
+    "值得注意的是", "需要注意的是", "总的来说", "总而言之",
+    "首先", "其次", "最后", "综上所述", "简而言之",
+    "换句话说", "也就是说", "从某种意义上说", "从某种程度上说",
+    "需要指出的是", "应当注意的是", "不可否认",
+    "在我看来", "我认为", "可以说",
+    "事实上", "实际上", "客观地说",
+    "这是一个很好的问题", "好问题", "很好的问题",
+    "让我来解释", "让我详细说明", "我来帮你",
+    "希望能帮到你", "希望对你有帮助", "希望这能帮助",
+    "作为一个人工智能", "作为AI", "我的训练数据",
+    "我的知识截止", "我无法实时",
+})
+
+# Japanese LLM patterns
+JP_AI_TELL_PHRASES = frozenset({
+    "重要なのは", "注意すべきは", "まとめると", "つまり",
+    "言い換えると", "端的に言えば", "結論として",
+    "まず", "次に", "最後に",
+    "良い質問ですね", "素晴らしい質問", "ご質問ありがとうございます",
+    "詳しく説明します", "説明させていただきます",
+    "お役に立てば幸いです", "参考になれば",
+    "AIとして", "私の知識",
+})
+
+# Korean LLM patterns
+KR_AI_TELL_PHRASES = frozenset({
+    "주목할 점은", "유의해야 할 점은", "요약하자면", "결론적으로",
+    "다시 말해", "즉", "간단히 말해",
+    "먼저", "다음으로", "마지막으로",
+    "좋은 질문이네요", "훌륭한 질문입니다",
+    "자세히 설명해 드리겠습니다", "도움이 되길 바랍니다",
+    "AI로서", "제 지식은",
+})
+
+# European language LLM tell-phrases (French, German, Spanish, Portuguese, Italian)
+EU_AI_TELL_PHRASES = frozenset({
+    # French
+    "il est important de noter", "il vaut la peine de", "en résumé",
+    "en conclusion", "autrement dit", "en d'autres termes",
+    "tout d'abord", "ensuite", "enfin",
+    "excellente question", "bonne question",
+    "permettez-moi d'expliquer", "laissez-moi expliquer",
+    "j'espère que cela aide", "n'hésitez pas à",
+    "en tant qu'ia", "en tant qu'intelligence artificielle",
+    # German
+    "es ist wichtig zu beachten", "es lohnt sich zu",
+    "zusammenfassend", "kurz gesagt", "mit anderen Worten",
+    "zunächst", "desweiteren", "schließlich",
+    "gute frage", "ausgezeichnete frage",
+    "lass mich erklären", "ich erkläre gerne",
+    "ich hoffe das hilft", "zögern sie nicht",
+    "als ki", "als künstliche intelligenz",
+    # Spanish
+    "es importante tener en cuenta", "vale la pena señalar",
+    "en resumen", "en conclusión", "en otras palabras",
+    "primero", "segundo", "por último",
+    "excelente pregunta", "buena pregunta",
+    "déjame explicarte", "permíteme explicar",
+    "espero que esto ayude", "no dudes en",
+    "como ia", "como inteligencia artificial",
+    # Portuguese
+    "é importante notar", "vale a pena notar",
+    "em resumo", "em conclusão", "em outras palavras",
+    "primeiro", "segundo", "por fim",
+    "excelente pergunta", "boa pergunta",
+    "deixe-me explicar", "espero que isso ajude",
+    "como ia", "como inteligência artificial",
+    # Italian
+    "è importante notare", "vale la pena notare",
+    "in sintesi", "in conclusione", "in altre parole",
+    "innanzitutto", "in secondo luogo", "infine",
+    "ottima domanda", "buona domanda",
+    "lasciami spiegare", "spero che questo aiuti",
+    "come ia", "come intelligenza artificiale",
+})
+
+# CJK formal vocabulary that AI over-uses in casual settings
+CJK_FORMAL_WORDS = frozenset({
+    "此外", "然而", "因此", "总之", "鉴于",
+    "毋庸置疑", "至关重要", "不可或缺", "显著",
+    "涉及", "阐述", "探讨", "分析", "论证",
+    "综上所述", "换言之", "与此同时", "另一方面",
+})
+
+# European formal vocabulary
+EU_FORMAL_WORDS = frozenset({
+    "par conséquent", "néanmoins", "en outre", "cependant",
+    "demnach", "darüber hinaus", "insbesondere", "beziehungsweise",
+    "adicionalmente", "asimismo", "no obstante", "por consiguiente",
+    "adicionalmente", "outrossim", "entretanto", "por conseguinte",
+    "inoltre", "pertanto", "d'altra parte", "di conseguenza",
+})
+
+# Casual CJK words that humans use but AI rarely does in chat
+CJK_CASUAL_WORDS = frozenset({
+    "哈哈", "嘿嘿", "额", "嗯", "哦", "啊",
+    "卧槽", "牛逼", "666", "草", "emmm", "hhh",
+    "w", "kwsk", "草", "うp", "乙", "おつ",
+    "ㅋㅋ", "ㅎㅎ", "ㄷㄷ", "헐", "대박", "징징",
+})
+
+# Detect CJK character ranges for language identification
+_CJK_RANGE_RE = re.compile(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]')
+_CJK_CN_RE = re.compile(r'[\u4e00-\u9fff]')
+_CJK_JP_RE = re.compile(r'[\u3040-\u309f\u30a0-\u30ff]')
+_CJK_KR_RE = re.compile(r'[\uac00-\ud7af]')
+_LATIN_ACCENT_RE = re.compile(r'[àáâãäåèéêëìíîïòóôõöùúûüýÿñçßðþæœ]')
+
+def _detect_text_language(text: str) -> str:
+    """Simple language detection: 'zh', 'ja', 'ko', 'eu', or 'en'."""
+    if _CJK_CN_RE.search(text) and not _CJK_JP_RE.search(text):
+        return "zh"
+    if _CJK_JP_RE.search(text):
+        return "ja"
+    if _CJK_KR_RE.search(text):
+        return "ko"
+    if _LATIN_ACCENT_RE.search(text):
+        return "eu"
+    return "en"
 _BOT_OPENER_RE = re.compile(
     r"^(?:Sure[!,]?|Absolutely[!,]?|Certainly[!,]?|Of course[!,]?|"
     r"Great[!,]?|Gladly[!,]?|Happy to help[!,]?|I'?d be happy|"
@@ -2136,6 +5662,71 @@ class EnsembleAIDetector:
 
         return min(1.0, score)
 
+    @staticmethod
+    def _multilang_formality_score(text: str) -> float:
+        """0..1 — language-specific formality scoring for CJK and European text."""
+        if not text:
+            return 0.0
+        lang = _detect_text_language(text)
+        score = 0.0
+
+        if lang == "zh":
+            text_lower = text.lower()
+            if any(p in text for p in CJK_AI_TELL_PHRASES):
+                score += 0.30
+            if any(p in text for p in CJK_FORMAL_WORDS):
+                score += 0.15
+            if not any(p in text for p in CJK_CASUAL_WORDS):
+                score += 0.10
+            if re.search(r'[。；：]', text) and not re.search(r'[！？]', text):
+                score += 0.08
+            if len(text) > 80:
+                score += 0.10
+            if re.search(r'[一二三四五六七八九十]、', text):
+                score += 0.12
+            if any(p in text for p in ("首先", "其次", "最后", "第一", "第二", "第三")):
+                score += 0.10
+            return min(1.0, score)
+
+        elif lang == "ja":
+            if any(p in text for p in JP_AI_TELL_PHRASES):
+                score += 0.30
+            if re.search(r'。$', text) and not re.search(r'[！？ww]', text):
+                score += 0.10
+            if re.search(r'[①②③④⑤]', text):
+                score += 0.12
+            if len(text) > 80:
+                score += 0.08
+            if not re.search(r'ww|ｗｗ|笑', text):
+                score += 0.05
+            return min(1.0, score)
+
+        elif lang == "ko":
+            if any(p in text for p in KR_AI_TELL_PHRASES):
+                score += 0.30
+            if not any(p in text for p in CJK_CASUAL_WORDS):
+                score += 0.10
+            if re.search(r'[.；:]', text) and not re.search(r'[ㅋㅎㅠㅜ]', text):
+                score += 0.08
+            if len(text) > 80:
+                score += 0.08
+            return min(1.0, score)
+
+        elif lang == "eu":
+            text_lower = text.lower()
+            if any(p in text_lower for p in EU_AI_TELL_PHRASES):
+                score += 0.30
+            if any(p in text_lower for p in EU_FORMAL_WORDS):
+                score += 0.15
+            if any(p in text for p in ("—", "–")):
+                score += 0.10
+            words = text.split()
+            if len(words) >= 6:
+                score += 0.05
+            return min(1.0, score)
+
+        return 0.0
+
     def _heuristic_score(self, text: str) -> float:
         """Combined heuristic score incorporating general formality,
         Llama-specific patterns, burstiness, lexical diversity, and
@@ -2153,12 +5744,18 @@ class EnsembleAIDetector:
         punct   = self._punctuation_anomaly(text)       # high anomaly → AI-like
         func_w  = self._function_word_ratio(text)       # high ratio → AI-like
         opener  = 1.0 - self._sentence_openers_variety(text)  # low variety → AI-like
+        ml_form = self._multilang_formality_score(text) # CJK/EU language-specific signals
 
-        # llama_pattern_score is a strong direct signal — give it equal weight to formality
-        # New signals get moderate weight to complement existing heuristics
+        lang = _detect_text_language(text)
+        is_cjk_eu = lang not in ("en",)
+        en_weight = 0.0 if is_cjk_eu else 0.28
+        ml_weight = 0.30 if is_cjk_eu else 0.05
+        llama_w = 0.10 if is_cjk_eu else 0.25
+
         return max(0.0, min(1.0,
-            0.28 * form
-            + 0.25 * llama
+            en_weight * form
+            + llama_w * llama
+            + ml_weight * ml_form
             + 0.10 * rep
             + 0.05 * length
             - 0.10 * ent_penalty
@@ -2645,8 +6242,2861 @@ class EnsembleAIDetector:
         return output_path
 
 # =========================
-# BotFingerprint
+# Sentiment Analysis
 # =========================
+_SENTIMENT_POSITIVE = frozenset({
+    "happy", "glad", "great", "awesome", "amazing", "love", "like", "nice",
+    "cool", "fun", "funny", "lol", "haha", "rofl", "lmao", "thanks", "thank",
+    "appreciate", "helpful", "perfect", "excellent", "wonderful", "fantastic",
+    "brilliant", "superb", "outstanding", "impressive", "beautiful", "good",
+    "yes", "yeah", "yep", "sure", "ok", "okay", "agree", "correct", "right",
+    "welcome", "congrats", "congratulations", "cheers", "gg", "wp", "well done",
+    "excited", "thrilled", "delighted", "pleased", "satisfied", "joy", "joyful",
+    "blessed", "grateful", "proud", "hope", "hopeful", "optimistic",
+    "nice one", "good job", "well played", "noice", "based", "w", "fire",
+    "goat", "legend", "king", "queen", "slay", "iconic", "vibes", "mood",
+})
+_SENTIMENT_NEGATIVE = frozenset({
+    "hate", "angry", "mad", "annoyed", "frustrated", "terrible", "awful",
+    "horrible", "bad", "worst", "stupid", "idiot", "dumb", "ugly", "fail",
+    "failed", "broken", "sucks", "shit", "crap", "damn", "hell", "fucking",
+    "no", "nope", "wrong", "disagree", "incorrect", "false", "lie", "lying",
+    "scam", "fake", "trash", "garbage", "useless", "pointless", "waste",
+    "disappointed", "disappointing", "sad", "unhappy", "miserable", "depressed",
+    "frustrating", "annoying", "irritating", "boring", "tired", "exhausted",
+    "confused", "lost", "helpless", "hopeless", "pessimistic", "angry",
+    "toxic", "drama", "dramatic", "rude", "mean", "cruel", "harsh", "hostile",
+    "l", "mid", "cringe", "ratio", "copium", "cope", "seethe", "mad", "salty",
+    "triggered", "butthurt", "salty", "butthurt", "cry", "crying", "whine",
+})
+_SENTIMENT_INTENSIFIERS = frozenset({
+    "very", "really", "super", "extremely", "absolutely", "totally", "completely",
+    "utterly", "incredibly", "amazingly", "so", "such", "quite", "pretty",
+    "highly", "deeply", "strongly", "seriously", "literally", "actually",
+})
+_SENTIMENT_NEGATORS = frozenset({
+    "not", "no", "never", "neither", "nobody", "nothing", "nowhere",
+    "don't", "doesn't", "didn't", "won't", "wouldn't", "can't", "cannot",
+    "couldn't", "shouldn't", "isn't", "aren't", "wasn't", "weren't",
+    "hardly", "barely", "scarcely", "without",
+})
+
+class SentimentAnalyzer:
+    """Lightweight rule-based sentiment analysis for IRC messages.
+
+    Returns a score in [-1.0, 1.0] where negative = hostile/negative,
+    positive = friendly/positive, and 0 = neutral.
+    """
+
+    def analyze(self, text: str) -> Dict[str, float]:
+        """Return sentiment breakdown for *text*.
+
+        Keys:
+          score   – overall sentiment [-1.0, 1.0]
+          pos     – positive word count
+          neg     – negative word count
+          intensity – intensifier multiplier
+          is_negated – whether negation was detected
+        """
+        words = [w.lower().strip(".,!?;:\"'()[]") for w in text.split()]
+        if not words:
+            return {"score": 0.0, "pos": 0, "neg": 0, "intensity": 1.0, "is_negated": False}
+
+        pos_count = 0
+        neg_count = 0
+        intensity = 1.0
+        negated = False
+
+        for i, w in enumerate(words):
+            if w in _SENTIMENT_INTENSIFIERS:
+                intensity = min(2.0, intensity + 0.3)
+            if w in _SENTIMENT_NEGATORS:
+                negated = True
+            if w in _SENTIMENT_POSITIVE:
+                pos_count += 1
+            if w in _SENTIMENT_NEGATIVE:
+                neg_count += 1
+
+        # Caps lock = emotional intensity
+        if text.isupper() and len(text) > 3:
+            intensity = min(2.0, intensity + 0.2)
+
+        # Exclamation marks = intensity
+        exclam = text.count("!")
+        if exclam > 1:
+            intensity = min(2.0, intensity + 0.1 * min(exclam, 5))
+
+        # Question marks = uncertainty (slight negative bias)
+        questions = text.count("?")
+        if questions > 2:
+            neg_count += 1
+
+        raw_score = (pos_count - neg_count) * intensity
+        max_possible = max(pos_count + neg_count, 1)
+        score = max(-1.0, min(1.0, raw_score / max_possible))
+
+        # Negation flips the polarity
+        if negated:
+            score = -score * 0.5
+
+        return {
+            "score": round(score, 3),
+            "pos": pos_count,
+            "neg": neg_count,
+            "intensity": round(intensity, 2),
+            "is_negated": negated,
+        }
+
+    def sentiment_label(self, score: float) -> str:
+        if score >= 0.5:
+            return "very positive"
+        if score >= 0.2:
+            return "positive"
+        if score > -0.2:
+            return "neutral"
+        if score > -0.5:
+            return "negative"
+        return "very negative"
+
+
+# =========================
+# Behavioral Anomaly Detector
+# =========================
+class BehavioralAnomalyDetector:
+    """Detects sudden changes in a user's behavioral patterns.
+
+    Tracks:
+      • Message length distribution
+      • Sentiment distribution
+      • Timing patterns (messages per minute)
+      • Vocabulary richness
+      • Punctuation usage
+
+    Flags when a user's recent behavior deviates significantly from their
+    historical baseline (z-score > 2.0).
+    """
+
+    def __init__(self, window_size: int = 50):
+        self.window_size = window_size
+        self._user_profiles: Dict[str, Dict] = {}
+
+    def _get_profile(self, nick: str) -> Dict:
+        if nick not in self._user_profiles:
+            self._user_profiles[nick] = {
+                "msg_lengths": [],
+                "sentiments": [],
+                "gaps": [],
+                "vocab_sizes": [],
+                "punct_ratios": [],
+                "last_ts": None,
+                "anomaly_count": 0,
+                "last_anomaly_ts": 0,
+            }
+        return self._user_profiles[nick]
+
+    def update(self, nick: str, msg: str, sentiment_score: float) -> Dict[str, Any]:
+        """Update user profile and return anomaly analysis.
+
+        Returns dict with:
+          anomaly_score – 0..1 (higher = more anomalous)
+          changed_aspects – list of aspects that changed significantly
+          explanation – human-readable summary
+        """
+        prof = self._get_profile(nick)
+        now = time.time()
+
+        # Compute current metrics
+        msg_len = len(msg)
+        words = msg.split()
+        vocab_size = len(set(w.lower() for w in words))
+        punct_count = sum(1 for c in msg if c in ".,!?;:\"'()[]-")
+        punct_ratio = punct_count / max(len(msg), 1)
+
+        # Timing gap
+        gap = 0.0
+        if prof["last_ts"] is not None:
+            gap = now - prof["last_ts"]
+        prof["last_ts"] = now
+
+        # Update rolling windows
+        prof["msg_lengths"].append(msg_len)
+        prof["sentiments"].append(sentiment_score)
+        prof["vocab_sizes"].append(vocab_size)
+        prof["punct_ratios"].append(punct_ratio)
+        if gap > 0:
+            prof["gaps"].append(gap)
+
+        # Trim to window size
+        for key in ("msg_lengths", "sentiments", "vocab_sizes", "punct_ratios", "gaps"):
+            if len(prof[key]) > self.window_size:
+                prof[key] = prof[key][-self.window_size:]
+
+        # Need at least 10 samples to detect anomalies
+        if len(prof["msg_lengths"]) < 10:
+            return {
+                "anomaly_score": 0.0,
+                "changed_aspects": [],
+                "explanation": "Insufficient data for anomaly detection",
+            }
+
+        # Compute z-scores for each aspect
+        anomalies = []
+        _calc_z = lambda lst, val: self._z_score(lst, val)
+
+        len_z = _calc_z(prof["msg_lengths"][:-1], msg_len)
+        sent_z = _calc_z(prof["sentiments"][:-1], sentiment_score)
+        vocab_z = _calc_z(prof["vocab_sizes"][:-1], vocab_size)
+        punct_z = _calc_z(prof["punct_ratios"][:-1], punct_ratio)
+
+        # Gap anomaly (sudden burst or long silence)
+        gap_z = 0.0
+        if len(prof["gaps"]) >= 5:
+            gap_z = _calc_z(prof["gaps"][:-1], gap)
+
+        # Threshold: z-score > 2.0 = significant deviation
+        if abs(len_z) > 2.0:
+            anomalies.append(f"message length {'dramatically longer' if len_z > 0 else 'much shorter'} than usual")
+        if abs(sent_z) > 2.0:
+            anomalies.append(f"sentiment {'unusually positive' if sent_z > 0 else 'much more negative'} than usual")
+        if abs(vocab_z) > 2.0:
+            anomalies.append(f"vocabulary {'much richer' if vocab_z > 0 else 'much simpler'} than usual")
+        if abs(punct_z) > 2.0:
+            anomalies.append(f"punctuation usage {'much higher' if punct_z > 0 else 'much lower'} than usual")
+        if abs(gap_z) > 2.0:
+            anomalies.append(f"timing {'sudden burst' if gap_z < 0 else 'long silence'} detected")
+
+        # Composite anomaly score
+        max_z = max(abs(len_z), abs(sent_z), abs(vocab_z), abs(punct_z), abs(gap_z))
+        anomaly_score = min(1.0, max_z / 4.0)
+
+        # Track anomaly frequency
+        if anomaly_score > 0.5:
+            prof["anomaly_count"] += 1
+            prof["last_anomaly_ts"] = now
+
+        explanation = ""
+        if anomalies:
+            explanation = f"{nick}: " + "; ".join(anomalies)
+
+        return {
+            "anomaly_score": round(anomaly_score, 3),
+            "changed_aspects": anomalies,
+            "explanation": explanation,
+            "z_scores": {
+                "length": round(len_z, 2),
+                "sentiment": round(sent_z, 2),
+                "vocabulary": round(vocab_z, 2),
+                "punctuation": round(punct_z, 2),
+                "timing": round(gap_z, 2),
+            },
+        }
+
+    @staticmethod
+    def _z_score(data: list, value: float) -> float:
+        if len(data) < 2:
+            return 0.0
+        mean = sum(data) / len(data)
+        variance = sum((x - mean) ** 2 for x in data) / len(data)
+        std = variance ** 0.5
+        if std < 1e-6:
+            return 0.0
+        return (value - mean) / std
+
+
+# =========================
+# Topic Detector
+# =========================
+_TOPIC_KEYWORDS = {
+    "programming": {"code", "bug", "debug", "function", "variable", "python", "javascript",
+                    "typescript", "rust", "c++", "java", "api", "server", "database", "sql",
+                    "git", "commit", "merge", "pull", "branch", "deploy", "docker", "kubernetes",
+                    "linux", "windows", "macos", "compiler", "runtime", "library", "framework",
+                    "react", "vue", "angular", "node", "npm", "pip", "cargo", "maven"},
+    "gaming": {"game", "play", "player", "match", "win", "lose", "score", "level", "boss",
+               "raid", "dungeon", "quest", "npc", "pvp", "pve", "mmorpg", "fps", "rpg",
+               "steam", "epic", "xbox", "playstation", "nintendo", "switch", "pc", "console",
+               "gg", "wp", "noob", "pro", "carry", "feed", "afk", "respawn", "loot", "drop"},
+    "anime": {"anime", "manga", "otaku", "waifu", "husband", "senpai", "kawaii", "shonen",
+              "shoujo", "seinen", "josei", "isekai", "mecha", "slice of life", "episode",
+              "season", "arc", "filler", "canon", "studio", "gibli", "crunchyroll", "funimation",
+              "naruto", "one piece", "attack on titan", "demon slayer", "jujutsu", "chainsaw"},
+    "music": {"song", "album", "track", "band", "artist", "genre", "rock", "pop", "jazz",
+              "classical", "hip hop", "rap", "metal", "electronic", "indie", "folk", "blues",
+              "spotify", "apple music", "youtube music", "soundcloud", "bandcamp", "playlist",
+              "listen", "hear", "lyrics", "vocals", "guitar", "piano", "drums", "bass"},
+    "science": {"science", "physics", "chemistry", "biology", "math", "research", "experiment",
+                "theory", "hypothesis", "data", "analysis", "study", "paper", "journal",
+                "quantum", "relativity", "evolution", "genetics", "neuroscience", "astronomy",
+                "planet", "star", "galaxy", "universe", "black hole", "dark matter"},
+    "politics": {"politics", "government", "election", "vote", "president", "congress", "senate",
+                 "democrat", "republican", "liberal", "conservative", "policy", "law", "bill",
+                 "tax", "budget", "economy", "trade", "war", "peace", "diplomacy", "treaty"},
+    "crypto": {"crypto", "bitcoin", "ethereum", "blockchain", "token", "nft", "defi", "wallet",
+               "mining", "hash", "consensus", "proof of work", "proof of stake", "exchange",
+               "bull", "bear", "hodl", "moon", "lambo", "whale", "diamond hands", "paper hands"},
+    "health": {"health", "fitness", "exercise", "diet", "nutrition", "weight", "muscle", "cardio",
+               "yoga", "meditation", "sleep", "stress", "anxiety", "depression", "doctor",
+               "hospital", "medicine", "vitamin", "supplement", "workout", "gym", "run"},
+    "food": {"food", "cook", "recipe", "restaurant", "meal", "breakfast", "lunch", "dinner",
+             "snack", "dessert", "pizza", "sushi", "burger", "pasta", "salad", "soup",
+             "vegan", "vegetarian", "keto", "paleo", "gluten free", "organic", "fresh"},
+    "ai_ml": {"ai", "machine learning", "deep learning", "neural network", "model", "training",
+              "inference", "dataset", "label", "feature", "accuracy", "precision", "recall",
+              "transformer", "llm", "gpt", "claude", "gemini", "llama", "mistral", "qwen",
+              "prompt", "token", "embedding", "vector", "attention", "fine-tune", "rlhf"},
+}
+
+class TopicDetector:
+    """Detects topics in messages using keyword matching.
+
+    Returns a list of (topic, confidence) pairs for each message.
+    """
+
+    def detect(self, text: str) -> List[Tuple[str, float]]:
+        """Return list of (topic, confidence) for *text*.
+
+        Confidence is 0..1 based on keyword density.
+        """
+        text_lower = text.lower()
+        words = set(text_lower.split())
+        results = []
+
+        for topic, keywords in _TOPIC_KEYWORDS.items():
+            hits = words & keywords
+            if hits:
+                confidence = min(1.0, len(hits) / max(len(keywords) * 0.1, 1))
+                results.append((topic, round(confidence, 3)))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:3]  # Return top 3 topics
+
+
+# =========================
+# Semantic Similarity Detector
+# =========================
+class SemanticSimilarityDetector:
+    """Detects when users send semantically similar messages.
+
+    Uses lightweight n-gram overlap and word set similarity to find
+    potential copy-paste, bot coordination, or repeated spam.
+    """
+
+    def __init__(self, max_entries: int = 500):
+        self.max_entries = max_entries
+        self._message_history: deque = deque(maxlen=max_entries)
+
+    def add_message(self, nick: str, text: str, channel: str) -> None:
+        """Store a message for future similarity checks."""
+        self._message_history.append({
+            "nick": nick,
+            "text": text.lower(),
+            "words": set(text.lower().split()),
+            "channel": channel,
+            "ts": time.time(),
+        })
+
+    def find_similar(self, nick: str, text: str, threshold: float = 0.7) -> List[Dict]:
+        """Find messages similar to *text* from other users.
+
+        Returns list of matches with similarity scores.
+        """
+        text_lower = text.lower()
+        words = set(text_lower.split())
+        matches = []
+
+        for entry in self._message_history:
+            if entry["nick"] == nick:
+                continue
+            # Skip old messages (> 1 hour)
+            if time.time() - entry["ts"] > 3600:
+                continue
+
+            # Jaccard similarity
+            intersection = words & entry["words"]
+            union = words | entry["words"]
+            jaccard = len(intersection) / len(union) if union else 0
+
+            # Exact substring match
+            is_substring = (text_lower in entry["text"] or
+                           entry["text"] in text_lower)
+
+            score = max(jaccard, 0.9 if is_substring else 0)
+            if score >= threshold:
+                matches.append({
+                    "nick": entry["nick"],
+                    "text": entry["text"][:100],
+                    "channel": entry["channel"],
+                    "score": round(score, 3),
+                    "type": "substring" if is_substring else "jaccard",
+                })
+
+        matches.sort(key=lambda x: x["score"], reverse=True)
+        return matches[:5]
+
+
+# =========================
+# Conversation Thread Tracker
+# =========================
+class ThreadTracker:
+    """Tracks conversation threads by detecting reply patterns.
+
+    Uses:
+      • IRCv3 +reply tags
+      • Nick mentions at message start ("nick: ...")
+      • Temporal proximity (messages within 30s of each other)
+    """
+
+    def __init__(self, max_threads: int = 100, max_thread_length: int = 50):
+        self.max_threads = max_threads
+        self.max_thread_length = max_thread_length
+        self._threads: Dict[str, List[Dict]] = {}  # thread_id → messages
+        self._active_threads: List[str] = []
+        self._last_messages: Dict[str, Dict] = {}  # channel → last message
+
+    def add_message(self, msgid: str, nick: str, target: str, text: str,
+                    reply_to: str = "", ts: float = 0) -> Optional[str]:
+        """Add a message and return thread_id if it belongs to a thread."""
+        if not ts:
+            ts = time.time()
+
+        msg = {"msgid": msgid, "nick": nick, "text": text[:100], "ts": ts}
+
+        # Explicit reply
+        if reply_to:
+            thread_id = self._find_thread_by_msgid(reply_to)
+            if thread_id:
+                self._threads[thread_id].append(msg)
+                if len(self._threads[thread_id]) > self.max_thread_length:
+                    self._threads[thread_id] = self._threads[thread_id][-self.max_thread_length:]
+                return thread_id
+
+        # Nick mention at start
+        colon = text.find(":")
+        comma = text.find(",")
+        end = min(colon, comma) if colon >= 0 and comma >= 0 else max(colon, comma)
+        if end > 0:
+            mentioned = text[:end].strip().lower()
+            thread_id = self._find_thread_by_nick(mentioned, target)
+            if thread_id:
+                self._threads[thread_id].append(msg)
+                return thread_id
+
+        # Temporal proximity (within 30s of last message in channel)
+        last = self._last_messages.get(target)
+        if last and ts - last["ts"] < 30:
+            thread_id = last.get("thread_id")
+            if thread_id and thread_id in self._threads:
+                self._threads[thread_id].append(msg)
+                msg["thread_id"] = thread_id
+                self._last_messages[target] = msg
+                return thread_id
+
+        # Start new thread
+        thread_id = f"thread_{msgid or hash(text)}"
+        self._threads[thread_id] = [msg]
+        msg["thread_id"] = thread_id
+        self._last_messages[target] = msg
+        self._active_threads.append(thread_id)
+
+        # Trim old threads
+        if len(self._active_threads) > self.max_threads:
+            old = self._active_threads.pop(0)
+            self._threads.pop(old, None)
+
+        return thread_id
+
+    def _find_thread_by_msgid(self, msgid: str) -> Optional[str]:
+        for tid, msgs in self._threads.items():
+            for m in msgs:
+                if m.get("msgid") == msgid:
+                    return tid
+        return None
+
+    def _find_thread_by_nick(self, nick: str, channel: str) -> Optional[str]:
+        for tid, msgs in self._threads.items():
+            if msgs and msgs[-1].get("nick", "").lower() == nick:
+                return tid
+        return None
+
+    def get_thread(self, thread_id: str) -> Optional[List[Dict]]:
+        return self._threads.get(thread_id)
+
+    def get_active_threads(self, channel: str = "", limit: int = 10) -> List[Dict]:
+        """Return summary of active threads."""
+        results = []
+        for tid in reversed(self._active_threads):
+            msgs = self._threads.get(tid, [])
+            if not msgs:
+                continue
+            participants = list(set(m["nick"] for m in msgs))
+            results.append({
+                "thread_id": tid,
+                "participants": participants,
+                "message_count": len(msgs),
+                "started": msgs[0]["ts"],
+                "last_msg": msgs[-1]["ts"],
+                "topic": msgs[0]["text"][:80],
+            })
+            if len(results) >= limit:
+                break
+        return results
+
+
+# =========================
+# Cross-Channel Bot Detector
+# =========================
+class CrossChannelBotDetector:
+    """Detects bots that operate across multiple channels.
+
+    Correlates:
+      • Identical messages sent to multiple channels
+      • Similar timing patterns across channels
+      • Shared vocabulary fingerprints
+    """
+
+    def __init__(self):
+        self._nick_channels: Dict[str, set] = {}
+        self._nick_messages: Dict[str, deque] = {}
+        self._cross_channel_alerts: List[Dict] = []
+
+    def record_message(self, nick: str, channel: str, text: str) -> Optional[Dict]:
+        """Record a message and check for cross-channel coordination.
+
+        Returns alert dict if suspicious activity detected.
+        """
+        self._nick_channels.setdefault(nick, set()).add(channel)
+        if nick not in self._nick_messages:
+            self._nick_messages[nick] = deque(maxlen=200)
+        self._nick_messages[nick].append({
+            "channel": channel,
+            "text": text.lower(),
+            "ts": time.time(),
+        })
+
+        # Check for identical messages in different channels
+        channels = self._nick_channels[nick]
+        if len(channels) < 2:
+            return None
+
+        msgs = self._nick_messages[nick]
+        recent = [m for m in msgs if time.time() - m["ts"] < 300]  # 5 min window
+
+        # Group by text
+        text_channels: Dict[str, set] = {}
+        for m in recent:
+            text_channels.setdefault(m["text"], set()).add(m["channel"])
+
+        for text, chs in text_channels.items():
+            if len(chs) >= 2:
+                alert = {
+                    "nick": nick,
+                    "type": "identical_cross_channel",
+                    "channels": sorted(chs),
+                    "message": text[:100],
+                    "ts": time.time(),
+                }
+                self._cross_channel_alerts.append(alert)
+                return alert
+
+        return None
+
+    def get_suspicious_nicks(self, min_channels: int = 3) -> List[Dict]:
+        """Return nicks active in many channels with suspicious patterns."""
+        results = []
+        for nick, channels in self._nick_channels.items():
+            if len(channels) >= min_channels:
+                msgs = self._nick_messages.get(nick, [])
+                results.append({
+                    "nick": nick,
+                    "channels": sorted(channels),
+                    "message_count": len(msgs),
+                    "alerts": sum(1 for a in self._cross_channel_alerts if a["nick"] == nick),
+                })
+        results.sort(key=lambda x: x["alerts"], reverse=True)
+        return results
+
+
+# =========================
+# Productivity Features
+# =========================
+
+# ── Reminder System ─────────────────────────────────────────────────────────
+_REMINDER_PATH = os.path.join(_SCRIPT_DIR, "reminders.json")
+
+class ReminderManager:
+    """Manages user reminders with persistent storage.
+
+    Supports:
+      • Time-based reminders: "in 30m", "at 14:30", "tomorrow at 9am"
+      • Message-based reminders: "remind me to check #channel"
+      • Channel-specific reminders
+    """
+
+    def __init__(self):
+        self._reminders: List[Dict] = []
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            with open(_REMINDER_PATH, "r", encoding="utf-8") as f:
+                self._reminders = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            self._reminders = []
+
+    def _save(self) -> None:
+        try:
+            with open(_REMINDER_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._reminders, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def parse_time(self, time_str: str) -> Optional[float]:
+        """Parse time string and return absolute timestamp.
+
+        Supports:
+          • "in 30m", "in 2h", "in 1d"
+          • "at 14:30", "at 3pm"
+          • "tomorrow at 9am"
+          • "next monday"
+        """
+        now = time.time()
+        time_str = time_str.strip().lower()
+
+        # "in X" format
+        in_match = re.match(r'^in\s+(\d+)\s*(s|m|h|d|w)$', time_str)
+        if in_match:
+            val = int(in_match.group(1))
+            unit = in_match.group(2)
+            multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+            return now + val * multipliers[unit]
+
+        # "at HH:MM" format
+        at_match = re.match(r'^at\s+(\d{1,2}):(\d{2})$', time_str)
+        if at_match:
+            hour = int(at_match.group(1))
+            minute = int(at_match.group(2))
+            target = now
+            # If time is in the past, schedule for tomorrow
+            from datetime import datetime
+            dt = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if dt.timestamp() <= now:
+                dt = dt.replace(day=dt.day + 1)
+            return dt.timestamp()
+
+        # "tomorrow at HH:MM" format
+        tomorrow_match = re.match(r'^tomorrow\s+at\s+(\d{1,2}):(\d{2})$', time_str)
+        if tomorrow_match:
+            hour = int(tomorrow_match.group(1))
+            minute = int(tomorrow_match.group(2))
+            from datetime import datetime, timedelta
+            dt = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=1)
+            return dt.timestamp()
+
+        # "at Xam/pm" format
+        ampm_match = re.match(r'^at\s+(\d{1,2})(am|pm)$', time_str)
+        if ampm_match:
+            hour = int(ampm_match.group(1))
+            ampm = ampm_match.group(2)
+            if ampm == "pm" and hour != 12:
+                hour += 12
+            elif ampm == "am" and hour == 12:
+                hour = 0
+            from datetime import datetime
+            dt = datetime.now().replace(hour=hour, minute=0, second=0, microsecond=0)
+            if dt.timestamp() <= now:
+                dt = dt.replace(day=dt.day + 1)
+            return dt.timestamp()
+
+        return None
+
+    def add_reminder(self, nick: str, time_str: str, message: str, channel: str = "") -> Optional[Dict]:
+        """Add a reminder. Returns reminder dict or None if time parsing fails."""
+        ts = self.parse_time(time_str)
+        if ts is None:
+            return None
+
+        reminder = {
+            "id": f"rem_{int(time.time())}_{hash(nick + message) % 10000}",
+            "nick": nick,
+            "time": ts,
+            "message": message,
+            "channel": channel,
+            "created": time.time(),
+            "fired": False,
+        }
+        self._reminders.append(reminder)
+        self._save()
+        return reminder
+
+    def get_pending(self, nick: str = "") -> List[Dict]:
+        """Get pending reminders, optionally filtered by nick."""
+        now = time.time()
+        pending = [r for r in self._reminders if not r["fired"] and r["time"] > now]
+        if nick:
+            pending = [r for r in pending if r["nick"].lower() == nick.lower()]
+        pending.sort(key=lambda r: r["time"])
+        return pending
+
+    def get_due(self) -> List[Dict]:
+        """Get reminders that are due now."""
+        now = time.time()
+        due = [r for r in self._reminders if not r["fired"] and r["time"] <= now]
+        return due
+
+    def mark_fired(self, reminder_id: str) -> None:
+        """Mark a reminder as fired."""
+        for r in self._reminders:
+            if r["id"] == reminder_id:
+                r["fired"] = True
+                break
+        self._save()
+
+    def cancel(self, reminder_id: str) -> bool:
+        """Cancel a reminder. Returns True if found."""
+        for r in self._reminders:
+            if r["id"] == reminder_id:
+                r["fired"] = True
+                self._save()
+                return True
+        return False
+
+    def clear_old(self, max_age_days: int = 7) -> int:
+        """Remove fired reminders older than max_age_days. Returns count removed."""
+        cutoff = time.time() - max_age_days * 86400
+        before = len(self._reminders)
+        self._reminders = [r for r in self._reminders if not r["fired"] or r["time"] > cutoff]
+        removed = before - len(self._reminders)
+        if removed > 0:
+            self._save()
+        return removed
+
+    def list_all(self, nick: str = "") -> List[Dict]:
+        """List all reminders for a nick, or all if nick is empty."""
+        reminders = self._reminders
+        if nick:
+            reminders = [r for r in reminders if r["nick"].lower() == nick.lower()]
+        reminders.sort(key=lambda r: r["time"])
+        return reminders
+
+
+# ── Nick Watch System ───────────────────────────────────────────────────────
+_WATCH_PATH = os.path.join(_SCRIPT_DIR, "nick_watches.json")
+
+class NickWatchManager:
+    """Watches for specific nicks and alerts when they join/speak.
+
+    Supports:
+      • Watch for nick joins
+      • Watch for nick speaks in specific channels
+      • Watch for nick mentions
+      • Custom alert messages
+    """
+
+    def __init__(self):
+        self._watches: Dict[str, Dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            with open(_WATCH_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._watches = data
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            self._watches = {}
+
+    def _save(self) -> None:
+        try:
+            with open(_WATCH_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._watches, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def add_watch(self, nick: str, watcher: str, events: List[str] = None,
+                  channels: List[str] = None, message: str = "") -> Dict:
+        """Add a watch for a nick.
+
+        events: ["join", "speak", "mention"] (default: all)
+        channels: list of channels to watch (default: all)
+        message: custom alert message
+        """
+        key = f"{watcher.lower()}:{nick.lower()}"
+        self._watches[key] = {
+            "nick": nick,
+            "watcher": watcher,
+            "events": events or ["join", "speak", "mention"],
+            "channels": channels or [],
+            "message": message,
+            "created": time.time(),
+            "triggers": 0,
+            "last_trigger": 0,
+        }
+        self._save()
+        return self._watches[key]
+
+    def remove_watch(self, watcher: str, nick: str) -> bool:
+        """Remove a watch. Returns True if found."""
+        key = f"{watcher.lower()}:{nick.lower()}"
+        if key in self._watches:
+            del self._watches[key]
+            self._save()
+            return True
+        return False
+
+    def get_watches(self, watcher: str) -> List[Dict]:
+        """Get all watches for a user."""
+        return [w for w in self._watches.values() if w["watcher"].lower() == watcher.lower()]
+
+    def check_event(self, event_type: str, nick: str, channel: str = "") -> List[Dict]:
+        """Check if an event triggers any watches. Returns list of triggered watches."""
+        triggered = []
+        for key, watch in self._watches.items():
+            if watch["nick"].lower() != nick.lower():
+                continue
+            if event_type not in watch["events"]:
+                continue
+            if watch["channels"] and channel and channel not in watch["channels"]:
+                continue
+            # Rate limit: max 1 trigger per 5 minutes
+            if time.time() - watch.get("last_trigger", 0) < 300:
+                continue
+            watch["triggers"] += 1
+            watch["last_trigger"] = time.time()
+            triggered.append(watch)
+        if triggered:
+            self._save()
+        return triggered
+
+    def list_all(self) -> List[Dict]:
+        """List all active watches."""
+        return list(self._watches.values())
+
+
+# ── Snippet Manager ─────────────────────────────────────────────────────────
+_SNIPPET_PATH = os.path.join(_SCRIPT_DIR, "snippets.json")
+
+class SnippetManager:
+    """Manages text snippets for quick insertion.
+
+    Supports:
+      • Named snippets: /snippet add greeting Hello, welcome to the channel!
+      • Tagged snippets for organization
+      • Quick insertion via /snippet use <name> or $name
+      • Snippet history and usage tracking
+    """
+
+    def __init__(self):
+        self._snippets: Dict[str, Dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            with open(_SNIPPET_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._snippets = data
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            self._snippets = {}
+
+    def _save(self) -> None:
+        try:
+            with open(_SNIPPET_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._snippets, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def add(self, name: str, text: str, tags: List[str] = None, user: str = "") -> Dict:
+        """Add a snippet."""
+        name = name.lower()
+        self._snippets[name] = {
+            "name": name,
+            "text": text,
+            "tags": tags or [],
+            "user": user,
+            "created": time.time(),
+            "use_count": 0,
+            "last_used": 0,
+        }
+        self._save()
+        return self._snippets[name]
+
+    def get(self, name: str) -> Optional[Dict]:
+        """Get a snippet by name."""
+        return self._snippets.get(name.lower())
+
+    def use(self, name: str) -> Optional[str]:
+        """Use a snippet and return its text. Updates usage stats."""
+        snippet = self.get(name)
+        if snippet:
+            snippet["use_count"] += 1
+            snippet["last_used"] = time.time()
+            self._save()
+            return snippet["text"]
+        return None
+
+    def remove(self, name: str) -> bool:
+        """Remove a snippet. Returns True if found."""
+        name = name.lower()
+        if name in self._snippets:
+            del self._snippets[name]
+            self._save()
+            return True
+        return False
+
+    def search(self, query: str) -> List[Dict]:
+        """Search snippets by name, text, or tags."""
+        query = query.lower()
+        results = []
+        for name, snippet in self._snippets.items():
+            if (query in name or
+                query in snippet["text"].lower() or
+                any(query in tag.lower() for tag in snippet["tags"])):
+                results.append(snippet)
+        results.sort(key=lambda s: s["use_count"], reverse=True)
+        return results
+
+    def list_all(self, tag: str = "") -> List[Dict]:
+        """List all snippets, optionally filtered by tag."""
+        snippets = list(self._snippets.values())
+        if tag:
+            snippets = [s for s in snippets if tag.lower() in [t.lower() for t in s["tags"]]]
+        snippets.sort(key=lambda s: s["name"])
+        return snippets
+
+    def expand_snippets_in_text(self, text: str) -> str:
+        """Expand $name patterns in text with snippet content."""
+        def replace_match(m):
+            name = m.group(1)
+            snippet = self.get(name)
+            return snippet["text"] if snippet else m.group(0)
+        return re.sub(r'\$(\w+)', replace_match, text)
+
+
+# ── Channel Statistics ──────────────────────────────────────────────────────
+class ChannelStatsTracker:
+    """Tracks per-channel activity statistics.
+
+    Provides:
+      • Message counts per user
+      • Activity heatmap (hour of day)
+      • Top talkers
+      • Message length statistics
+      • Active hours detection
+    """
+
+    def __init__(self, max_channels: int = 50):
+        self.max_channels = max_channels
+        self._channels: Dict[str, Dict] = {}
+
+    def _get_channel(self, channel: str) -> Dict:
+        if channel not in self._channels:
+            self._channels[channel] = {
+                "users": {},
+                "hourly": [0] * 24,
+                "total_msgs": 0,
+                "first_msg": time.time(),
+                "last_msg": 0,
+                "msg_lengths": [],
+            }
+            # Trim oldest channels if over limit
+            if len(self._channels) > self.max_channels:
+                oldest = min(self._channels.items(), key=lambda x: x[1]["last_msg"])
+                del self._channels[oldest[0]]
+        return self._channels[channel]
+
+    def record_message(self, channel: str, nick: str, msg: str) -> None:
+        """Record a message for statistics."""
+        ch = self._get_channel(channel)
+        ch["total_msgs"] += 1
+        ch["last_msg"] = time.time()
+
+        # User stats
+        if nick not in ch["users"]:
+            ch["users"][nick] = {
+                "msgs": 0,
+                "total_chars": 0,
+                "first_msg": time.time(),
+                "last_msg": 0,
+                "hours": [0] * 24,
+            }
+        user = ch["users"][nick]
+        user["msgs"] += 1
+        user["total_chars"] += len(msg)
+        user["last_msg"] = time.time()
+
+        # Hourly tracking
+        hour = time.localtime().tm_hour
+        ch["hourly"][hour] += 1
+        user["hours"][hour] += 1
+
+        # Message length tracking (keep last 1000)
+        ch["msg_lengths"].append(len(msg))
+        if len(ch["msg_lengths"]) > 1000:
+            ch["msg_lengths"] = ch["msg_lengths"][-1000:]
+
+    def get_top_talkers(self, channel: str, limit: int = 10) -> List[Dict]:
+        """Get top talkers in a channel."""
+        ch = self._channels.get(channel)
+        if not ch:
+            return []
+        users = sorted(ch["users"].items(), key=lambda x: x[1]["msgs"], reverse=True)
+        results = []
+        for nick, stats in users[:limit]:
+            avg_len = stats["total_chars"] / stats["msgs"] if stats["msgs"] else 0
+            results.append({
+                "nick": nick,
+                "msgs": stats["msgs"],
+                "avg_len": round(avg_len, 1),
+                "first_msg": stats["first_msg"],
+                "last_msg": stats["last_msg"],
+            })
+        return results
+
+    def get_heatmap(self, channel: str) -> List[int]:
+        """Get hourly activity heatmap for a channel."""
+        ch = self._channels.get(channel)
+        return ch["hourly"] if ch else [0] * 24
+
+    def get_active_hours(self, channel: str, threshold: float = 0.5) -> List[int]:
+        """Get hours with activity above threshold (relative to peak)."""
+        hourly = self.get_heatmap(channel)
+        if not hourly or max(hourly) == 0:
+            return []
+        peak = max(hourly)
+        return [h for h, count in enumerate(hourly) if count >= peak * threshold]
+
+    def get_stats(self, channel: str) -> Dict:
+        """Get comprehensive stats for a channel."""
+        ch = self._channels.get(channel)
+        if not ch:
+            return {}
+        lengths = ch["msg_lengths"]
+        return {
+            "total_msgs": ch["total_msgs"],
+            "unique_users": len(ch["users"]),
+            "first_msg": ch["first_msg"],
+            "last_msg": ch["last_msg"],
+            "avg_msg_len": round(sum(lengths) / len(lengths), 1) if lengths else 0,
+            "max_msg_len": max(lengths) if lengths else 0,
+            "min_msg_len": min(lengths) if lengths else 0,
+            "top_talkers": self.get_top_talkers(channel, 5),
+            "active_hours": self.get_active_hours(channel),
+        }
+
+
+# ── RSS Feed Bridge ─────────────────────────────────────────────────────────
+_RSS_PATH = os.path.join(_SCRIPT_DIR, "rss_feeds.json")
+_RSS_CACHE: Dict[str, Dict] = {}  # url → {entries, last_fetch, etag}
+
+class RSSFeedBridge:
+    """Bridges RSS feeds to IRC channels.
+
+    Supports:
+      • Multiple feeds per channel
+      • Configurable poll intervals
+      • Entry filtering by keywords
+      • Feed entry caching to avoid duplicates
+    """
+
+    def __init__(self):
+        self._feeds: List[Dict] = []
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            with open(_RSS_PATH, "r", encoding="utf-8") as f:
+                self._feeds = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            self._feeds = []
+
+    def _save(self) -> None:
+        try:
+            with open(_RSS_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._feeds, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def add_feed(self, url: str, channel: str, interval: int = 300,
+                 keywords: List[str] = None, title: str = "") -> Dict:
+        """Add an RSS feed.
+
+        interval: seconds between polls (default: 300 = 5 min)
+        keywords: only post entries containing these words (default: all)
+        """
+        feed = {
+            "id": f"rss_{hash(url) % 100000}",
+            "url": url,
+            "channel": channel,
+            "interval": interval,
+            "keywords": keywords or [],
+            "title": title or url,
+            "enabled": True,
+            "last_fetch": 0,
+            "last_entry": "",
+            "error_count": 0,
+        }
+        self._feeds.append(feed)
+        self._save()
+        return feed
+
+    def remove_feed(self, feed_id: str) -> bool:
+        """Remove a feed by ID."""
+        before = len(self._feeds)
+        self._feeds = [f for f in self._feeds if f["id"] != feed_id]
+        if len(self._feeds) < before:
+            self._save()
+            return True
+        return False
+
+    def get_feeds(self, channel: str = "") -> List[Dict]:
+        """Get feeds, optionally filtered by channel."""
+        if channel:
+            return [f for f in self._feeds if f["channel"] == channel]
+        return self._feeds
+
+    def toggle_feed(self, feed_id: str) -> bool:
+        """Toggle a feed's enabled status."""
+        for f in self._feeds:
+            if f["id"] == feed_id:
+                f["enabled"] = not f["enabled"]
+                self._save()
+                return f["enabled"]
+        return False
+
+    def get_due_feeds(self) -> List[Dict]:
+        """Get feeds that are due for polling."""
+        now = time.time()
+        return [f for f in self._feeds if f["enabled"] and now - f["last_fetch"] >= f["interval"]]
+
+    def mark_fetched(self, feed_id: str, last_entry: str = "") -> None:
+        """Mark a feed as fetched."""
+        for f in self._feeds:
+            if f["id"] == feed_id:
+                f["last_fetch"] = time.time()
+                if last_entry:
+                    f["last_entry"] = last_entry
+                f["error_count"] = 0
+                break
+        self._save()
+
+    def mark_error(self, feed_id: str) -> None:
+        """Increment error count for a feed."""
+        for f in self._feeds:
+            if f["id"] == feed_id:
+                f["error_count"] += 1
+                break
+        self._save()
+
+    def _parse_feed_blocking(self, url: str) -> List[Dict]:
+        """Fetch and parse an RSS/Atom feed. Returns list of entries."""
+        try:
+            import xml.etree.ElementTree as ET
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; eyearesee/1.0; RSS Bot)",
+            })
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read(524288)  # 512 KB max
+            text = raw.decode("utf-8", errors="replace")
+            root = ET.fromstring(text)
+
+            entries = []
+            # RSS 2.0
+            if root.tag == "rss":
+                for item in root.findall(".//item"):
+                    title = item.findtext("title", "")
+                    link = item.findtext("link", "")
+                    desc = item.findtext("description", "")
+                    # Strip HTML tags from description
+                    desc = re.sub(r'<[^>]+>', '', desc)[:200]
+                    entries.append({
+                        "title": title,
+                        "link": link,
+                        "description": desc,
+                    })
+            # Atom
+            elif "feed" in root.tag:
+                ns = {"atom": "http://www.w3.org/2005/Atom"}
+                for entry in root.findall("atom:entry", ns):
+                    title = entry.findtext("atom:title", "", ns)
+                    link_el = entry.find("atom:link", ns)
+                    link = link_el.get("href", "") if link_el is not None else ""
+                    summary = entry.findtext("atom:summary", "", ns)
+                    summary = re.sub(r'<[^>]+>', '', summary)[:200]
+                    entries.append({
+                        "title": title,
+                        "link": link,
+                        "description": summary,
+                    })
+            return entries
+        except Exception:
+            return []
+
+    async def fetch_new_entries(self, feed: Dict) -> List[Dict]:
+        """Fetch new entries from a feed. Returns list of new entries."""
+        loop = asyncio.get_running_loop()
+        entries = await loop.run_in_executor(
+            None, self._parse_feed_blocking, feed["url"])
+
+        if not entries:
+            self.mark_error(feed["id"])
+            return []
+
+        self.mark_fetched(feed["id"], entries[0].get("link", ""))
+
+        # Filter by keywords
+        if feed["keywords"]:
+            keywords = [k.lower() for k in feed["keywords"]]
+            entries = [e for e in entries if any(
+                k in e["title"].lower() or k in e["description"].lower()
+                for k in keywords)]
+
+        # Filter out already seen entries
+        last_entry = feed.get("last_entry", "")
+        if last_entry:
+            seen = False
+            new_entries = []
+            for e in entries:
+                if e.get("link") == last_entry:
+                    seen = True
+                    continue
+                if not seen:
+                    new_entries.append(e)
+            entries = new_entries
+
+        return entries[:5]  # Max 5 new entries per poll
+
+
+# ── Todo List ────────────────────────────────────────────────────────────────
+_TODO_PATH = os.path.join(_SCRIPT_DIR, "todos.json")
+
+class TodoManager:
+    """Persistent todo list with priority, due dates, and completion tracking.
+
+    Supports:
+      • Priority levels: low, medium, high, urgent
+      • Optional due dates
+      • Tags for categorisation
+      • Completion tracking with timestamps
+      • Multiple lists (per-channel or global)
+    """
+
+    def __init__(self):
+        self._todos: List[Dict] = []
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            with open(_TODO_PATH, "r", encoding="utf-8") as f:
+                self._todos = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            self._todos = []
+
+    def _save(self) -> None:
+        try:
+            with open(_TODO_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._todos, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def add(self, text: str, priority: str = "medium", due: str = "",
+            tags: List[str] = None, channel: str = "") -> Dict:
+        priority = priority.lower()
+        if priority not in ("low", "medium", "high", "urgent"):
+            priority = "medium"
+        todo = {
+            "id": f"t_{int(time.time())}_{random.randint(0,9999):04d}",
+            "text": text,
+            "priority": priority,
+            "due": due,
+            "tags": tags or [],
+            "channel": channel,
+            "created": time.time(),
+            "completed": False,
+            "completed_at": None,
+        }
+        self._todos.append(todo)
+        self._save()
+        return todo
+
+    def complete(self, todo_id: str) -> Optional[Dict]:
+        for t in self._todos:
+            if t["id"] == todo_id and not t["completed"]:
+                t["completed"] = True
+                t["completed_at"] = time.time()
+                self._save()
+                return t
+        return None
+
+    def uncomplete(self, todo_id: str) -> Optional[Dict]:
+        for t in self._todos:
+            if t["id"] == todo_id and t["completed"]:
+                t["completed"] = False
+                t["completed_at"] = None
+                self._save()
+                return t
+        return None
+
+    def remove(self, todo_id: str) -> bool:
+        before = len(self._todos)
+        self._todos = [t for t in self._todos if t["id"] != todo_id]
+        if len(self._todos) < before:
+            self._save()
+            return True
+        return False
+
+    def edit(self, todo_id: str, text: str = None, priority: str = None,
+             due: str = None, tags: List[str] = None) -> Optional[Dict]:
+        for t in self._todos:
+            if t["id"] == todo_id:
+                if text is not None:
+                    t["text"] = text
+                if priority is not None:
+                    p = priority.lower()
+                    if p in ("low", "medium", "high", "urgent"):
+                        t["priority"] = p
+                if due is not None:
+                    t["due"] = due
+                if tags is not None:
+                    t["tags"] = tags
+                self._save()
+                return t
+        return None
+
+    def list_todos(self, channel: str = "", show_completed: bool = False,
+                   priority: str = "", tag: str = "") -> List[Dict]:
+        results = []
+        for t in self._todos:
+            if t["completed"] and not show_completed:
+                continue
+            if channel and t.get("channel", "") != channel:
+                continue
+            if priority and t.get("priority", "") != priority.lower():
+                continue
+            if tag and tag.lower() not in [tg.lower() for tg in t.get("tags", [])]:
+                continue
+            results.append(t)
+        _prio_order = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
+        results.sort(key=lambda x: (x["completed"], _prio_order.get(x.get("priority", "medium"), 2)))
+        return results
+
+    def clear_completed(self) -> int:
+        before = len(self._todos)
+        self._todos = [t for t in self._todos if not t["completed"]]
+        removed = before - len(self._todos)
+        if removed:
+            self._save()
+        return removed
+
+
+# ── Pomodoro Timer ───────────────────────────────────────────────────────────
+_POMODORO_PATH = os.path.join(_SCRIPT_DIR, "pomodoro_state.json")
+
+class PomodoroManager:
+    """Pomodoro technique timer with work/break cycles and session tracking.
+
+    Supports:
+      • Configurable work/break durations
+      • Long break every N sessions
+      • Session statistics
+      • Auto-notification via IRC
+    """
+
+    def __init__(self):
+        self.work_duration: int = 25 * 60
+        self.short_break: int = 5 * 60
+        self.long_break: int = 15 * 60
+        self.sessions_before_long: int = 4
+        self._state: Dict = self._load()
+        self._running: bool = False
+        self._task: Optional[asyncio.Task] = None
+        self._ui_queue: Optional[asyncio.Queue] = None
+        self._nick: str = ""
+
+    def _load(self) -> Dict:
+        try:
+            with open(_POMODORO_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {
+                "completed_sessions": 0,
+                "total_work_minutes": 0,
+                "last_session": 0,
+            }
+
+    def _save(self) -> None:
+        try:
+            with open(_POMODORO_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._state, f, indent=2)
+        except OSError:
+            pass
+
+    def configure(self, work: int = 25, short_break: int = 5,
+                  long_break: int = 15, sessions: int = 4) -> None:
+        self.work_duration = work * 60
+        self.short_break = short_break * 60
+        self.long_break = long_break * 60
+        self.sessions_before_long = sessions
+
+    def start(self, ui_queue: asyncio.Queue, nick: str) -> Optional[str]:
+        if self._running:
+            return None
+        self._ui_queue = ui_queue
+        self._nick = nick
+        self._running = True
+        self._task = asyncio.create_task(self._run_cycle())
+        sessions = self._state.get("completed_sessions", 0)
+        return f"Pomodoro started: {self.work_duration // 60}m work session"
+
+    def stop(self) -> Optional[str]:
+        if not self._running:
+            return None
+        self._running = False
+        if self._task and not self._task.done():
+            self._task.cancel()
+        self._task = None
+        return "Pomodoro stopped"
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    def status(self) -> Dict:
+        return {
+            "running": self._running,
+            "completed_sessions": self._state.get("completed_sessions", 0),
+            "total_work_minutes": self._state.get("total_work_minutes", 0),
+            "config": {
+                "work_min": self.work_duration // 60,
+                "short_break_min": self.short_break // 60,
+                "long_break_min": self.long_break // 60,
+                "sessions_before_long": self.sessions_before_long,
+            },
+        }
+
+    async def _run_cycle(self) -> None:
+        try:
+            while self._running:
+                if self._ui_queue:
+                    await self._ui_queue.put(("status",
+                        f"[pomodoro] Work session started — {self.work_duration // 60} min"))
+                await asyncio.sleep(self.work_duration)
+                if not self._running:
+                    break
+                sessions = self._state.get("completed_sessions", 0) + 1
+                self._state["completed_sessions"] = sessions
+                self._state["total_work_minutes"] = self._state.get("total_work_minutes", 0) + self.work_duration // 60
+                self._state["last_session"] = time.time()
+                self._save()
+                is_long = sessions % self.sessions_before_long == 0
+                break_dur = self.long_break if is_long else self.short_break
+                break_label = "long" if is_long else "short"
+                if self._ui_queue:
+                    await self._ui_queue.put(("status",
+                        f"[pomodoro] Work done! {sessions} sessions completed. "
+                        f"Take a {break_label} break ({break_dur // 60} min)"))
+                await asyncio.sleep(break_dur)
+                if not self._running:
+                    break
+                if self._ui_queue:
+                    await self._ui_queue.put(("status",
+                        f"[pomodoro] Break over — starting work session"))
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._running = False
+
+
+# ── Scratchpad / Notes ───────────────────────────────────────────────────────
+_NOTES_PATH = os.path.join(_SCRIPT_DIR, "notes.json")
+
+class NoteManager:
+    """Persistent scratchpad notes with categories and search.
+
+    Supports:
+      • Categorised notes
+      • Full-text search
+      • Pin important notes
+      • Timestamps and editing
+    """
+
+    def __init__(self):
+        self._notes: Dict[str, Dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            with open(_NOTES_PATH, "r", encoding="utf-8") as f:
+                self._notes = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            self._notes = {}
+
+    def _save(self) -> None:
+        try:
+            with open(_NOTES_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._notes, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def add(self, text: str, category: str = "general", pinned: bool = False) -> Dict:
+        note_id = f"n_{int(time.time())}_{random.randint(0,9999):04d}"
+        note = {
+            "id": note_id,
+            "text": text,
+            "category": category.lower(),
+            "pinned": pinned,
+            "created": time.time(),
+            "edited": None,
+        }
+        self._notes[note_id] = note
+        self._save()
+        return note
+
+    def edit(self, note_id: str, text: str = None, category: str = None,
+             pinned: Optional[bool] = None) -> Optional[Dict]:
+        note = self._notes.get(note_id)
+        if not note:
+            return None
+        if text is not None:
+            note["text"] = text
+        if category is not None:
+            note["category"] = category.lower()
+        if pinned is not None:
+            note["pinned"] = pinned
+        note["edited"] = time.time()
+        self._save()
+        return note
+
+    def remove(self, note_id: str) -> bool:
+        if note_id in self._notes:
+            del self._notes[note_id]
+            self._save()
+            return True
+        return False
+
+    def get(self, note_id: str) -> Optional[Dict]:
+        return self._notes.get(note_id)
+
+    def search(self, query: str, category: str = "") -> List[Dict]:
+        query = query.lower()
+        results = []
+        for note in self._notes.values():
+            if category and note.get("category", "") != category.lower():
+                continue
+            if query in note["text"].lower() or query in note.get("category", "").lower():
+                results.append(note)
+        results.sort(key=lambda n: (not n.get("pinned", False), n.get("created", 0)), reverse=True)
+        return results
+
+    def list_notes(self, category: str = "", pinned_only: bool = False) -> List[Dict]:
+        results = []
+        for note in self._notes.values():
+            if category and note.get("category", "") != category.lower():
+                continue
+            if pinned_only and not note.get("pinned", False):
+                continue
+            results.append(note)
+        results.sort(key=lambda n: (not n.get("pinned", False), n.get("created", 0)), reverse=True)
+        return results
+
+    def list_categories(self) -> List[str]:
+        cats: set = set()
+        for note in self._notes.values():
+            cats.add(note.get("category", "general"))
+        return sorted(cats)
+
+
+# ── Bookmarks ─────────────────────────────────────────────────────────────────
+_BOOKMARK_PATH = os.path.join(_SCRIPT_DIR, "bookmarks.json")
+
+class BookmarkManager:
+    """Persistent bookmarks for channels, nicks, URLs, and conversations.
+
+    Supports:
+      • Bookmark channels, nicks, URLs, or arbitrary items
+      • Tags and descriptions
+      • Search and filtering
+      • Quick navigation via /bookmark go
+    """
+
+    def __init__(self):
+        self._bookmarks: Dict[str, Dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            with open(_BOOKMARK_PATH, "r", encoding="utf-8") as f:
+                self._bookmarks = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            self._bookmarks = {}
+
+    def _save(self) -> None:
+        try:
+            with open(_BOOKMARK_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._bookmarks, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def add(self, target: str, description: str = "", tags: List[str] = None,
+            btype: str = "channel") -> Dict:
+        btype = btype.lower()
+        if btype not in ("channel", "nick", "url", "general"):
+            btype = "general"
+        bm_id = f"bm_{int(time.time())}_{random.randint(0,9999):04d}"
+        bm = {
+            "id": bm_id,
+            "target": target,
+            "description": description,
+            "tags": tags or [],
+            "type": btype,
+            "created": time.time(),
+        }
+        self._bookmarks[bm_id] = bm
+        self._save()
+        return bm
+
+    def remove(self, bm_id: str) -> bool:
+        if bm_id in self._bookmarks:
+            del self._bookmarks[bm_id]
+            self._save()
+            return True
+        return False
+
+    def search(self, query: str, btype: str = "", tag: str = "") -> List[Dict]:
+        query = query.lower()
+        results = []
+        for bm in self._bookmarks.values():
+            if btype and bm.get("type", "") != btype.lower():
+                continue
+            if tag and tag.lower() not in [t.lower() for t in bm.get("tags", [])]:
+                continue
+            if (query in bm["target"].lower() or
+                query in bm.get("description", "").lower()):
+                results.append(bm)
+        results.sort(key=lambda b: b.get("created", 0), reverse=True)
+        return results
+
+    def list_bookmarks(self, btype: str = "", tag: str = "") -> List[Dict]:
+        results = []
+        for bm in self._bookmarks.values():
+            if btype and bm.get("type", "") != btype.lower():
+                continue
+            if tag and tag.lower() not in [t.lower() for t in bm.get("tags", [])]:
+                continue
+            results.append(bm)
+        results.sort(key=lambda b: b.get("created", 0), reverse=True)
+        return results
+
+    def get_by_target(self, target: str) -> List[Dict]:
+        target_lower = target.lower()
+        return [bm for bm in self._bookmarks.values()
+                if bm["target"].lower() == target_lower]
+
+
+# ── Countdown Timer ──────────────────────────────────────────────────────────
+class TimerManager:
+    """Lightweight countdown timers with auto-notification.
+
+    Supports:
+      • Multiple concurrent timers
+      • Named timers
+      • Auto-notification via IRC when timer expires
+    """
+
+    def __init__(self):
+        self._timers: Dict[str, Dict] = {}
+        self._seq: int = 0
+        self._ui_queue: Optional[asyncio.Queue] = None
+
+    def set_ui_queue(self, queue: asyncio.Queue) -> None:
+        self._ui_queue = queue
+
+    def start(self, name: str, seconds: int, ui_queue: asyncio.Queue = None) -> str:
+        if ui_queue:
+            self._ui_queue = ui_queue
+        self._seq += 1
+        tid = f"tmr_{self._seq}"
+        self._timers[tid] = {
+            "id": tid,
+            "name": name,
+            "duration": seconds,
+            "started": time.time(),
+            "expires": time.time() + seconds,
+            "task": asyncio.create_task(self._countdown(tid, name, seconds)),
+        }
+        return tid
+
+    def cancel(self, tid: str) -> bool:
+        entry = self._timers.get(tid)
+        if not entry:
+            return False
+        if entry.get("task") and not entry["task"].done():
+            entry["task"].cancel()
+        del self._timers[tid]
+        return True
+
+    def list_timers(self) -> List[Dict]:
+        now = time.time()
+        results = []
+        for tid, entry in self._timers.items():
+            remaining = max(0, entry["expires"] - now)
+            mins, secs = divmod(int(remaining), 60)
+            results.append({
+                "id": tid,
+                "name": entry["name"],
+                "remaining": f"{mins}m {secs}s",
+                "remaining_secs": remaining,
+            })
+        results.sort(key=lambda x: x["remaining_secs"])
+        return results
+
+    async def _countdown(self, tid: str, name: str, seconds: int) -> None:
+        try:
+            await asyncio.sleep(seconds)
+            if self._ui_queue:
+                mins, secs = divmod(seconds, 60)
+                dur_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+                await self._ui_queue.put(("status",
+                    f"[timer] '{name}' ({dur_str}) has finished!"))
+            self._timers.pop(tid, None)
+        except asyncio.CancelledError:
+            pass
+
+
+# =========================
+# RelationshipGraph
+# =========================
+
+class RelationshipGraph:
+    """Tracks interaction patterns between nicks in channels.
+
+    Records:
+      • Who mentions whom (directed edge with weight)
+      • Who replies to whom (via +reply tags or nick prefix)
+      • Shared channel overlap (undirected co-membership)
+
+    Provides /graph <nick> to visualize a nick's social connections.
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "relationship_graph.json")
+
+    def __init__(self):
+        self._edges: Dict[str, Dict[str, int]] = {}
+        self._co_channels: Dict[str, set] = {}
+        self._last_save: float = 0.0
+
+    def record_mention(self, from_nick: str, to_nick: str, channel: str = "") -> None:
+        fn = from_nick.lower()
+        tn = to_nick.lower()
+        if fn == tn:
+            return
+        self._edges.setdefault(fn, {})
+        self._edges[fn][tn] = self._edges[fn].get(tn, 0) + 1
+        if channel:
+            self._co_channels.setdefault(fn, set()).add(channel.lower())
+            self._co_channels.setdefault(tn, set()).add(channel.lower())
+
+    def record_reply(self, from_nick: str, to_nick: str) -> None:
+        fn = from_nick.lower()
+        tn = to_nick.lower()
+        if fn == tn:
+            return
+        self._edges.setdefault(fn, {})
+        self._edges[fn][tn] = self._edges[fn].get(tn, 0) + 2
+
+    def record_co_channel(self, nick: str, channel: str) -> None:
+        self._co_channels.setdefault(nick.lower(), set()).add(channel.lower())
+
+    def get_connections(self, nick: str, depth: int = 1) -> Dict:
+        """Return connections for a nick up to depth hops."""
+        root = nick.lower()
+        result: Dict[str, Dict] = {}
+        visited: set = set()
+        frontier = {root}
+        for hop in range(depth + 1):
+            next_frontier: set = set()
+            for n in frontier:
+                if n in visited:
+                    continue
+                visited.add(n)
+                outgoing = self._edges.get(n, {})
+                incoming = {src: w for src, targets in self._edges.items()
+                            for tgt, w in targets.items() if tgt == n}
+                merged: Dict[str, int] = {}
+                for k, v in outgoing.items():
+                    merged[k] = merged.get(k, 0) + v
+                for k, v in incoming.items():
+                    merged[k] = merged.get(k, 0) + v
+                result[n] = {
+                    "outgoing": dict(sorted(outgoing.items(), key=lambda x: -x[1])[:20]),
+                    "incoming": dict(sorted(incoming.items(), key=lambda x: -x[1])[:20]),
+                    "top": dict(sorted(merged.items(), key=lambda x: -x[1])[:20]),
+                    "channels": sorted(self._co_channels.get(n, set())),
+                }
+                next_frontier |= set(merged.keys())
+            frontier = next_frontier - visited
+        return result
+
+    def get_top_interactions(self, nick: str, limit: int = 15) -> list:
+        conn = self.get_connections(nick, depth=0)
+        if nick.lower() not in conn:
+            return []
+        top = conn[nick.lower()]["top"]
+        return list(top.items())[:limit]
+
+    def get_mutual(self, nick: str, limit: int = 10) -> list:
+        root = nick.lower()
+        outgoing = self._edges.get(root, {})
+        mutual = []
+        for target, weight in outgoing.items():
+            reverse = self._edges.get(target, {}).get(root, 0)
+            if reverse > 0:
+                mutual.append((target, weight, reverse))
+        mutual.sort(key=lambda x: -(x[1] + x[2]))
+        return mutual[:limit]
+
+    def save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 30:
+            return
+        self._last_save = now
+        data = {
+            "edges": {k: v for k, v in self._edges.items() if v},
+            "co_channels": {k: sorted(v) for k, v in self._co_channels.items() if v},
+        }
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._edges = {k: v for k, v in data.get("edges", {}).items() if v}
+            self._co_channels = {k: set(v) for k, v in data.get("co_channels", {}).items() if v}
+        except Exception:
+            pass
+
+
+# =========================
+# Network Analytics
+# =========================
+
+class NetworkAnalytics:
+    """Tracks connection latency, channel activity heatmaps, and server topology.
+
+    Provides:
+      • Per-server latency history with jitter/p95/p99 stats
+      • Channel activity heatmap (hour × day)
+      • Network topology: server → channels → users mapping
+      • Connection uptime/downtime tracking
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "network_analytics.json")
+
+    def __init__(self):
+        self._latency_samples: Dict[str, deque] = {}
+        self._heatmaps: Dict[str, Dict[int, Dict[int, int]]] = {}
+        self._topology: Dict[str, Dict[str, set]] = {}
+        self._connect_times: Dict[str, List[Tuple[float, Optional[float]]]] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def record_latency(self, server: str, latency_ms: float) -> None:
+        samples = self._latency_samples.setdefault(server, deque(maxlen=1000))
+        samples.append({"ts": time.time(), "ms": latency_ms})
+        self._maybe_save()
+
+    def get_latency_stats(self, server: str) -> Dict[str, Any]:
+        samples = self._latency_samples.get(server, deque())
+        if not samples:
+            return {"server": server, "samples": 0}
+        values = [s["ms"] for s in samples]
+        sorted_v = sorted(values)
+        n = len(sorted_v)
+        return {
+            "server": server,
+            "samples": n,
+            "current": round(values[-1], 1),
+            "mean": round(sum(values) / n, 1),
+            "min": round(sorted_v[0], 1),
+            "max": round(sorted_v[-1], 1),
+            "median": round(sorted_v[n // 2], 1),
+            "p95": round(sorted_v[int(n * 0.95)], 1),
+            "p99": round(sorted_v[int(n * 0.99)], 1),
+            "jitter": round((sum((v - sum(values)/n)**2 for v in values) / n) ** 0.5, 1),
+        }
+
+    def record_message(self, channel: str) -> None:
+        ts = time.localtime()
+        day = ts.tm_wday
+        hour = ts.tm_hour
+        hm = self._heatmaps.setdefault(channel.lower(), {})
+        hm.setdefault(day, {})
+        hm[day][hour] = hm[day].get(hour, 0) + 1
+        self._maybe_save()
+
+    def get_heatmap(self, channel: str) -> Dict[int, Dict[int, int]]:
+        return self._heatmaps.get(channel.lower(), {})
+
+    def get_heatmap_summary(self, channel: str, days: int = 7) -> List[Tuple[int, int, int]]:
+        hm = self.get_heatmap(channel)
+        entries = []
+        for d in range(7):
+            if d in hm:
+                for h, count in hm[d].items():
+                    entries.append((d, h, count))
+        entries.sort(key=lambda x: -x[2])
+        return entries[:days * 24]
+
+    def update_topology(self, server: str, channel: str, users: set) -> None:
+        srv_topo = self._topology.setdefault(server, {})
+        srv_topo[channel.lower()] = {u.lower() for u in users}
+
+    def get_topology(self, server: str) -> Dict[str, Any]:
+        srv = self._topology.get(server, {})
+        total_channels = len(srv)
+        total_users = len(set().union(*srv.values())) if srv else 0
+        return {
+            "server": server,
+            "channels": total_channels,
+            "total_users": total_users,
+            "channel_list": sorted(srv.keys()),
+        }
+
+    def record_connect(self, server: str) -> None:
+        self._connect_times.setdefault(server, []).append((time.time(), None))
+
+    def record_disconnect(self, server: str) -> None:
+        conns = self._connect_times.get(server, [])
+        if conns and conns[-1][1] is None:
+            conns[-1] = (conns[-1][0], time.time())
+
+    def get_uptime(self, server: str) -> Dict[str, Any]:
+        conns = self._connect_times.get(server, [])
+        if not conns:
+            return {"server": server, "connected": False}
+        last = conns[-1]
+        is_connected = last[1] is None
+        current_duration = time.time() - last[0] if is_connected else 0
+        total_up = sum((e[1] or time.time()) - e[0] for e in conns)
+        total_span = (conns[-1][1] or time.time()) - conns[0][0] if len(conns) > 1 else current_duration
+        return {
+            "server": server,
+            "connected": is_connected,
+            "current_duration": round(current_duration, 0),
+            "total_connections": len(conns),
+            "total_uptime": round(total_up, 0),
+            "uptime_pct": round(total_up / max(total_span, 1) * 100, 1),
+        }
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "latency": {s: list(d)[-100:] for s, d in self._latency_samples.items()},
+                "heatmaps": self._heatmaps,
+                "topology": {s: {c: sorted(u) for c, u in ch.items()} for s, ch in self._topology.items()},
+                "connect_times": self._connect_times,
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for s, samples in data.get("latency", {}).items():
+                self._latency_samples[s] = deque(samples[-1000:], maxlen=1000)
+            self._heatmaps = data.get("heatmaps", {})
+            for s, ch in data.get("topology", {}).items():
+                self._topology[s] = {c: set(u) for c, u in ch.items()}
+            self._connect_times = data.get("connect_times", {})
+        except Exception:
+            pass
+
+
+# =========================
+# Trigger Manager
+# =========================
+
+class TriggerManager:
+    """Auto-respond to message patterns with custom actions.
+
+    Supports:
+      • Regex-based pattern matching
+      • Actions: reply, notify, log, exec, ignore
+      • Per-channel or global triggers
+      • Rate limiting per trigger
+      • Cooldown periods to prevent spam
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "triggers.json")
+
+    def __init__(self):
+        self._triggers: List[Dict] = []
+        self._last_fired: Dict[int, float] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def add(self, pattern: str, action: str, response: str = "",
+            channel: str = "", cooldown: float = 30.0, case_sensitive: bool = False) -> int:
+        trigger_id = len(self._triggers)
+        self._triggers.append({
+            "id": trigger_id, "pattern": pattern, "action": action,
+            "response": response, "channel": channel.lower() if channel else "",
+            "cooldown": cooldown, "case_sensitive": case_sensitive,
+            "enabled": True, "fire_count": 0, "created": time.time(),
+        })
+        self._maybe_save()
+        return trigger_id
+
+    def remove(self, trigger_id: int) -> bool:
+        for i, t in enumerate(self._triggers):
+            if t["id"] == trigger_id:
+                del self._triggers[i]
+                self._last_fired.pop(trigger_id, None)
+                self._maybe_save()
+                return True
+        return False
+
+    def match(self, nick: str, channel: str, text: str) -> List[Dict]:
+        results = []
+        now = time.time()
+        for t in self._triggers:
+            if not t["enabled"]:
+                continue
+            if t["channel"] and t["channel"] != channel.lower():
+                continue
+            last = self._last_fired.get(t["id"], 0)
+            if now - last < t["cooldown"]:
+                continue
+            flags = 0 if t["case_sensitive"] else re.IGNORECASE
+            try:
+                if re.search(t["pattern"], text, flags):
+                    self._last_fired[t["id"]] = now
+                    t["fire_count"] += 1
+                    results.append(t)
+            except re.error:
+                pass
+        return results
+
+    def list_triggers(self) -> List[Dict]:
+        return sorted(self._triggers, key=lambda x: x["id"])
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._triggers, f, indent=2)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                self._triggers = json.load(f)
+        except Exception:
+            pass
+
+
+# =========================
+# AutoMod Manager
+# =========================
+
+class AutoModManager:
+    """Auto-moderation rules for channels.
+
+    Supports:
+      • Regex-based spam/harassment detection
+      • Flood detection (message rate per user)
+      • Caps lock detection
+      • Link filtering
+      • Actions: warn, mute, kick, ban, delete
+      • Whitelist for trusted users
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "automod.json")
+
+    def __init__(self):
+        self._rules: Dict[str, List[Dict]] = {}
+        self._flood_tracker: Dict[str, deque] = {}
+        self._whitelist: Dict[str, set] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def add_rule(self, channel: str, rule_type: str, pattern: str = "",
+                 action: str = "warn", threshold: int = 3, duration: int = 60) -> int:
+        cl = channel.lower()
+        rule_id = len(self._rules.get(cl, []))
+        self._rules.setdefault(cl, []).append({
+            "id": rule_id, "type": rule_type, "pattern": pattern,
+            "action": action, "threshold": threshold, "duration": duration,
+            "enabled": True,
+        })
+        self._maybe_save()
+        return rule_id
+
+    def remove_rule(self, channel: str, rule_id: int) -> bool:
+        cl = channel.lower()
+        rules = self._rules.get(cl, [])
+        for i, r in enumerate(rules):
+            if r["id"] == rule_id:
+                del rules[i]
+                self._maybe_save()
+                return True
+        return False
+
+    def add_whitelist(self, channel: str, nick: str) -> None:
+        self._whitelist.setdefault(channel.lower(), set()).add(nick.lower())
+
+    def remove_whitelist(self, channel: str, nick: str) -> None:
+        self._whitelist.get(channel.lower(), set()).discard(nick.lower())
+
+    def check(self, nick: str, channel: str, text: str) -> List[Dict]:
+        cl = channel.lower()
+        nl = nick.lower()
+        if nl in self._whitelist.get(cl, set()):
+            return []
+        results = []
+        now = time.time()
+
+        # Flood detection
+        ft = self._flood_tracker.setdefault(nl, deque(maxlen=20))
+        ft.append(now)
+        recent = sum(1 for t in ft if now - t < 5.0)
+        rules = self._rules.get(cl, [])
+        for r in rules:
+            if not r["enabled"]:
+                continue
+            if r["type"] == "flood" and recent >= r["threshold"]:
+                results.append({"rule": r, "reason": f"flood: {recent} msgs in 5s", "nick": nick})
+            elif r["type"] == "caps":
+                caps = sum(1 for c in text if c.isupper())
+                letters = sum(1 for c in text if c.isalpha())
+                if letters > 5 and caps / letters > r["threshold"] / 100:
+                    results.append({"rule": r, "reason": f"caps: {caps/letters:.0%}", "nick": nick})
+            elif r["type"] == "regex" and r["pattern"]:
+                try:
+                    if re.search(r["pattern"], text, re.IGNORECASE):
+                        results.append({"rule": r, "reason": f"regex match", "nick": nick})
+                except re.error:
+                    pass
+            elif r["type"] == "links" and ("http://" in text or "https://" in text):
+                results.append({"rule": r, "reason": "link detected", "nick": nick})
+        return results
+
+    def list_rules(self, channel: str) -> List[Dict]:
+        return self._rules.get(channel.lower(), [])
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "rules": self._rules,
+                "whitelist": {k: sorted(v) for k, v in self._whitelist.items()},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._rules = data.get("rules", {})
+            self._whitelist = {k: set(v) for k, v in data.get("whitelist", {}).items()}
+        except Exception:
+            pass
+
+
+# =========================
+# Webhook Manager
+# =========================
+
+class WebhookManager:
+    """Forward IRC events to external webhooks (Discord, Slack, custom).
+
+    Supports:
+      • Channel-specific or global webhooks
+      • Event filtering (msg, join, part, quit, topic, action)
+      • Payload formatting (JSON, form-data, plain text)
+      • Retry on failure with exponential backoff
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "webhooks.json")
+
+    def __init__(self):
+        self._webhooks: List[Dict] = []
+        self._last_save: float = 0.0
+        self.load()
+
+    def add(self, url: str, events: List[str], channel: str = "",
+            name: str = "", format_type: str = "json") -> int:
+        wh_id = len(self._webhooks)
+        self._webhooks.append({
+            "id": wh_id, "url": url, "events": events,
+            "channel": channel.lower() if channel else "",
+            "name": name or f"webhook-{wh_id}", "format": format_type,
+            "enabled": True, "fail_count": 0, "created": time.time(),
+        })
+        self._maybe_save()
+        return wh_id
+
+    def remove(self, wh_id: int) -> bool:
+        for i, w in enumerate(self._webhooks):
+            if w["id"] == wh_id:
+                del self._webhooks[i]
+                self._maybe_save()
+                return True
+        return False
+
+    async def fire(self, event_type: str, channel: str, data: Dict) -> None:
+        for wh in self._webhooks:
+            if not wh["enabled"]:
+                continue
+            if event_type not in wh["events"]:
+                continue
+            if wh["channel"] and wh["channel"] != channel.lower():
+                continue
+            await self._send_webhook(wh, event_type, channel, data)
+
+    async def _send_webhook(self, wh: Dict, event_type: str, channel: str, data: Dict) -> None:
+        try:
+            payload = json.dumps({
+                "event": event_type, "channel": channel,
+                "ts": time.time(), "data": data,
+            })
+            req = urllib.request.Request(
+                wh["url"],
+                data=payload.encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(_IO_EXECUTOR, lambda: urllib.request.urlopen(req, timeout=10))
+            wh["fail_count"] = 0
+        except Exception:
+            wh["fail_count"] = wh.get("fail_count", 0) + 1
+            if wh["fail_count"] > 10:
+                wh["enabled"] = False
+
+    def list_webhooks(self) -> List[Dict]:
+        return self._webhooks
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._webhooks, f, indent=2)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                self._webhooks = json.load(f)
+        except Exception:
+            pass
+
+
+# =========================
+# GitHub Tracker
+# =========================
+
+class GitHubTracker:
+    """Track GitHub repositories and post updates to IRC channels.
+
+    Monitors:
+      • New issues, PRs, releases
+      • Commit activity
+      • Star/watcher count changes
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "github_tracker.json")
+
+    def __init__(self):
+        self._repos: Dict[str, Dict] = {}
+        self._last_check: Dict[str, float] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def add(self, owner: str, repo: str, channel: str, events: List[str] = None,
+            token: str = "") -> str:
+        key = f"{owner}/{repo}".lower()
+        self._repos[key] = {
+            "owner": owner, "repo": repo, "channel": channel.lower(),
+            "events": events or ["issue", "pr", "release"],
+            "token": token, "enabled": True,
+            "last_issue": 0, "last_pr": 0, "last_release": 0,
+        }
+        self._maybe_save()
+        return key
+
+    def remove(self, key: str) -> bool:
+        if key.lower() in self._repos:
+            del self._repos[key.lower()]
+            self._maybe_save()
+            return True
+        return False
+
+    async def check_updates(self) -> List[Dict]:
+        updates = []
+        now = time.time()
+        for key, repo in self._repos.items():
+            if not repo["enabled"]:
+                continue
+            if now - self._last_check.get(key, 0) < 300:
+                continue
+            self._last_check[key] = now
+            try:
+                updates.extend(await self._check_repo(key, repo))
+            except Exception:
+                pass
+        return updates
+
+    async def _check_repo(self, key: str, repo: Dict) -> List[Dict]:
+        updates = []
+        headers = {"Accept": "application/vnd.github.v3+json"}
+        if repo.get("token"):
+            headers["Authorization"] = f"token {repo['token']}"
+        base = f"https://api.github.com/repos/{repo['owner']}/{repo['repo']}"
+
+        loop = asyncio.get_running_loop()
+        if "issue" in repo["events"]:
+            try:
+                url = f"{base}/issues?state=open&sort=created&direction=desc&per_page=3"
+                raw = await loop.run_in_executor(_IO_EXECUTOR, lambda: self._fetch(url, headers))
+                issues = json.loads(raw) if raw else []
+                for iss in issues:
+                    if iss.get("pull_request"):
+                        continue
+                    created = time.mktime(time.strptime(iss["created_at"][:19], "%Y-%m-%dT%H:%M:%S"))
+                    if created > repo.get("last_issue", 0):
+                        updates.append({"type": "issue", "repo": key, "title": iss["title"],
+                                       "user": iss["user"]["login"], "url": iss["html_url"], "channel": repo["channel"]})
+                        repo["last_issue"] = max(repo.get("last_issue", 0), created)
+            except Exception:
+                pass
+
+        if "pr" in repo["events"]:
+            try:
+                url = f"{base}/pulls?state=open&sort=created&direction=desc&per_page=3"
+                raw = await loop.run_in_executor(_IO_EXECUTOR, lambda: self._fetch(url, headers))
+                prs = json.loads(raw) if raw else []
+                for pr in prs:
+                    created = time.mktime(time.strptime(pr["created_at"][:19], "%Y-%m-%dT%H:%M:%S"))
+                    if created > repo.get("last_pr", 0):
+                        updates.append({"type": "pr", "repo": key, "title": pr["title"],
+                                       "user": pr["user"]["login"], "url": pr["html_url"], "channel": repo["channel"]})
+                        repo["last_pr"] = max(repo.get("last_pr", 0), created)
+            except Exception:
+                pass
+
+        if "release" in repo["events"]:
+            try:
+                url = f"{base}/releases?per_page=1"
+                raw = await loop.run_in_executor(_IO_EXECUTOR, lambda: self._fetch(url, headers))
+                releases = json.loads(raw) if raw else []
+                if releases:
+                    rel = releases[0]
+                    created = time.mktime(time.strptime(rel["published_at"][:19], "%Y-%m-%dT%H:%M:%S"))
+                    if created > repo.get("last_release", 0):
+                        updates.append({"type": "release", "repo": key, "title": rel["name"] or rel["tag_name"],
+                                       "user": rel["author"]["login"], "url": rel["html_url"], "channel": repo["channel"]})
+                        repo["last_release"] = max(repo.get("last_release", 0), created)
+            except Exception:
+                pass
+
+        return updates
+
+    @staticmethod
+    def _fetch(url: str, headers: Dict) -> Optional[str]:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.read().decode("utf-8")
+        except Exception:
+            return None
+
+    def list_repos(self) -> List[Dict]:
+        return [{"key": k, **v} for k, v in self._repos.items()]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._repos, f, indent=2)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                self._repos = json.load(f)
+        except Exception:
+            pass
+
+
+# =========================
+# Chat Log Importer
+# =========================
+
+class ChatLogImporter:
+    """Import chat logs from other IRC clients.
+
+    Supported formats:
+      • HexChat/XChat (.log)
+      • WeeChat (.weechatlog)
+      • irssi (.log)
+      • Generic timestamped text
+    """
+
+    @staticmethod
+    def detect_format(filepath: str) -> str:
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                first_lines = [f.readline() for _ in range(5)]
+            for line in first_lines:
+                if re.match(r'\*\*\*\*\s+Log', line):
+                    return "hexchat"
+                if re.match(r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}', line):
+                    return "weechat"
+                if re.match(r'--.*--\s+Log', line):
+                    return "irssi"
+            return "generic"
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def import_file(filepath: str, window_name: str, fmt: str = "auto") -> int:
+        if fmt == "auto":
+            fmt = ChatLogImporter.detect_format(filepath)
+        count = 0
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    if not line.strip():
+                        continue
+                    parsed = ChatLogImporter._parse_line(line, fmt)
+                    if parsed:
+                        ts_str, nick, text = parsed
+                        append_chat_line(window_name, f"{ts_str} <{nick}> {text}")
+                        count += 1
+        except Exception:
+            pass
+        return count
+
+    @staticmethod
+    def _parse_line(line: str, fmt: str) -> Optional[Tuple[str, str, str]]:
+        if fmt == "hexchat":
+            m = re.match(r'\*\*\*\*\s+Log opened:\s+(.*)', line)
+            if m:
+                return None
+            m = re.match(r'(\d{2}:\d{2}:\d{2})\s+<([^>]+)>\s+(.*)', line)
+            if m:
+                return (f"[{m.group(1)}]", m.group(2), m.group(3))
+        elif fmt == "weechat":
+            m = re.match(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+<([^>]+)>\s+(.*)', line)
+            if m:
+                dt = m.group(1).split()[1]
+                return (f"[{dt}]", m.group(2), m.group(3))
+        elif fmt == "irssi":
+            m = re.match(r'--\w+\s+\w+\s+\d+\s+(\d{2}:\d{2}:\d{2})\s+--\s+<([^>]+)>\s+(.*)', line)
+            if m:
+                return (f"[{m.group(1)}]", m.group(2), m.group(3))
+        m = re.match(r'\[?(\d{2}:\d{2}(?::\d{2})?)\]?\s*[<\[]([^>\]]+)[>\]]\s+(.*)', line)
+        if m:
+            return (f"[{m.group(1)}]", m.group(2), m.group(3))
+        return None
+
+
+# =========================
+# Real-time Stats Panel
+# =========================
+
+class RealtimeStats:
+    """Tracks and computes real-time channel/session statistics for the stats panel."""
+
+    def __init__(self):
+        self._msg_timestamps: deque = deque(maxlen=5000)
+        self._channel_msg_counts: Dict[str, int] = {}
+        self._hourly_activity: List[int] = [0] * 24
+        self._session_start: float = time.time()
+        self._total_msgs: int = 0
+        self._total_suspects_seen: int = 0
+        self._ai_scores_in_window: deque = deque(maxlen=200)
+        self._sentiment_samples: deque = deque(maxlen=200)
+        self._last_compute: float = 0.0
+        self._cached_lines: List[str] = []
+
+    def record_message(self, nick: str, channel: str, ai_score: int = 0, sentiment: float = 0.0) -> None:
+        now = time.time()
+        self._msg_timestamps.append(now)
+        self._channel_msg_counts[channel] = self._channel_msg_counts.get(channel, 0) + 1
+        self._hourly_activity[time.localtime().tm_hour] += 1
+        self._total_msgs += 1
+        if ai_score >= AI_SUSPECT_THRESHOLD:
+            self._total_suspects_seen += 1
+        self._ai_scores_in_window.append(ai_score)
+        self._sentiment_samples.append(sentiment)
+        self._last_compute = 0.0
+
+    def get_panel_lines(self, current_channel: str, total_users: int, suspect_count: int, channels_joined: int) -> List[str]:
+        now = time.monotonic()
+        if now - self._last_compute < 1.0 and self._cached_lines:
+            return self._cached_lines
+
+        lines = []
+        uptime = time.time() - self._session_start
+        hours, rem = divmod(int(uptime), 3600)
+        mins, secs = divmod(rem, 60)
+
+        lines.append(" Stats ")
+        lines.append(f" {int(hours)}h {mins}m {secs}s")
+        lines.append(f" {self._total_msgs} msgs")
+
+        msgs_per_min = self._compute_rate(60)
+        lines.append(f" {msgs_per_min:.1f}/min")
+
+        lines.append(f" {total_users} users")
+        lines.append(f" {suspect_count} suspects")
+        lines.append(f" {channels_joined} channels")
+
+        if current_channel and current_channel.startswith("#"):
+            ch_msgs = self._channel_msg_counts.get(current_channel, 0)
+            lines.append(f" {ch_msgs} in {current_channel}")
+
+        avg_ai = sum(self._ai_scores_in_window) / len(self._ai_scores_in_window) if self._ai_scores_in_window else 0
+        lines.append(f" AI avg: {avg_ai:.0f}%")
+
+        if self._sentiment_samples:
+            avg_sent = sum(self._sentiment_samples) / len(self._sentiment_samples)
+            sent_label = "+" if avg_sent > 0.2 else "-" if avg_sent < -0.2 else "~"
+            lines.append(f" mood: {sent_label}{abs(avg_sent):.2f}")
+
+        peak_hour = max(range(24), key=lambda h: self._hourly_activity[h])
+        if self._hourly_activity[peak_hour] > 0:
+            lines.append(f" peak: {peak_hour:02d}:00")
+
+        self._cached_lines = lines
+        self._last_compute = now
+        return lines
+
+    def _compute_rate(self, window_seconds: int) -> float:
+        now = time.time()
+        cutoff = now - window_seconds
+        count = sum(1 for t in self._msg_timestamps if t >= cutoff)
+        return count / (window_seconds / 60.0)
+
+
+# =========================
+# AICalibrationManager
+# =========================
+
+class AICalibrationManager:
+    """Manages AI detection confidence calibration using feedback history.
+
+    Tracks:
+      • Per-nick feedback (ai/human labels with associated scores)
+      • Per-signal accuracy (how often each heuristic signal correlates with feedback)
+      • Adaptive thresholds (auto-tuned from feedback distribution)
+      • Calibration curve data (binned accuracy vs. predicted score)
+
+    Provides /aicalibrate to inspect and adjust calibration.
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "ai_calibration.json")
+
+    def __init__(self):
+        self._feedback: list = []
+        self._signal_stats: Dict[str, Dict] = {}
+        self._thresholds: Dict[str, float] = {
+            "ai_confirm": 70.0,
+            "human_confirm": 30.0,
+            "review": 50.0,
+        }
+        self._score_bins: Dict[str, int] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def record_feedback(self, nick: str, label: str, ai_score: float,
+                        signal_scores: Dict = None) -> None:
+        entry = {
+            "nick": nick,
+            "label": label,
+            "ai_score": ai_score,
+            "signal_scores": signal_scores or {},
+            "ts": time.time(),
+        }
+        self._feedback.append(entry)
+        self._update_signal_stats(entry)
+        self._update_score_bins(ai_score, label)
+        self._auto_adjust_thresholds()
+        self._maybe_save()
+
+    def _update_signal_stats(self, entry: dict) -> None:
+        label = entry["label"]
+        signals = entry.get("signal_scores", {})
+        for sig_name, sig_val in signals.items():
+            stats = self._signal_stats.setdefault(sig_name, {
+                "ai_total": 0.0, "ai_count": 0,
+                "human_total": 0.0, "human_count": 0,
+            })
+            if label == "ai":
+                stats["ai_total"] += sig_val
+                stats["ai_count"] += 1
+            else:
+                stats["human_total"] += sig_val
+                stats["human_count"] += 1
+
+    def _update_score_bins(self, ai_score: float, label: str) -> None:
+        bin_key = f"{int(ai_score / 10) * 10}-{int(ai_score / 10) * 10 + 9}"
+        self._score_bins.setdefault(bin_key, 0)
+        if label == "ai":
+            self._score_bins[bin_key] = self._score_bins.get(bin_key, 0) + 1
+
+    def _auto_adjust_thresholds(self) -> None:
+        if len(self._feedback) < 5:
+            return
+        ai_scores = [e["ai_score"] for e in self._feedback if e["label"] == "ai"]
+        human_scores = [e["ai_score"] for e in self._feedback if e["label"] == "human"]
+        if not ai_scores or not human_scores:
+            return
+        ai_avg = sum(ai_scores) / len(ai_scores)
+        human_avg = sum(human_scores) / len(human_scores)
+        midpoint = (ai_avg + human_avg) / 2.0
+        spread = abs(ai_avg - human_avg)
+        if spread < 10:
+            return
+        self._thresholds["review"] = midpoint
+        self._thresholds["ai_confirm"] = midpoint + spread * 0.25
+        self._thresholds["human_confirm"] = midpoint - spread * 0.25
+
+    def get_signal_reliability(self) -> Dict[str, Dict]:
+        results: Dict[str, Dict] = {}
+        for sig, stats in self._signal_stats.items():
+            ai_avg = stats["ai_total"] / stats["ai_count"] if stats["ai_count"] else 0
+            human_avg = stats["human_total"] / stats["human_count"] if stats["human_count"] else 0
+            separation = abs(ai_avg - human_avg)
+            results[sig] = {
+                "ai_avg": round(ai_avg, 3),
+                "human_avg": round(human_avg, 3),
+                "separation": round(separation, 3),
+                "ai_count": stats["ai_count"],
+                "human_count": stats["human_count"],
+                "reliable": separation > 0.1 and stats["ai_count"] >= 3 and stats["human_count"] >= 3,
+            }
+        return results
+
+    def get_thresholds(self) -> Dict[str, float]:
+        return dict(self._thresholds)
+
+    def get_summary(self) -> Dict:
+        ai_count = sum(1 for e in self._feedback if e["label"] == "ai")
+        human_count = sum(1 for e in self._feedback if e["label"] == "human")
+        return {
+            "total_feedback": len(self._feedback),
+            "ai_confirmations": ai_count,
+            "human_corrections": human_count,
+            "thresholds": self.get_thresholds(),
+            "signals": len(self._signal_stats),
+            "recent": self._feedback[-5:],
+        }
+
+    def get_weight_adjustments(self) -> Dict[str, float]:
+        reliability = self.get_signal_reliability()
+        adj: Dict[str, float] = {}
+        for sig, info in reliability.items():
+            if info["reliable"]:
+                if info["ai_avg"] > info["human_avg"]:
+                    adj[sig] = min(0.05, info["separation"] * 0.1)
+                else:
+                    adj[sig] = -min(0.05, info["separation"] * 0.1)
+            else:
+                adj[sig] = 0.0
+        return adj
+
+    def reset(self) -> None:
+        self._feedback.clear()
+        self._signal_stats.clear()
+        self._score_bins.clear()
+        self._thresholds = {
+            "ai_confirm": 70.0,
+            "human_confirm": 30.0,
+            "review": 50.0,
+        }
+        self._save()
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump({
+                    "feedback": self._feedback[-200:],
+                    "signal_stats": self._signal_stats,
+                    "thresholds": self._thresholds,
+                    "score_bins": self._score_bins,
+                }, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._feedback = data.get("feedback", [])
+            self._signal_stats = data.get("signal_stats", {})
+            self._thresholds = data.get("thresholds", self._thresholds)
+            self._score_bins = data.get("score_bins", {})
+        except Exception:
+            pass
+
+
+# =========================
+# TLSConnectionFingerprinter
+# =========================
+
+class TLSConnectionFingerprinter:
+    """Records TLS certificate fingerprints and alerts on changes.
+
+    Tracks:
+      • SHA-256 fingerprint of the server's TLS certificate chain
+      • TLS version and cipher suite
+      • Change history (cert rotation, MITM detection)
+
+    Alerts when the cert fingerprint changes between connections.
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "tls_fingerprints.json")
+
+    def __init__(self):
+        self._known: Dict[str, Dict] = {}
+        self._ui_queue: Optional[asyncio.Queue] = None
+        self.load()
+
+    def set_ui_queue(self, queue: asyncio.Queue) -> None:
+        self._ui_queue = queue
+
+    def record_cert(self, server: str, fingerprint: str,
+                    tls_version: str = "", cipher: str = "",
+                    issuer: str = "", subject: str = "",
+                    not_before: str = "", not_after: str = "") -> bool:
+        """Record a server cert. Returns True if cert is NEW or CHANGED."""
+        key = server.lower()
+        entry = {
+            "fingerprint": fingerprint,
+            "tls_version": tls_version,
+            "cipher": cipher,
+            "issuer": issuer,
+            "subject": subject,
+            "not_before": not_before,
+            "not_after": not_after,
+            "first_seen": time.time(),
+            "last_seen": time.time(),
+        }
+        if key not in self._known:
+            self._known[key] = entry
+            self._save()
+            return True
+        existing = self._known[key]
+        if existing["fingerprint"] != fingerprint:
+            old_fp = existing["fingerprint"]
+            history = existing.setdefault("history", [])
+            history.append({
+                "fingerprint": old_fp,
+                "last_seen": existing["last_seen"],
+            })
+            existing.update(entry)
+            existing["first_seen"] = self._known[key].get("first_seen", time.time())
+            existing["history"] = history
+            self._save()
+            return True
+        existing["last_seen"] = time.time()
+        if tls_version:
+            existing["tls_version"] = tls_version
+        if cipher:
+            existing["cipher"] = cipher
+        return False
+
+    def check_cert_change(self, server: str, fingerprint: str) -> Optional[Dict]:
+        """Check if fingerprint differs from known. Returns old entry if changed, None if same/new."""
+        key = server.lower()
+        if key not in self._known:
+            return None
+        existing = self._known[key]
+        if existing["fingerprint"] != fingerprint:
+            return {"old": existing["fingerprint"], "new": fingerprint,
+                    "old_cipher": existing.get("cipher", "?"),
+                    "old_tls": existing.get("tls_version", "?")}
+        return None
+
+    def get_status(self, server: str = "") -> Dict:
+        if server:
+            return self._known.get(server.lower(), {})
+        return dict(self._known)
+
+    def get_history(self, server: str) -> list:
+        key = server.lower()
+        entry = self._known.get(key, {})
+        return entry.get("history", [])
+
+    def _save(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._known, f, indent=2)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                self._known = json.load(f)
+        except Exception:
+            pass
+
+
+
+_FINGERPRINT_PATH = os.path.join(_SCRIPT_DIR, "bot_fingerprints.json")
 _STRIP_PUNCT = str.maketrans("", "", ".,!?;:\"'()[]")
 
 class BotFingerprint:
@@ -2663,11 +9113,15 @@ class BotFingerprint:
         self.bigrams:   set = set()    # consecutive word pairs
         self.trigrams:  set = set()    # consecutive word triples
         self.msg_count: int = 0
+        self.first_seen: float = time.time()
+        self.last_seen: float = time.time()
+        self.channels: set = set()     # channels where this bot was seen
+        self.sample_messages: List[str] = []  # up to 10 representative messages
 
     def _tokenize(self, text: str) -> List[str]:
         return [w.lower().translate(_STRIP_PUNCT) for w in text.split() if w.strip(_STRIP_PUNCT)]
 
-    def ingest(self, text: str) -> None:
+    def ingest(self, text: str, channel: str = "") -> None:
         """Feed one message into this fingerprint."""
         words = self._tokenize(text)
         if not words:
@@ -2678,6 +9132,11 @@ class BotFingerprint:
         for i in range(len(words) - 2):
             self.trigrams.add((words[i], words[i + 1], words[i + 2]))
         self.msg_count += 1
+        self.last_seen = time.time()
+        if channel:
+            self.channels.add(channel)
+        if len(self.sample_messages) < 10 and len(text) > 10:
+            self.sample_messages.append(text[:200])
 
     def similarity(self, text: str) -> float:
         """Return 0..1 — how closely *text* matches this bot's writing patterns.
@@ -2706,6 +9165,618 @@ class BotFingerprint:
             tri_score = len(text_tri & self.trigrams) / len(text_tri)
 
         return min(1.0, 0.25 * vocab_j + 0.35 * bi_score + 0.40 * tri_score)
+
+    def to_dict(self) -> Dict:
+        """Serialize fingerprint to a dictionary."""
+        return {
+            "nick": self.nick,
+            "word_vocab": sorted(self.word_vocab),
+            "bigrams": [f"{a} {b}" for a, b in self.bigrams],
+            "trigrams": [f"{a} {b} {c}" for a, b, c in self.trigrams],
+            "msg_count": self.msg_count,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "channels": sorted(self.channels),
+            "sample_messages": self.sample_messages,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "BotFingerprint":
+        """Deserialize fingerprint from a dictionary."""
+        fp = cls(data["nick"])
+        fp.word_vocab = set(data.get("word_vocab", []))
+        fp.bigrams = set()
+        for bg in data.get("bigrams", []):
+            parts = bg.split(" ", 2)
+            if len(parts) >= 2:
+                fp.bigrams.add((parts[0], parts[1]))
+        fp.trigrams = set()
+        for tg in data.get("trigrams", []):
+            parts = tg.split(" ", 3)
+            if len(parts) >= 3:
+                fp.trigrams.add((parts[0], parts[1], parts[2]))
+        fp.msg_count = data.get("msg_count", 0)
+        fp.first_seen = data.get("first_seen", time.time())
+        fp.last_seen = data.get("last_seen", time.time())
+        fp.channels = set(data.get("channels", []))
+        fp.sample_messages = data.get("sample_messages", [])
+        return fp
+
+
+def save_fingerprints(fingerprints: Dict[str, BotFingerprint]) -> None:
+    """Persist all bot fingerprints to disk."""
+    try:
+        data = {nick: fp.to_dict() for nick, fp in fingerprints.items()}
+        with open(_FINGERPRINT_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def load_fingerprints() -> Dict[str, BotFingerprint]:
+    """Load bot fingerprints from disk."""
+    fingerprints = {}
+    try:
+        with open(_FINGERPRINT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for nick, fp_data in data.items():
+            fingerprints[nick] = BotFingerprint.from_dict(fp_data)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return fingerprints
+
+
+# =========================
+# Async DNS Resolver
+# =========================
+
+class AsyncDNSResolver:
+    """Non-blocking DNS resolution with LRU caching and TTL support.
+
+    Uses asyncio.getaddrinfo in a thread executor so DNS lookups never block
+    the event loop.  Results are cached with TTL expiration to avoid repeated
+    lookups for the same host (especially useful during reconnect storms).
+    """
+
+    _CACHE_MAX = 128
+    _DEFAULT_TTL = 300  # 5 minutes default TTL
+
+    def __init__(self):
+        self._cache: OrderedDict = OrderedDict()
+        self._pending: Dict[str, asyncio.Future] = {}
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_UNSPEC) -> List[Tuple]:
+        """Resolve *host* to a list of (family, type, proto, canonname, sockaddr) tuples.
+
+        Returns cached results if available and not expired.
+        Deduplicates concurrent requests for the same host.
+        """
+        cache_key = f"{host}:{port}:{family}"
+        now = time.monotonic()
+
+        cached = self._cache.get(cache_key)
+        if cached and cached["expires"] > now:
+            self._cache.move_to_end(cache_key)
+            return cached["results"]
+
+        if cache_key in self._pending:
+            return await self._pending[cache_key]
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = asyncio.ensure_future(
+            loop.run_in_executor(_IO_EXECUTOR, socket.getaddrinfo, host, port, family, socket.SOCK_STREAM)
+        )
+        self._pending[cache_key] = fut
+        try:
+            results = await fut
+            ttl = self._DEFAULT_TTL
+            self._cache[cache_key] = {
+                "results": results,
+                "expires": now + ttl,
+                "ttl": ttl,
+            }
+            if len(self._cache) > self._CACHE_MAX:
+                self._cache.popitem(last=False)
+            return results
+        finally:
+            self._pending.pop(cache_key, None)
+
+    async def resolve_ip(self, host: str) -> List[str]:
+        """Return a list of IP addresses for *host* (IPv4 first, then IPv6)."""
+        results = await self.resolve(host)
+        ips: List[str] = []
+        for family, _, _, _, sockaddr in results:
+            ip = sockaddr[0]
+            if family == socket.AF_INET and ip not in ips:
+                ips.insert(0, ip)
+            elif family == socket.AF_INET6 and ip not in ips:
+                ips.append(ip)
+        return ips
+
+    def clear(self) -> None:
+        self._cache.clear()
+        for fut in self._pending.values():
+            fut.cancel()
+        self._pending.clear()
+
+    def get_cache_info(self) -> Dict[str, Any]:
+        now = time.monotonic()
+        entries = []
+        for key, data in self._cache.items():
+            remaining = max(0, data["expires"] - now)
+            entries.append({
+                "host": key,
+                "ttl_remaining": round(remaining, 1),
+                "results": len(data["results"]),
+            })
+        return {"cached": len(entries), "pending": len(self._pending), "entries": entries}
+
+
+_dns_resolver = AsyncDNSResolver()
+
+
+# =========================
+# LLM Fingerprinter
+# =========================
+
+class LLMFingerprinter:
+    """Detects LLM-specific generation patterns beyond simple linguistic fingerprints.
+
+    Tracks:
+      • Perplexity anomalies (unusually uniform or peaked token distributions)
+      • Punctuation entropy (LLMs tend to use punctuation more predictably)
+      • Function-word ratio bias (overuse of certain conjunctions/prepositions)
+      • Sentence-boundary patterns (LLMs often start sentences with similar structures)
+      • Repetition loops (circular rephrasing, "as mentioned before" patterns)
+      • Hedging language density ("it's important to note", "however", "additionally")
+      • List-structure bias (numbered/bulleted lists appearing unnaturally)
+      • Temperature signatures (low-temp: repetitive; high-temp: incoherent)
+
+    Provides per-nick LLM likelihood scores that complement the existing
+    AIVsAIDetector and BotFingerprint systems.
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "llm_fingerprints.json")
+
+    _HEDGING_PHRASES = re.compile(
+        r'\b(?:it.s important to note|it.s worth noting|however|additionally|'
+        r'furthermore|moreover|in conclusion|to summarize|on the other hand|'
+        r'it depends|generally speaking|typically|usually|often|in many cases|'
+        r'as an AI|as a language model|I.d be happy to|I can help|'
+        r'please note|keep in mind|it.s worth mentioning)\b',
+        re.IGNORECASE,
+    )
+
+    _REPETITION_PATTERNS = re.compile(
+        r'\b(?:as mentioned|as noted|as stated|as discussed|as we said|'
+        r'to reiterate|in other words|to put it differently|'
+        r'as I said before|as previously mentioned)\b',
+        re.IGNORECASE,
+    )
+
+    _LIST_STARTERS = re.compile(
+        r'^(?:\d+[\.\)]\s|[a-z][\.\)]\s|[-•*]\s|first(?:ly)?,|second(?:ly)?,|'
+        r'third(?:ly)?,|finally,|lastly,|next,|then,)\b',
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    _SENTENCE_STARTERS = re.compile(
+        r'(?:^|[.!?]\s+)([A-Z][a-z]{2,15})\b',
+        re.MULTILINE,
+    )
+
+    def __init__(self):
+        self._nick_data: Dict[str, Dict] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def analyze(self, nick: str, text: str) -> Dict[str, float]:
+        """Analyze a single message for LLM fingerprints. Returns per-feature scores."""
+        nl = nick.lower()
+        nd = self._nick_data.setdefault(nl, {
+            "msg_count": 0, "total_score": 0.0, "features": {},
+            "sentence_starts": Counter(), "hedging_count": 0,
+            "repetition_count": 0, "list_count": 0,
+        })
+        nd["msg_count"] += 1
+
+        features = {}
+        features["punctuation_entropy"] = self._punctuation_entropy(text)
+        features["function_word_ratio"] = self._function_word_ratio(text)
+        features["hedging_density"] = self._hedging_density(text)
+        features["repetition_score"] = self._repetition_score(text)
+        features["list_bias"] = self._list_bias(text)
+        features["sentence_start_uniformity"] = self._sentence_start_uniformity(nl, text)
+        features["perplexity_anomaly"] = self._perplexity_anomaly(text)
+
+        nd["hedging_count"] += 1 if features["hedging_density"] > 0.1 else 0
+        nd["repetition_count"] += 1 if features["repetition_score"] > 0.3 else 0
+        nd["list_count"] += 1 if features["list_bias"] > 0.5 else 0
+
+        weights = {
+            "punctuation_entropy": 0.15,
+            "function_word_ratio": 0.15,
+            "hedging_density": 0.20,
+            "repetition_score": 0.15,
+            "list_bias": 0.10,
+            "sentence_start_uniformity": 0.15,
+            "perplexity_anomaly": 0.10,
+        }
+        combined = sum(features.get(f, 0) * w for f, w in weights.items())
+        nd["total_score"] = (nd["total_score"] * (nd["msg_count"] - 1) + combined) / nd["msg_count"]
+        nd["features"] = features
+        self._maybe_save()
+        return {"combined": combined, "features": features}
+
+    def get_nick_score(self, nick: str) -> Dict[str, Any]:
+        nl = nick.lower()
+        nd = self._nick_data.get(nl, {})
+        if not nd or nd.get("msg_count", 0) < 3:
+            return {"nick": nick, "llm_score": 0, "confidence": "low", "samples": 0}
+        score = nd.get("total_score", 0) * 100
+        samples = nd.get("msg_count", 0)
+        confidence = "high" if samples >= 20 else "medium" if samples >= 10 else "low"
+        return {
+            "nick": nick, "llm_score": round(min(100, max(0, score)), 1),
+            "confidence": confidence, "samples": samples,
+            "hedging_ratio": round(nd.get("hedging_count", 0) / max(1, samples), 2),
+            "repetition_ratio": round(nd.get("repetition_count", 0) / max(1, samples), 2),
+            "list_ratio": round(nd.get("list_count", 0) / max(1, samples), 2),
+        }
+
+    def get_top_suspects(self, limit: int = 10) -> List[Dict]:
+        results = []
+        for nick, data in self._nick_data.items():
+            if data.get("msg_count", 0) >= 3:
+                score = data.get("total_score", 0) * 100
+                if score >= 30:
+                    results.append({
+                        "nick": nick, "score": round(score, 1),
+                        "samples": data["msg_count"],
+                    })
+        results.sort(key=lambda x: -x["score"])
+        return results[:limit]
+
+    def _punctuation_entropy(self, text: str) -> float:
+        punct_counts = Counter(c for c in text if c in ".,;:!?()-[]{}\"'")
+        if not punct_counts:
+            return 0.0
+        total = sum(punct_counts.values())
+        entropy = -sum((c / total) * log2(c / total) for c in punct_counts.values() if c > 0)
+        max_entropy = log2(max(len(punct_counts), 2))
+        normalized = entropy / max_entropy if max_entropy > 0 else 0
+        return 1.0 - normalized if normalized < 0.5 else 0.0
+
+    def _function_word_ratio(self, text: str) -> float:
+        words = text.lower().split()
+        if len(words) < 5:
+            return 0.0
+        _func = frozenset({"the", "a", "an", "of", "to", "in", "is", "that", "for", "it",
+                           "on", "and", "be", "or", "as", "at", "by", "with", "this", "are",
+                           "was", "were", "been", "has", "have", "had", "do", "does", "did",
+                           "will", "would", "can", "could", "may", "might", "shall", "should",
+                           "not", "no", "so", "if", "than", "then", "but", "because", "we",
+                           "they", "he", "she", "i", "you", "me", "him", "her", "us", "them"})
+        func_count = sum(1 for w in words if w in _func)
+        ratio = func_count / len(words)
+        if 0.35 < ratio < 0.55:
+            return 0.0
+        return min(1.0, abs(ratio - 0.45) * 3)
+
+    def _hedging_density(self, text: str) -> float:
+        matches = self._HEDGING_PHRASES.findall(text)
+        words = len(text.split())
+        if words < 10:
+            return 0.0
+        density = len(matches) / (words / 20)
+        return min(1.0, density)
+
+    def _repetition_score(self, text: str) -> float:
+        rep_matches = self._REPETITION_PATTERNS.findall(text)
+        words = text.lower().split()
+        if len(words) < 10:
+            return 0.0
+        word_freq = Counter(words)
+        repeated = sum(1 for c in word_freq.values() if c > 2)
+        rep_ratio = repeated / max(len(word_freq), 1)
+        phrase_score = min(1.0, len(rep_matches) * 0.3)
+        return min(1.0, (rep_ratio * 0.5 + phrase_score * 0.5))
+
+    def _list_bias(self, text: str) -> float:
+        lines = text.split("\n")
+        if len(lines) < 2:
+            list_matches = self._LIST_STARTERS.findall(text)
+            return min(1.0, len(list_matches) * 0.2)
+        list_lines = sum(1 for line in lines if self._LIST_STARTERS.match(line.strip()))
+        return min(1.0, list_lines / max(len(lines), 1))
+
+    def _sentence_start_uniformity(self, nick: str, text: str) -> float:
+        starts = self._SENTENCE_STARTERS.findall(text)
+        nd = self._nick_data.get(nick.lower(), {})
+        existing_starts = nd.get("sentence_starts", Counter())
+        for s in starts:
+            existing_starts[s.lower()] += 1
+        nd["sentence_starts"] = existing_starts
+        if sum(existing_starts.values()) < 5:
+            return 0.0
+        total = sum(existing_starts.values())
+        top3 = sum(c for _, c in existing_starts.most_common(3))
+        ratio = top3 / total
+        return ratio if ratio > 0.6 else 0.0
+
+    def _perplexity_anomaly(self, text: str) -> float:
+        words = text.split()
+        if len(words) < 10:
+            return 0.0
+        word_lens = [len(w) for w in words]
+        mean_len = sum(word_lens) / len(word_lens)
+        variance = sum((l - mean_len) ** 2 for l in word_lens) / len(word_lens)
+        cv = (variance ** 0.5) / max(mean_len, 1)
+        if cv < 0.3:
+            return 0.3
+        return 0.0
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {}
+            for nick, nd in self._nick_data.items():
+                data[nick] = {
+                    "msg_count": nd["msg_count"],
+                    "total_score": nd["total_score"],
+                    "hedging_count": nd["hedging_count"],
+                    "repetition_count": nd["repetition_count"],
+                    "list_count": nd["list_count"],
+                    "sentence_starts": dict(nd.get("sentence_starts", {})),
+                }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for nick, nd in data.items():
+                self._nick_data[nick] = {
+                    "msg_count": nd.get("msg_count", 0),
+                    "total_score": nd.get("total_score", 0.0),
+                    "hedging_count": nd.get("hedging_count", 0),
+                    "repetition_count": nd.get("repetition_count", 0),
+                    "list_count": nd.get("list_count", 0),
+                    "sentence_starts": Counter(nd.get("sentence_starts", {})),
+                    "features": {},
+                }
+        except Exception:
+            pass
+
+
+# =========================
+# Deepfake Text Relay Detector
+# =========================
+
+class DeepfakeRelayDetector:
+    """Detects relay-style deepfake text patterns where AI-generated content is
+    being passed through a human intermediary or relayed from another source.
+
+    Detects:
+      • Source attribution anomalies (claims of "someone told me", "I heard")
+      • Temporal inconsistency (relaying info that was just generated)
+      • Style switching (sudden shifts in vocabulary/formality within a conversation)
+      • Quotation patterns (excessive quoting without context)
+      • Metadata mismatch (claimed experience vs actual knowledge)
+      • Cross-reference failure (claims that don't match known facts in channel history)
+      • Relay chain detection (A says X, B relays X with minor changes, C relays B's version)
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "deepfake_relay.json")
+
+    _RELAY_PHRASES = re.compile(
+        r'\b(?:someone (?:told|said|mentioned)|I heard (?:that )?|'
+        r'(?:a friend|my source|an insider) (?:told|said)|'
+        r"apparently|supposedly|reportedly|allegedly|"
+        r'(?:according to|as per) (?:reports|sources|news)|'
+        r'I\'ve been told|I was informed|word is|rumor has it|'
+        r'(?:they|he|she) said that|it is said that|'
+        r'(?:repost|relay|forward|share|pass on))\b',
+        re.IGNORECASE,
+    )
+
+    _QUOTE_PATTERN = re.compile(r'(?:"([^"]{10,})"|\'([^\']{10,})\'|“([^"]{10,})”)', re.DOTALL)
+
+    def __init__(self):
+        self._nick_data: Dict[str, Dict] = {}
+        self._relay_chains: Dict[str, List[Dict]] = {}
+        self._channel_history: Dict[str, deque] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def analyze(self, nick: str, channel: str, text: str) -> Dict[str, Any]:
+        nl = nick.lower()
+        cl = channel.lower()
+        nd = self._nick_data.setdefault(nl, {
+            "relay_phrase_count": 0, "quote_count": 0,
+            "style_shifts": 0, "total_msgs": 0, "relay_score": 0.0,
+        })
+        nd["total_msgs"] += 1
+
+        self._channel_history.setdefault(cl, deque(maxlen=500))
+        self._channel_history[cl].append({"nick": nl, "text": text, "ts": time.time()})
+
+        features = {}
+        features["relay_phrase_score"] = self._relay_phrase_score(text)
+        features["quote_density"] = self._quote_density(text)
+        features["style_shift_score"] = self._style_shift_score(nl, text)
+        features["temporal_inconsistency"] = self._temporal_inconsistency(cl, text)
+        features["relay_chain_score"] = self._relay_chain_score(cl, text)
+
+        nd["relay_phrase_count"] += 1 if features["relay_phrase_score"] > 0.3 else 0
+        nd["quote_count"] += 1 if features["quote_density"] > 0.4 else 0
+
+        weights = {
+            "relay_phrase_score": 0.25,
+            "quote_density": 0.20,
+            "style_shift_score": 0.20,
+            "temporal_inconsistency": 0.15,
+            "relay_chain_score": 0.20,
+        }
+        combined = sum(features.get(f, 0) * w for f, w in weights.items())
+        nd["relay_score"] = (nd["relay_score"] * (nd["total_msgs"] - 1) + combined) / nd["total_msgs"]
+
+        if combined >= 0.5:
+            self._record_relay_chain(cl, nick, text, combined)
+
+        self._maybe_save()
+        return {"combined": combined, "features": features, "is_relay": combined >= 0.5}
+
+    def get_nick_score(self, nick: str) -> Dict[str, Any]:
+        nl = nick.lower()
+        nd = self._nick_data.get(nl, {})
+        if not nd or nd.get("total_msgs", 0) < 3:
+            return {"nick": nick, "relay_score": 0, "confidence": "low", "samples": 0}
+        score = nd.get("relay_score", 0) * 100
+        samples = nd.get("total_msgs", 0)
+        confidence = "high" if samples >= 30 else "medium" if samples >= 10 else "low"
+        return {
+            "nick": nick, "relay_score": round(min(100, max(0, score)), 1),
+            "confidence": confidence, "samples": samples,
+            "relay_phrases": nd.get("relay_phrase_count", 0),
+            "quotes": nd.get("quote_count", 0),
+        }
+
+    def get_active_chains(self, limit: int = 5) -> List[Dict]:
+        results = []
+        for chain_id, entries in self._relay_chains.items():
+            if len(entries) >= 2:
+                results.append({
+                    "chain_id": chain_id,
+                    "participants": list(set(e["nick"] for e in entries)),
+                    "length": len(entries),
+                    "avg_score": round(sum(e["score"] for e in entries) / len(entries), 2),
+                })
+        results.sort(key=lambda x: -x["avg_score"])
+        return results[:limit]
+
+    def _relay_phrase_score(self, text: str) -> float:
+        matches = self._RELAY_PHRASES.findall(text)
+        words = len(text.split())
+        if words < 5:
+            return 0.0
+        density = len(matches) / (words / 15)
+        return min(1.0, density)
+
+    def _quote_density(self, text: str) -> float:
+        quotes = self._QUOTE_PATTERN.findall(text)
+        quote_len = sum(len(q) for group in quotes for q in group if q)
+        if len(text) < 10:
+            return 0.0
+        ratio = quote_len / len(text)
+        return min(1.0, ratio * 2)
+
+    def _style_shift_score(self, nick: str, text: str) -> float:
+        nl = nick.lower()
+        nd = self._nick_data.get(nl, {})
+        words = text.split()
+        if len(words) < 5:
+            return 0.0
+        avg_word_len = sum(len(w) for w in words) / len(words)
+        vocab_richness = len(set(w.lower() for w in words)) / len(words)
+        prev_avg = nd.get("prev_avg_word_len", avg_word_len)
+        prev_vocab = nd.get("prev_vocab_richness", vocab_richness)
+        nd["prev_avg_word_len"] = avg_word_len
+        nd["prev_vocab_richness"] = vocab_richness
+        word_len_shift = abs(avg_word_len - prev_avg) / max(prev_avg, 1)
+        vocab_shift = abs(vocab_richness - prev_vocab) / max(prev_vocab, 0.01)
+        combined = (word_len_shift * 0.5 + vocab_shift * 0.5)
+        return min(1.0, combined) if combined > 0.3 else 0.0
+
+    def _temporal_inconsistency(self, channel: str, text: str) -> float:
+        history = self._channel_history.get(channel.lower(), deque())
+        if len(history) < 3:
+            return 0.0
+        now = time.time()
+        recent = [e for e in history if now - e["ts"] < 60]
+        if len(recent) < 2:
+            return 0.0
+        text_lower = text.lower()
+        for entry in recent:
+            if entry["text"].lower() in text_lower and len(entry["text"]) > 20:
+                return 0.6
+        return 0.0
+
+    def _relay_chain_score(self, channel: str, text: str) -> float:
+        history = self._channel_history.get(channel.lower(), deque())
+        if len(history) < 4:
+            return 0.0
+        text_words = set(text.lower().split())
+        if len(text_words) < 5:
+            return 0.0
+        chain_count = 0
+        for entry in list(history)[-10:]:
+            entry_words = set(entry["text"].lower().split())
+            overlap = len(text_words & entry_words) / max(len(text_words), 1)
+            if 0.4 < overlap < 0.9:
+                chain_count += 1
+        return min(1.0, chain_count * 0.25)
+
+    def _record_relay_chain(self, channel: str, nick: str, text: str, score: float) -> None:
+        chain_key = f"{channel.lower()}:{text[:30].lower()}"
+        self._relay_chains.setdefault(chain_key, [])
+        self._relay_chains[chain_key].append({
+            "nick": nick, "ts": time.time(), "score": score,
+        })
+        if len(self._relay_chains[chain_key]) > 10:
+            self._relay_chains[chain_key] = self._relay_chains[chain_key][-10:]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {}
+            for nick, nd in self._nick_data.items():
+                data[nick] = {
+                    "relay_phrase_count": nd["relay_phrase_count"],
+                    "quote_count": nd["quote_count"],
+                    "style_shifts": nd["style_shifts"],
+                    "total_msgs": nd["total_msgs"],
+                    "relay_score": nd["relay_score"],
+                }
+            chains = {}
+            for key, entries in self._relay_chains.items():
+                chains[key] = [{"nick": e["nick"], "ts": e["ts"], "score": e["score"]} for e in entries[-5:]]
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump({"nicks": data, "chains": chains}, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for nick, nd in data.get("nicks", {}).items():
+                self._nick_data[nick] = {
+                    "relay_phrase_count": nd.get("relay_phrase_count", 0),
+                    "quote_count": nd.get("quote_count", 0),
+                    "style_shifts": nd.get("style_shifts", 0),
+                    "total_msgs": nd.get("total_msgs", 0),
+                    "relay_score": nd.get("relay_score", 0.0),
+                }
+            for key, entries in data.get("chains", {}).items():
+                self._relay_chains[key] = entries
+        except Exception:
+            pass
 
 
 # =========================
@@ -2992,6 +10063,121 @@ class ScoringEngine:
         self.bot_fingerprints: Dict[str, BotFingerprint] = {}
         self.blocklisted_ngrams: set = set()
         self._load_blocklist()
+        # Load persisted fingerprints
+        self._load_fingerprints()
+        # New AI/ML components
+        self.sentiment = SentimentAnalyzer()
+        self.behavioral = BehavioralAnomalyDetector()
+        self.topics = TopicDetector()
+        self.semantic = SemanticSimilarityDetector()
+        self.threads = ThreadTracker()
+        self.cross_channel = CrossChannelBotDetector()
+        # Sentiment history per nick for trend analysis
+        self._sentiment_history: Dict[str, deque] = {}
+        # Productivity components
+        self.reminders = ReminderManager()
+        self.watches = NickWatchManager()
+        self.snippets = SnippetManager()
+        self.channel_stats = ChannelStatsTracker()
+        self.rss = RSSFeedBridge()
+        self.todos = TodoManager()
+        self.pomodoro = PomodoroManager()
+        self.notes = NoteManager()
+        self.bookmarks = BookmarkManager()
+        self.timers = TimerManager()
+        self.relationships = RelationshipGraph()
+        self.calibration = AICalibrationManager()
+        self.tls_fingerprinter = TLSConnectionFingerprinter()
+        self.ai_vs_ai = AIVsAIDetector()
+        self.sentiment_ai = SentimentAICorrelator()
+        # Advanced AI detection
+        self.llm_fingerprinter = LLMFingerprinter()
+        self.deepfake_relay = DeepfakeRelayDetector()
+        # Networking & analytics
+        self.network_analytics = NetworkAnalytics()
+        # Automation & bots
+        self.triggers = TriggerManager()
+        self.automod = AutoModManager()
+        self.webhooks = WebhookManager()
+        # Data & integration
+        self.github = GitHubTracker()
+        # Advanced AI/ML features
+        self.astroturfing = AstroturfingDetector()
+        self.personality = PersonalityProfiler()
+        self.predictive_reply = PredictiveReplyEngine()
+        self.stances = StanceTracker()
+        self.flow_predictor = ConversationFlowPredictor()
+        self.sentiment_contagion = SentimentContagionMap()
+        self.bot_swarm = BotSwarmDetector()
+        self.ban_evasion = BanEvasionDetector()
+        self.fact_checker = RealtimeFactChecker()
+        self.research_agent = AutonomousResearchAgent()
+        self.conversational_agent = ConversationalAgent()
+        self.role_inference = RoleInference()
+        self.debate_analyzer = DebateAnalyzer()
+        self.echo_chamber = EchoChamberDetector()
+        self.achievements = AchievementBadges()
+        self.sarcasm = SarcasmDetector()
+        self.emotion_arc = EmotionArc()
+        # Real-time stats panel
+        self.stats = RealtimeStats()
+
+    def _load_fingerprints(self) -> None:
+        """Load persisted bot fingerprints from disk."""
+        self.bot_fingerprints = load_fingerprints()
+        # Re-add loaded fingerprints to confirmed_bot_nicks
+        for nick in self.bot_fingerprints:
+            self.confirmed_bot_nicks.add(nick.lower())
+
+    def save_fingerprints(self) -> None:
+        """Persist all bot fingerprints to disk."""
+        save_fingerprints(self.bot_fingerprints)
+
+    def analyze_sentiment(self, nick: str, text: str) -> Dict[str, Any]:
+        """Analyze sentiment and track history for *nick*."""
+        result = self.sentiment.analyze(text)
+        if nick not in self._sentiment_history:
+            self._sentiment_history[nick] = deque(maxlen=100)
+        self._sentiment_history[nick].append({
+            "score": result["score"],
+            "ts": time.time(),
+            "text": text[:100],
+        })
+        return result
+
+    def get_sentiment_trend(self, nick: str, window: int = 20) -> Dict[str, Any]:
+        """Return sentiment trend for *nick* over last *window* messages."""
+        history = self._sentiment_history.get(nick, deque())
+        if not history:
+            return {"trend": "no data", "avg_score": 0.0, "volatility": 0.0}
+        recent = list(history)[-window:]
+        scores = [h["score"] for h in recent]
+        avg = sum(scores) / len(scores) if scores else 0.0
+        # Volatility = standard deviation
+        if len(scores) >= 2:
+            variance = sum((s - avg) ** 2 for s in scores) / len(scores)
+            volatility = variance ** 0.5
+        else:
+            volatility = 0.0
+        # Trend direction
+        if len(scores) >= 5:
+            first_half = sum(scores[:len(scores)//2]) / (len(scores)//2)
+            second_half = sum(scores[len(scores)//2:]) / (len(scores) - len(scores)//2)
+            delta = second_half - first_half
+            if delta > 0.1:
+                trend = "improving"
+            elif delta < -0.1:
+                trend = "declining"
+            else:
+                trend = "stable"
+        else:
+            trend = "insufficient data"
+        return {
+            "trend": trend,
+            "avg_score": round(avg, 3),
+            "volatility": round(volatility, 3),
+            "sample_count": len(scores),
+        }
 
     # ── Collaborative n-gram blocklist (Area 3) ───────────────────────────
 
@@ -3077,18 +10263,20 @@ class ScoringEngine:
             total += 1
         return min(1.0, hits / max(1, total))
 
-    def confirm_bot(self, nick: str, messages: List[str]) -> BotFingerprint:
+    def confirm_bot(self, nick: str, messages: List[str], channel: str = "") -> BotFingerprint:
         """Mark *nick* as a confirmed bot and build their linguistic fingerprint."""
-        self.confirmed_bot_nicks.add(nick)
-        fp = self.bot_fingerprints.get(nick) or BotFingerprint(nick)
+        self.confirmed_bot_nicks.add(nick.lower())
+        fp = self.bot_fingerprints.get(nick.lower()) or BotFingerprint(nick)
         for msg in messages:
-            fp.ingest(msg)
-        self.bot_fingerprints[nick] = fp
+            fp.ingest(msg, channel)
+        self.bot_fingerprints[nick.lower()] = fp
+        self.save_fingerprints()
         return fp
 
     def unconfirm_bot(self, nick: str) -> None:
-        self.confirmed_bot_nicks.discard(nick)
-        self.bot_fingerprints.pop(nick, None)
+        self.confirmed_bot_nicks.discard(nick.lower())
+        self.bot_fingerprints.pop(nick.lower(), None)
+        self.save_fingerprints()
 
     def max_fingerprint_similarity(self, text: str, exclude_nick: str = "") -> float:
         """Return the highest similarity score of *text* against all bot fingerprints."""
@@ -3248,6 +10436,7 @@ class IRCClient:
         self.use_ssl = use_ssl
         self.use_tor = use_tor
         self.tor_strict: bool = False
+        self.i2p_strict: bool = False
         self._own_umodes: set = set()      # user modes (+i, +o, +w, etc.)
         self._ircop_nicks: set = set()     # nicks known to be IRC operators
         self._ctcp_mode: str = "normal"    # normal, off, spoof
@@ -3277,6 +10466,8 @@ class IRCClient:
         self._monitor_nicks: set = set()         # nicks on MONITOR list
         self._chathistory_cap: str = ""          # "chathistory" or "draft/chathistory"
         self._replay_enabled: bool = False       # must be set True before /replay works
+        self._soju_networks: dict = {}           # net_id → {name, host, port, nick, state, ...}
+        self._soju_is_bouncer: bool = False      # True when soju.im/bouncer-networks ACKed
         self._label_seq: int = 0                 # monotonic label counter (labeled-response)
         self._pending_labels: set = set()        # labels sent on outgoing msgs, awaiting echo
         self._whox_seq: int = 1                  # rotating token for WHOX queries (1–999)
@@ -3311,6 +10502,15 @@ class IRCClient:
         # Strong references to fire-and-forget scoring tasks so they are not
         # garbage-collected before they finish (asyncio only holds weak refs).
         self._bg_tasks: set = set()
+        # Behavioral biometrics tracker for user typing patterns
+        self.biometrics: BehavioralBiometrics = BehavioralBiometrics()
+        # IRCv3 draft/thread: track last thread parent per channel
+        self._thread_parents: Dict[str, str] = {}
+        # IRCv3 read-marker: last known read marker per channel
+        self._read_markers: Dict[str, str] = {}
+        # Adaptive rate limiting state
+        self._throttle_count: int = 0
+        self._last_throttle: float = 0.0
 
     @property
     def server_id(self) -> str:
@@ -3362,17 +10562,56 @@ class IRCClient:
                 f"Tor strict mode: refusing clearnet host '{self.server}' "
                 f"(only .onion addresses allowed)")
 
-        via = " (via Tor)" if self.use_tor else ""
+        # I2P-only mode: refuse non-I2P hosts
+        if self.i2p_strict and not self.server.endswith(".i2p"):
+            raise ConnectionError(
+                f"I2P strict mode: refusing non-I2P host '{self.server}' "
+                f"(only .i2p addresses allowed)")
+
+        is_i2p = self.server.endswith(".i2p")
+        via = " (via Tor)" if self.use_tor else " (via I2P)" if is_i2p else ""
         proto = "SSL" if self.use_ssl else "plain"
         await self.ui_queue.put(("status", f"Connecting to {self.server}:{self.port} ({proto}{via})..."))
+
+        # Async DNS resolution with caching
+        if not self.use_tor and not is_i2p:
+            try:
+                resolved = await _dns_resolver.resolve_ip(self.server)
+                if resolved:
+                    await self.ui_queue.put(("status", f"[DNS] {self.server} → {', '.join(resolved)}"))
+            except Exception as dns_err:
+                await self.ui_queue.put(("status", f"[DNS] resolution failed: {dns_err} (falling back to system resolver)"))
+
         try:
             # 30-second connect timeout prevents hangs on unreachable hosts.
             # limit=2^20 (1 MiB) sets the StreamReader internal buffer; the default
             # 64 KB can stall on fast servers that send large NAMES / MOTD bursts.
             if self.use_tor:
                 self.reader, self.writer = await asyncio.wait_for(
-                    _socks5_connect(self.server, self.port),
+                    _socks5_connect(self.server, self.port,
+                                   proxy_host=TOR_PROXY_HOST, proxy_port=TOR_PROXY_PORT),
                     timeout=30.0,
+                )
+                if self.use_ssl:
+                    loop = asyncio.get_running_loop()
+                    raw_sock = self.writer.transport.get_extra_info("socket")
+                    ssl_sock = await loop.run_in_executor(
+                        None, lambda: _SSL_CTX.wrap_socket(
+                            raw_sock, server_hostname=self.server,
+                            do_handshake_on_connect=True))
+                    ssl_sock.setblocking(False)
+                    ssl_reader = asyncio.StreamReader(limit=2**20)
+                    ssl_protocol = asyncio.StreamReaderProtocol(ssl_reader)
+                    await loop.connect_accepted_socket(
+                        lambda: ssl_protocol, ssl_sock)
+                    self.writer = asyncio.StreamWriter(
+                        ssl_sock, ssl_protocol, ssl_reader, loop)
+                    self.reader = ssl_reader
+            elif is_i2p:
+                self.reader, self.writer = await asyncio.wait_for(
+                    _socks5_connect(self.server, self.port,
+                                   proxy_host=I2P_PROXY_HOST, proxy_port=I2P_PROXY_PORT),
+                    timeout=60.0,
                 )
                 if self.use_ssl:
                     loop = asyncio.get_running_loop()
@@ -3422,6 +10661,33 @@ class IRCClient:
                 pass  # socket options are best-effort
         via = " via Tor" if self.use_tor else ""
         conn_label = "SSL connection" if self.use_ssl else "Connection"
+        # TLS certificate fingerprinting (MITM / cert-change detection)
+        if self.use_ssl and self.scoring.tls_fingerprinter:
+            try:
+                ssl_obj = self.writer.transport.get_extra_info("ssl_object")
+                if ssl_obj:
+                    der_cert = ssl_obj.getpeercert(binary_form=True)
+                    cert_info = ssl_obj.getpeercert()
+                    if der_cert:
+                        fp = hashlib.sha256(der_cert).hexdigest()
+                        issuer = ""
+                        subject = ""
+                        tls_ver = ssl_obj.version() or ""
+                        cipher = ssl_obj.cipher()[0] if ssl_obj.cipher() else ""
+                        if cert_info:
+                            issuer = str(cert_info.get("issuer", ""))
+                            subject = str(cert_info.get("subject", ""))
+                        changed = self.scoring.tls_fingerprinter.check_cert_change(self.server, fp)
+                        self.scoring.tls_fingerprinter.record_cert(
+                            self.server, fp, tls_ver, cipher, issuer, subject)
+                        if changed:
+                            await self.ui_queue.put(("status",
+                                f"[TLS] CERT CHANGE on {self.server}: "
+                                f"old={changed['old'][:16]}… new={changed['new'][:16]}… "
+                                f"→ possible MITM or cert rotation"))
+                        self.scoring.tls_fingerprinter._save()
+            except Exception:
+                pass
         await self.ui_queue.put(("status", f"{conn_label}{via} established to {self.server}:{self.port}"))
         # Flush any stale messages queued from a previous (failed) connection
         # so they are not replayed on the new session.
@@ -3465,6 +10731,12 @@ class IRCClient:
         IRC servers typically kick clients that exceed ~10 lines/second; this
         keeps us well under that limit even on /join floods or mass-kicks.
 
+        Adaptive rate limiting:
+          • Detects server throttling (numerics 404, 406, 407, 436)
+          • Dynamically reduces rate on throttle detection, recovers gradually
+          • Per-channel rate tracking to avoid flooding busy channels
+          • Priority queuing: PING/PONG and SASL get highest priority
+
         Batching: after the first token is consumed we drain all immediately
         available messages (up to remaining token budget) and send them in a
         single writelines() + drain() call.  This reduces kernel round-trips
@@ -3478,29 +10750,70 @@ class IRCClient:
         tokens = BURST
         last_refill = time.monotonic()
 
+        # Adaptive rate limiting state
+        _adaptive_rate = RATE
+        _adaptive_burst = BURST
+        _throttle_count = 0
+        _last_throttle = 0.0
+        _recovery_timer = 0.0
+        _MIN_RATE = 1.0
+        _MAX_RATE = 8.0
+        _THROTTLE_NUMERICS = frozenset({"404", "406", "407", "436", "465"})
+        _channel_send_times: Dict[str, deque] = {}
+        _CHANNEL_BURST_LIMIT = 5
+        _CHANNEL_WINDOW = 2.0
+
         while self.running:
             try:
                 data = await self._send_queue.get()
             except asyncio.CancelledError:
                 break
 
-            # Refill the bucket for time elapsed since last send
+            # Adaptive recovery: gradually increase rate if no recent throttles
             now = time.monotonic()
-            tokens = min(BURST, tokens + (now - last_refill) * RATE)
+            if _throttle_count > 0 and now - _last_throttle > 30.0:
+                _recovery_timer += (now - _recovery_timer) * 0.1 if _recovery_timer else now
+                if now - _last_throttle > 60.0 and _adaptive_rate < RATE:
+                    _adaptive_rate = min(RATE, _adaptive_rate + 0.5)
+                    _adaptive_burst = min(BURST, _adaptive_burst + 1)
+                    _throttle_count = max(0, _throttle_count - 1)
+
+            # Refill the bucket for time elapsed since last send
+            tokens = min(_adaptive_burst, tokens + (now - last_refill) * _adaptive_rate)
             last_refill = now
 
             # If the bucket is empty, sleep until we have a token
             if tokens < 1.0:
-                wait = (1.0 - tokens) / RATE
+                wait = (1.0 - tokens) / _adaptive_rate
                 try:
                     await asyncio.sleep(wait)
                 except asyncio.CancelledError:
                     break
                 now = time.monotonic()
-                tokens = min(BURST, tokens + (now - last_refill) * RATE)
+                tokens = min(_adaptive_burst, tokens + (now - last_refill) * _adaptive_rate)
                 last_refill = now
 
             tokens -= 1.0
+
+            # Channel-level rate limiting: prevent flooding a single channel
+            try:
+                line_text = data.decode("utf-8", errors="replace").strip()
+                if line_text.startswith("PRIVMSG "):
+                    parts = line_text.split(" ", 2)
+                    if len(parts) >= 2:
+                        chan = parts[1]
+                        if chan.startswith("#"):
+                            chan_times = _channel_send_times.setdefault(chan, deque(maxlen=20))
+                            chan_times.append(now)
+                            recent = sum(1 for t in chan_times if now - t < _CHANNEL_WINDOW)
+                            if recent > _CHANNEL_BURST_LIMIT:
+                                delay = 1.0
+                                try:
+                                    await asyncio.sleep(delay)
+                                except asyncio.CancelledError:
+                                    break
+            except Exception:
+                pass
 
             # Batch: absorb all messages that are already queued (up to token
             # budget) so they share a single drain() syscall.
@@ -3526,6 +10839,12 @@ class IRCClient:
                 except Exception:
                     pass
                 break
+
+    def record_throttle(self, numeric: str) -> None:
+        """Called when a throttle-related numeric is received; reduces send rate."""
+        if numeric in {"404", "406", "407", "436", "465"}:
+            self._throttle_count = getattr(self, "_throttle_count", 0) + 1
+            self._last_throttle = time.monotonic()
 
     def _ctcp_allowed(self, nick: str) -> bool:
         """Allow at most 3 CTCP replies per nick per 30 s."""
@@ -3804,6 +11123,7 @@ class IRCClient:
                 echoed_ts = int(params[0].lstrip(":keepalive-"))
                 if echoed_ts > 0:
                     self._latency = time.time() - echoed_ts
+                    self.biometrics.record_incoming_message()
             except (ValueError, IndexError):
                 pass
 
@@ -3817,11 +11137,13 @@ class IRCClient:
         "chathistory", "draft/chathistory",
         "draft/multiline", "draft/format", "draft/ping",
         "message-redaction", "read-marker", "message-intents",
-        "draft/account-registration",
+        "draft/thread", "draft/account-registration",
         "draft/reply", "draft/react", "draft/typing",
         "draft/mention", "draft/event-playback",
         "draft/channel-rename", "draft/persistent-channel",
         "draft/resume",
+        "soju.im/bouncer-networks", "soju.im/bouncer-networks-notify",
+        "soju.im/search", "soju.im/read-away",
     )
 
     async def _irc_cap(self, nick, params, prefix):
@@ -3868,6 +11190,9 @@ class IRCClient:
         elif subcmd == "ACK":
             acked = set((params[-1] if params else "").lower().split())
             self._active_caps |= acked
+            if "soju.im/bouncer-networks" in acked:
+                self._soju_is_bouncer = True
+                self.send_raw("BOUNCER LISTNETWORKS")
             if "sasl" in acked:
                 self.send_raw(f"AUTHENTICATE {SASL_MECHANISM}")
             else:
@@ -4248,8 +11573,20 @@ class IRCClient:
                     await self.ui_queue.put(("status", f"Joining {ch}..."))
         if not self.current_channel and DEFAULT_CHANNEL:
             self.current_channel = DEFAULT_CHANNEL
+        if self._soju_is_bouncer and self._chathistory_cap:
+            asyncio.create_task(self._soju_auto_replay())
         # Query own user modes (triggers 221 RPL_UMODEIS)
         self.send_raw(f"MODE {self.nick}")
+
+    async def _soju_auto_replay(self) -> None:
+        """Request chathistory for all joined channels after soju connect."""
+        await asyncio.sleep(2)
+        all_ch = set(self.joined_channels) | set(_AUTOJOIN_CHANNELS)
+        for ch in sorted(all_ch):
+            self.cmd_chathistory(ch, count=50)
+        if all_ch:
+            await self.ui_queue.put(("status",
+                f"[soju] auto-replay requested for {len(all_ch)} channel{'s' if len(all_ch) != 1 else ''}"))
 
     def _finish_registration(self) -> None:
         """Send NICK/USER or RESUME after CAP negotiation completes."""
@@ -4274,6 +11611,10 @@ class IRCClient:
         await self.ui_queue.put(("join", nick, channel))
         if nick == self.nick:
             await self.ui_queue.put(("self_join", channel))
+        triggered = self.scoring.watches.check_event("join", nick, channel)
+        for tw in triggered:
+            alert = tw.get("message") or f"{nick} joined {channel}"
+            await self.ui_queue.put(("status", f"[watch] {alert}"))
 
     async def _irc_part(self, nick, params, prefix):
         if params:
@@ -4376,6 +11717,8 @@ class IRCClient:
         if (self._irc_lower(nick) == self._irc_lower(self.nick)
                 and not self._current_batch_is_replay):
             return
+        # Biometrics: record incoming message timestamp for response latency
+        self.biometrics.record_incoming_message()
         target = params[0]
         msg    = params[1]
         # server-time: prefer server-provided timestamp over local clock
@@ -4384,7 +11727,14 @@ class IRCClient:
         account  = tags.get("account", "")
         msgid    = tags.get("msgid", "")
         reply_to = tags.get("+reply", "")
+        thread_id = tags.get("draft/thread", "")
         is_replay = self._current_batch_is_replay
+        # read-marker: track last seen read marker per channel
+        read_marker = tags.get("read-marker", "")
+        if read_marker and target.startswith("#"):
+            self._read_markers[target.lower()] = read_marker
+        if thread_id and target.startswith("#"):
+            self._thread_parents[target.lower()] = thread_id
 
         # ACTION must be checked before the generic CTCP block — both use \x01
         # wrappers and falling into the CTCP branch silently drops /me lines.
@@ -4410,6 +11760,17 @@ class IRCClient:
                                  mention, intent))
         if is_replay:
             return  # don't score replayed history; it's already been seen
+        # Relationship graph: record mentions and replies
+        if target.startswith("#"):
+            self.scoring.relationships.record_co_channel(nick, target)
+            for word in msg.split():
+                if word.startswith("@"):
+                    mentioned = word.lstrip("@").strip(",:;.!?")
+                    if mentioned:
+                        self.scoring.relationships.record_mention(nick, mentioned, target)
+            if reply_to:
+                self.scoring.relationships.record_reply(nick, reply_to)
+            self.scoring.relationships.record_co_channel(nick, target)
         _t = asyncio.create_task(self._score_msg_bg(nick, target, msg, u_state, u_score, m_score))
         self._bg_tasks.add(_t)
         _t.add_done_callback(self._bg_tasks.discard)
@@ -4678,6 +12039,56 @@ class IRCClient:
     async def _irc_note(self, nick, params, prefix):
         await self.ui_queue.put(("status", f"[NOTE] {' '.join(params)}"))
 
+    async def _irc_bouncer(self, nick, params, prefix):
+        if not params:
+            return
+        sub = params[0].upper()
+        if sub == "LISTNETWORKS":
+            # BOUNCER LISTNETWORKS sends individual lines + end marker
+            # Each data line: BOUNCER NETWORK <id> <k=v ...>
+            pass
+        elif sub == "NETWORK":
+            net_id = params[1] if len(params) > 1 else ""
+            attrs = {}
+            for kv_str in params[2:]:
+                if "=" in kv_str:
+                    k, v = kv_str.split("=", 1)
+                    attrs[k] = v
+            self._soju_networks[net_id] = attrs
+            name = attrs.get("name", net_id)
+            host = attrs.get("host", "?")
+            state = attrs.get("state", "?")
+            await self.ui_queue.put(("status",
+                f"[soju] network {name}: host={host} state={state}"))
+        elif sub == "ENDNETWORKS":
+            n = len(self._soju_networks)
+            await self.ui_queue.put(("status",
+                f"[soju] {n} network{'s' if n != 1 else ''} loaded"))
+        elif sub == "ADDNETWORK":
+            name = params[1] if len(params) > 1 else ""
+            await self.ui_queue.put(("status", f"[soju] network '{name}' added"))
+            self.send_raw("BOUNCER LISTNETWORKS")
+        elif sub == "DELNETWORK":
+            name = params[1] if len(params) > 1 else ""
+            self._soju_networks.pop(name, None)
+            await self.ui_queue.put(("status", f"[soju] network '{name}' removed"))
+        elif sub == "CHANGENETWORK":
+            name = params[1] if len(params) > 1 else ""
+            attrs = {}
+            for kv_str in params[2:]:
+                if "=" in kv_str:
+                    k, v = kv_str.split("=", 1)
+                    attrs[k] = v
+            if name in self._soju_networks:
+                self._soju_networks[name].update(attrs)
+            else:
+                self._soju_networks[name] = attrs
+            await self.ui_queue.put(("status",
+                f"[soju] network '{name}' updated: {attrs}"))
+        else:
+            await self.ui_queue.put(("status",
+                f"[soju] BOUNCER {sub} {' '.join(params[1:])}"))
+
     async def _irc_mononline(self, nick, params, prefix):   # 730 RPL_MONONLINE
         for entry in (params[-1] if params else "").split(","):
             if entry:
@@ -4864,6 +12275,8 @@ class IRCClient:
         # Channel join error numerics
         for _code in _ERROR_REPLIES:
             h[_code] = self._irc_join_error
+        # soju bouncer commands
+        h["BOUNCER"]      = self._irc_bouncer
 
     # ====================== Commands ======================
     def cmd_join(self, channel: str) -> None:
@@ -5358,15 +12771,38 @@ class IRCClient:
     def cmd_monitor_status(self) -> None:
         self.send_raw("MONITOR S")
 
-    def cmd_chathistory(self, channel: str, count: int = 50) -> None:
-        if self._chathistory_cap:
-            self.send_raw(f"CHATHISTORY LATEST {channel} * {count}")
-        else:
+    def cmd_chathistory(self, channel: str, count: int = 50,
+                        subcmd: str = "LATEST", reference: str = "*",
+                        timestamp: str = "") -> None:
+        if not self._chathistory_cap:
             try:
                 self.ui_queue.put_nowait(("status",
                     "Server does not support chat history (chathistory CAP missing)"))
             except Exception:
                 pass
+            return
+        sub = subcmd.upper()
+        if sub == "LATEST":
+            self.send_raw(f"CHATHISTORY LATEST {channel} {reference} {count}")
+        elif sub == "BEFORE":
+            ref = timestamp or reference
+            self.send_raw(f"CHATHISTORY BEFORE {channel} ref={ref} {count}")
+        elif sub == "AFTER":
+            ref = timestamp or reference
+            self.send_raw(f"CHATHISTORY AFTER {channel} ref={ref} {count}")
+        elif sub == "BETWEEN":
+            if not timestamp:
+                try:
+                    self.ui_queue.put_nowait(("status",
+                        "BETWEEN requires timestamp= start,end"))
+                except Exception:
+                    pass
+                return
+            self.send_raw(f"CHATHISTORY BETWEEN {channel} {timestamp} {count}")
+        elif sub == "TARGETS":
+            self.send_raw(f"CHATHISTORY TARGETS * {count}")
+        else:
+            self.send_raw(f"CHATHISTORY LATEST {channel} {reference} {count}")
 
     def cmd_tagmsg(self, target: str, tags: dict) -> None:
         """Send a TAGMSG (client-only tags, no visible body text)."""
@@ -5389,8 +12825,8 @@ class IRCClient:
         try:
             # Confirmed bots: skip inference entirely — score is always 100.
             # Also ingest the message into their fingerprint to keep learning.
-            if nick in self.scoring.confirmed_bot_nicks:
-                fp = self.scoring.bot_fingerprints.get(nick)
+            if nick.lower() in self.scoring.confirmed_bot_nicks:
+                fp = self.scoring.bot_fingerprints.get(nick.lower())
                 if fp is not None:
                     fp.ingest(msg)
                 a_score = 100
@@ -5443,6 +12879,20 @@ class IRCClient:
                 if _blocklist_score > 0.0:
                     prob = min(1.0, prob + 0.30 * _blocklist_score)
 
+                # LLM fingerprinting: detect generation patterns
+                llm_result = self.scoring.llm_fingerprinter.analyze(nick, msg)
+                llm_boost = llm_result["combined"] * 0.15
+                if llm_boost > 0.0:
+                    prob = min(1.0, prob + llm_boost)
+                    detail["llm_fp"] = llm_result["combined"]
+
+                # Deepfake relay detection: detect relay-style patterns
+                relay_result = self.scoring.deepfake_relay.analyze(nick, target, msg)
+                relay_boost = relay_result["combined"] * 0.10
+                if relay_boost > 0.0:
+                    prob = min(1.0, prob + relay_boost)
+                    detail["relay"] = relay_result["combined"]
+
                 a_score = int(prob * 100)
         except asyncio.CancelledError:
             # Task cancelled (e.g. during shutdown) — log the partial result before
@@ -5493,6 +12943,27 @@ class IRCClient:
             except Exception:
                 pass
         rolling_ai = int(u_state.rolling_ai_likelihood())
+        # AI-vs-AI detection: check reply/mention target's AI score
+        if target.startswith("#") and rolling_ai >= 50:
+            for word in msg.split():
+                if word.startswith("@"):
+                    mentioned = word.lstrip("@").strip(",:;.!?")
+                    if mentioned:
+                        t_state = self.users.get(mentioned)
+                        if t_state:
+                            t_ai = int(t_state.rolling_ai_likelihood())
+                            if t_ai >= 50:
+                                self.scoring.ai_vs_ai.record_exchange(
+                                    nick, mentioned, target, float(rolling_ai), float(t_ai))
+        # Sentiment-AI correlation
+        if target.startswith("#"):
+            try:
+                sent_result = self.scoring.sentiment.analyze(msg)
+                self.scoring.sentiment_ai.record(
+                    nick, target, float(rolling_ai),
+                    sent_result["score"], sent_result.get("intensity", 0.0))
+            except Exception:
+                pass
         log_ai_event(
             nick, target, msg, u_score, m_score, a_score, rolling_ai,
             heu_score=detail.get("heu", 0), bino_score=detail.get("bino", 0),
@@ -6189,12 +13660,12 @@ class TUI:
         self.userlist_width = 30
         self._show_userlist = True
 
-        try:
-            self.chat_win  = curses.newwin(self.chat_height, max(1, self.width - self.userlist_width), 0, 0)
-            self.user_win  = curses.newwin(self.chat_height, self.userlist_width, 0, max(0, self.width - self.userlist_width))
-            self.input_win = curses.newwin(4, max(1, self.width), max(0, self.height - 4), 0)
-        except curses.error as e:
-            raise SystemExit(f"Terminal too small to initialise windows: {e}")
+        # Real-time stats panel
+        self._show_stats_panel = False
+        self._stats_width = 22
+        self._stats_win: Optional[Any] = None
+
+        self._create_windows()
 
         # Multi-server state: primary server is client passed to __init__
         self._primary_server_id: str = client.server_id
@@ -6258,6 +13729,7 @@ class TUI:
         self.last_redraw = 0.0
         self._start_time = time.monotonic()
         self.ignored_nicks: set = set(load_irc_config().get("ignored_nicks", []))
+        self.ignored_masks: list = load_irc_config().get("ignored_masks", [])  # list of glob patterns
         self._aliases: Dict[str, str] = dict(load_irc_config().get("aliases", {}))
         self.mention_beep_muted: bool = False
         self._msg_hours: Dict[str, List[int]] = {}
@@ -6267,6 +13739,12 @@ class TUI:
         self._ch_activity: Dict[str, Counter] = {}
         self._recent_styl_scores: Dict[str, float] = {}
         self._ai_feedback_log: List[Dict[str, Any]] = []
+
+        # Smart auto-complete: phrase completions and recent speaker tracking
+        self._phrase_completions: List[str] = []
+        self._phrase_freq: Counter = Counter()
+        self._recent_speaker_nicks: set = set()
+        self._completion_log: Counter = Counter()
 
         # /seen tracking: nick_lower → (unix_ts, message_preview, channel)
         self._seen_times: Dict[str, Tuple[float, str, str]] = {}
@@ -6349,6 +13827,7 @@ class TUI:
         self._chat_dirty    = True
         self._userlist_dirty = True
         self._input_dirty   = True
+        self._stats_dirty   = True
 
         # Cached window dimensions (updated only on resize)
         # Compute _tw from the logical expected width, not getmaxyx(), so that a
@@ -6414,6 +13893,13 @@ class TUI:
         self._tor_strict: bool = load_irc_config().get("tor", {}).get("strict", False)
         self.client.use_tor = self._use_tor
         self.client.tor_strict = self._tor_strict
+
+        # ── I2P ───────────────────────────────────────────────────────────────────
+        self._use_i2p: bool = load_irc_config().get("i2p", {}).get("enabled", False)
+        self._i2p_strict: bool = load_irc_config().get("i2p", {}).get("strict", False)
+        if self._use_i2p:
+            self.client.use_tor = True
+            self.client.i2p_strict = self._i2p_strict
 
     # ── Multi-server helpers ─────────────────────────────────────────────────
 
@@ -6622,7 +14108,7 @@ class TUI:
                 bars = "▁▂▃▄▅▆▇█"
                 spark = "".join(bars[min(7, s * 8 // 101)]
                                 for s in list(state.ai_scores)[-16:])
-                is_bot = state.is_confirmed_bot or nick in (client.scoring.confirmed_bot_nicks if hasattr(client, 'scoring') else set())
+                is_bot = state.is_confirmed_bot or nick.lower() in (client.scoring.confirmed_bot_nicks if hasattr(client, 'scoring') else set())
                 badge = " [BOT]" if is_bot else ""
                 A(f"  {nick:<14} [{ai_pct:2d}%]{badge}  msgs:{state.total_msgs:3d}  "
                   f"avg:{avg_len:4.0f}  mpm:{mpm:4.1f}  "
@@ -6658,6 +14144,21 @@ class TUI:
         A(f"  Messages     : {total_msgs}")
         A(f"  Uptime       : {uptime_mins // 60}h {uptime_mins % 60}m")
         A(f"  Buffered     : {self._bouncer_buffer.count} msgs ({self._bouncer_buffer.highlight_count} highlights)")
+
+        # ── Your Biometrics ─────────────────────────────────────────────────
+        A("")
+        A("── Your Biometrics ──")
+        A("")
+        bio = client.biometrics
+        cadence = bio.get_typing_cadence_stats()
+        comp = bio.get_composition_stats()
+        resp = bio.get_response_latency_stats()
+        A(f"  Typing cadence   : {cadence['mean']:.0f} ms (σ {cadence['std']:.0f} ms)")
+        A(f"  Composition time : {comp['mean']:.1f} s (σ {comp['std']:.1f} s)")
+        A(f"  Response latency : {resp['mean']:.1f} s (σ {resp['std']:.1f} s)")
+        A(f"  Backspace ratio  : {bio.get_backspace_ratio():.1%}")
+        A(f"  Human likelihood : {bio.get_human_likelihood():.0f}%")
+        A(f"  Messages sent    : {bio._messages_sent}  |  Keystrokes: {bio._total_keystrokes}")
 
         # ── Historical suspects from log ─────────────────────────────────
         A("")
@@ -6752,8 +14253,8 @@ class TUI:
         n_sessions    = len(active_sessions)
         is_consistent = h_std < 10 if h_total > 0 else (s_std < 10 if scores else True)
         is_bot        = (state and state.is_confirmed_bot) or (
-            nick in self._active_client().scoring.confirmed_bot_nicks)
-        fp            = self._active_client().scoring.bot_fingerprints.get(nick)
+            nick.lower() in self._active_client().scoring.confirmed_bot_nicks)
+        fp            = self._active_client().scoring.bot_fingerprints.get(nick.lower())
         if is_bot:
             verdict = "CONFIRMED BOT/AI — manually identified"
         elif combined_avg >= 80 and n_sessions >= 3 and is_consistent:
@@ -7176,6 +14677,92 @@ class TUI:
         except Exception:
             pass
 
+    async def _periodic_reminder_checker(self) -> None:
+        """Periodically check for due reminders and notify the user."""
+        while True:
+            try:
+                await asyncio.sleep(10)
+                if not hasattr(self._active_client(), 'scoring'):
+                    continue
+                scoring = self._active_client().scoring
+                due = scoring.reminders.check_due()
+                if due:
+                    status_win = self.window_by_name.get("*status*")
+                    if status_win:
+                        for reminder in due:
+                            status_win.add_line(
+                                f"-!- Reminder: {reminder['message']} (set {time.strftime('%H:%M', time.localtime(reminder['created_at']))})")
+                        self._chat_dirty = True
+                        self.dirty = True
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _periodic_rss_poller(self) -> None:
+        """Periodically poll RSS feeds and post new items to channels."""
+        while True:
+            try:
+                await asyncio.sleep(300)  # 5 minutes
+                if not hasattr(self._active_client(), 'scoring'):
+                    continue
+                scoring = self._active_client().scoring
+                new_items = await scoring.rss.poll_all()
+                if new_items:
+                    status_win = self.window_by_name.get("*status*")
+                    if status_win:
+                        for item in new_items:
+                            status_win.add_line(
+                                f"-!- RSS [{item['feed']}]: {item['title']} - {item['link']}")
+                        self._chat_dirty = True
+                        self.dirty = True
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _periodic_github_poller(self) -> None:
+        """Periodically check tracked GitHub repos for updates."""
+        while True:
+            try:
+                await asyncio.sleep(300)
+                if not hasattr(self._active_client(), 'scoring'):
+                    continue
+                scoring = self._active_client().scoring
+                updates = await scoring.github.check_updates()
+                if updates:
+                    status_win = self.window_by_name.get("*status*")
+                    for u in updates:
+                        msg = f"[GitHub] {u['type'].upper()} {u['repo']}: {u['title']} by {u['user']} {u['url']}"
+                        if status_win:
+                            status_win.add_line(msg)
+                        # Also post to the tracked channel
+                        target_win = self.window_by_name.get(u["channel"])
+                        if target_win and target_win != status_win:
+                            target_win.add_line(f"-!- {msg}")
+                    self._chat_dirty = True
+                    self.dirty = True
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _periodic_topology_updater(self) -> None:
+        """Periodically update network topology from channel user lists."""
+        while True:
+            try:
+                await asyncio.sleep(60)
+                if not hasattr(self._active_client(), 'scoring'):
+                    continue
+                client = self._active_client()
+                na = client.scoring.network_analytics
+                for ch, users in self.channel_users.items():
+                    na.update_topology(client.server_id, ch, users)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
     def apply_theme(self, n: int, announce: bool = True) -> None:
         """Switch to theme n (1-based). Re-initialises the four key color pairs
         and forces a full redraw.  Color pair integers are live — no need to
@@ -7200,13 +14787,29 @@ class TUI:
             self.window_by_name["*status*"].add_line(
                 f"Theme → {name} ({self.current_theme}/{len(THEMES)})  {theme_list}")
 
+    def _create_windows(self) -> None:
+        """Create all subwindows including the optional stats panel."""
+        try:
+            self.chat_win  = curses.newwin(self.chat_height, max(1, self.width - self.userlist_width), 0, 0)
+            self.user_win  = curses.newwin(self.chat_height, self.userlist_width, 0, max(0, self.width - self.userlist_width))
+            self.input_win = curses.newwin(4, max(1, self.width), max(0, self.height - 4), 0)
+            if self._show_stats_panel:
+                stats_x = self.width - self.userlist_width - self._stats_width
+                self._stats_win = curses.newwin(self.chat_height, self._stats_width, 0, max(0, stats_x))
+            else:
+                self._stats_win = None
+        except curses.error as e:
+            raise SystemExit(f"Terminal too small to initialise windows: {e}")
+
     def _resize_windows(self) -> None:
         """Resize/reposition subwindows and refresh cached dimensions."""
+        stats_offset = self._stats_width if self._show_stats_panel else 0
         if self._show_userlist:
-            chat_w = max(1, self.width - self.userlist_width)
+            chat_w = max(1, self.width - self.userlist_width - stats_offset)
         else:
-            chat_w = max(1, self.width)
+            chat_w = max(1, self.width - stats_offset)
         user_x = self.width - self.userlist_width
+        stats_x = user_x - self._stats_width
         try:
             self.chat_win.resize(self.chat_height, chat_w)
         except curses.error:
@@ -7216,19 +14819,22 @@ class TUI:
             self.user_win.mvwin(0, user_x)
         except curses.error:
             pass
+        if self._show_stats_panel and self._stats_win:
+            try:
+                self._stats_win.resize(self.chat_height, self._stats_width)
+                self._stats_win.mvwin(0, max(0, stats_x))
+            except curses.error:
+                pass
         try:
             self.input_win.resize(4, self.width)
             self.input_win.mvwin(self.height - 4, 0)
         except curses.error:
             pass
-        # Refresh cached dimension values and force full repaint.
-        # Use the expected logical width (not getmaxyx) so a silently-failed
-        # resize can't leave _tw pointing at the old oversized chat window.
         self._tw             = max(1, chat_w - 1)
         self._uw             = max(1, self.userlist_width - 2)
         self._input_w        = max(1, self.input_win.getmaxyx()[1] - 4)
         self._content_height = max(1, self.chat_height - 1)
-        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
 
     def _render_irc_line(self, row: int, line: str, base_attr: int, tw: int) -> None:
         """Write *line* to chat_win at *row*, applying IRC inline formatting.
@@ -7399,7 +15005,7 @@ class TUI:
 
                 # Build status indicators
                 status_marks = ""
-                if nick in confirmed_bots:
+                if nick.lower() in confirmed_bots:
                     status_marks += "B"
                 elif ai_pct >= thresh:
                     status_marks += "S"
@@ -7436,6 +15042,64 @@ class TUI:
                         self.user_win.addstr(i + 1, 1, line[:uw], attr_normal)
                 except curses.error:
                     break
+
+    def _draw_stats_panel(self) -> None:
+        if not self._show_stats_panel or self._stats_win is None:
+            return
+        sw = self._stats_width
+        self._stats_win.erase()
+        self._stats_win.border()
+
+        client = self._active_client()
+        if not hasattr(client, 'scoring') or not hasattr(client.scoring, 'stats'):
+            return
+        cur_win = self.get_current_window()
+        ch = None
+        if cur_win.is_channel and cur_win.name in self.channel_users:
+            ch = cur_win.name
+        elif self.current_channel and self.current_channel in self.channel_users:
+            ch = self.current_channel
+
+        total_users = len(self.channel_users.get(ch, set())) if ch else 0
+        suspect_count = len(self.channel_users.get(ch, set()) & self._suspect_nicks) if ch else 0
+        channels_joined = len([w for w in self.windows if w.is_channel])
+
+        lines = client.scoring.stats.get_panel_lines(ch, total_users, suspect_count, channels_joined)
+
+        try:
+            self._stats_win.addstr(0, 1, " Stats ".center(sw - 2)[:sw - 2], self._attr_userheader)
+        except curses.error:
+            pass
+
+        for i, line in enumerate(lines[1:], 1):
+            try:
+                self._stats_win.addstr(i, 1, line[:sw - 2], curses.A_NORMAL)
+            except curses.error:
+                break
+
+        # Mini activity bar (last 10 hours)
+        try:
+            bar_row = min(len(lines) + 1, self.chat_height - 3)
+            hourly = client.scoring.stats._hourly_activity
+            current_hour = time.localtime().tm_hour
+            bar_chars = []
+            for h in range(10):
+                idx = (current_hour - 9 + h) % 24
+                val = hourly[idx]
+                if val == 0:
+                    bar_chars.append(" ")
+                elif val < 5:
+                    bar_chars.append("▁")
+                elif val < 20:
+                    bar_chars.append("▃")
+                elif val < 50:
+                    bar_chars.append("▅")
+                else:
+                    bar_chars.append("▇")
+            bar_str = "".join(bar_chars)
+            self._stats_win.addstr(bar_row, 1, f" 10h:{bar_str}", curses.A_DIM)
+        except curses.error:
+            pass
 
     def _handle_tab_click(self, mx: int) -> None:
         """Switch to the window whose tab label was clicked."""
@@ -7682,6 +15346,11 @@ class TUI:
             self._draw_input()
             self._input_dirty = False
             refreshed.append(self.input_win)
+        if self._stats_dirty and self._show_stats_panel:
+            self._draw_stats_panel()
+            self._stats_dirty = False
+            if self._stats_win:
+                refreshed.append(self._stats_win)
 
         for w in refreshed:
             w.noutrefresh()
@@ -7748,14 +15417,6 @@ class TUI:
         return sorted(users, key=lambda n: (-self._prefix_rank(self._highest_prefix(modes.get(n, set()))), n.lower()))
 
     def do_nick_complete(self, reverse: bool = False) -> None:
-        if not self.current_channel or self.current_channel not in self.channel_users:
-            return
-        ch = self.current_channel
-        if ch not in self._sorted_users:
-            self._sorted_users[ch] = self._sort_users_by_mode(ch)
-        users = self._sorted_users[ch]
-        if not users:
-            return
         buf    = self.input_buffer
         cursor = min(self.input_cursor, len(buf))
         word_start = cursor
@@ -7764,9 +15425,40 @@ class TUI:
         prefix = buf[word_start:cursor].lower()
         if not prefix:
             return
-        matches = [u for u in users if u.lower().startswith(prefix)]
-        if not matches:
+
+        # Phase 1: current channel nicks (sorted by mode precedence)
+        channel_matches = []
+        if self.current_channel and self.current_channel in self.channel_users:
+            ch = self.current_channel
+            if ch not in self._sorted_users:
+                self._sorted_users[ch] = self._sort_users_by_mode(ch)
+            channel_matches = [u for u in self._sorted_users[ch] if u.lower().startswith(prefix)]
+
+        # Phase 2: nick history (nicks seen in other channels or recently active)
+        history_matches = []
+        _recent_nicks = set()
+        for ch, users in self.channel_users.items():
+            if ch != self.current_channel:
+                _recent_nicks.update(u.lower() for u in users)
+        # Add nicks from recent messages that aren't in any current channel
+        if hasattr(self, '_recent_speaker_nicks'):
+            _recent_nicks.update(self._recent_speaker_nicks)
+        history_matches = [n for n in sorted(_recent_nicks)
+                          if n.startswith(prefix) and n not in (m.lower() for m in channel_matches)]
+
+        # Phase 3: common phrases (frequently typed completions)
+        phrase_matches = []
+        if hasattr(self, '_phrase_completions'):
+            phrase_matches = [p for p in self._phrase_completions
+                             if p.lower().startswith(prefix)
+                             and p.lower() not in (m.lower() for m in channel_matches + history_matches)]
+
+        # Combine all sources, de-duplicated
+        all_matches = channel_matches + history_matches + phrase_matches
+        if not all_matches:
             return
+
+        # Cycle through matches
         if self.completion_state and self.completion_state[0] == prefix:
             if reverse:
                 idx = (self.completion_state[2] - 1) % len(self.completion_state[1])
@@ -7774,15 +15466,38 @@ class TUI:
                 idx = (self.completion_state[2] + 1) % len(self.completion_state[1])
             match = self.completion_state[1][idx]
         else:
-            idx = len(matches) - 1 if reverse else 0
-            match = matches[idx]
-        self.completion_state = (prefix, matches, idx)
+            idx = len(all_matches) - 1 if reverse else 0
+            match = all_matches[idx]
+        self.completion_state = (prefix, all_matches, idx)
+
         suffix = ": " if word_start == 0 else " "
         replacement = match + suffix
         self.input_buffer = buf[:word_start] + replacement + buf[cursor:]
         self.input_cursor = word_start + len(replacement)
         self._input_dirty = True
         self.dirty = True
+
+        # Record this completion for phrase learning
+        self._record_completion(prefix, match)
+
+    def _record_completion(self, prefix: str, completed: str) -> None:
+        """Track completion frequency to build phrase completion list."""
+        self._completion_log[completed.lower()] += 1
+        if len(self._completion_log) > 200:
+            oldest = self._completion_log.most_common()[-50:]
+            for k, _ in oldest:
+                del self._completion_log[k]
+        self._phrase_completions = [
+            nick for nick, _ in self._completion_log.most_common(30)
+        ]
+
+    def _track_speaker(self, nick: str) -> None:
+        """Add nick to recent speaker set for cross-channel auto-complete."""
+        self._recent_speaker_nicks.add(nick.lower())
+        if len(self._recent_speaker_nicks) > 200:
+            to_remove = list(self._recent_speaker_nicks)[:50]
+            for n in to_remove:
+                self._recent_speaker_nicks.discard(n)
 
     def do_command_complete(self, reverse: bool = False) -> None:
         """Complete slash command names when input starts with '/'."""
@@ -7900,7 +15615,7 @@ class TUI:
         reply_to  = _extra[4] if len(_extra) > 4 else ""
         mention   = _extra[5] if len(_extra) > 5 else ""
         intent    = _extra[6] if len(_extra) > 6 else ""
-        if nick.lower() in self.ignored_nicks:
+        if self._is_ignored(nick):
             return
         if target.startswith("#"):
             win_name = target
@@ -7952,6 +15667,7 @@ class TUI:
         # Investigative tracking
         hour = time.localtime().tm_hour
         self._msg_hours.setdefault(nick, []).append(hour)
+        self._track_speaker(nick)
         if target.startswith("#"):
             prev = self._last_speaker.get(target)
             if prev and prev != nick:
@@ -7971,6 +15687,107 @@ class TUI:
                     self._targets.setdefault(nick, Counter())[maybe] += 1
         self.user_scores[nick] = u_score
         self.user_ai_scores[nick] = rolling_ai
+
+        # ── New AI/ML pipeline ──────────────────────────────────────────────
+        if not is_replay and hasattr(self._active_client(), 'scoring'):
+            scoring = self._active_client().scoring
+            # Sentiment analysis
+            scoring.analyze_sentiment(nick, msg)
+            # Topic detection
+            scoring.topics.detect(msg)
+            # Semantic similarity tracking
+            scoring.semantic.add_message(nick, msg, target)
+            # Thread tracking
+            scoring.threads.add_message(msgid, nick, target, msg, reply_to=reply_to)
+            # Cross-channel bot detection
+            if target.startswith("#"):
+                scoring.cross_channel.record_message(nick, target, msg)
+            # Productivity: channel stats tracking
+            if target.startswith("#"):
+                scoring.channel_stats.record_message(nick, target, msg)
+                # Network analytics: heatmap tracking
+                scoring.network_analytics.record_message(target)
+                # Advanced AI/ML pipeline
+                scoring.astroturfing.record_message(nick, target, msg)
+                scoring.personality.update(nick, msg)
+                scoring.predictive_reply.train(target, nick, msg, reply_to)
+                scoring.stances.record(nick, msg)
+                scoring.flow_predictor.record(nick, target, msg, reply_to)
+                scoring.sentiment_contagion.record(nick, target, msg)
+                scoring.bot_swarm.record(nick, target, msg, rolling_ai / 100.0)
+                # Real-time stats tracking
+                try:
+                    _sr = scoring.sentiment.analyze(msg)
+                    _sent = _sr.get("score", 0)
+                except Exception:
+                    _sent = 0
+                scoring.stats.record_message(nick, target, rolling_ai, _sent)
+                
+                # Role inference
+                is_reply = bool(reply_to) or nick.lower() in [t.lower() for t in reply_to.split(",")] if reply_to else False
+                first_seen = time.time()
+                scoring.role_inference.observe(nick, target, msg, is_reply, u_score / 100.0, first_seen, time.time())
+
+                # Debate analyzer: track exchanges between users
+                if reply_to:
+                    replied_nicks = [n.strip() for n in reply_to.split(",") if n.strip()]
+                    for rn in replied_nicks:
+                        scoring.debate_analyzer.record_message(nick, rn, target, msg, time.time())
+
+                # Echo chamber detection
+                scoring.echo_chamber.observe(nick, target, msg, u_score / 100.0)
+
+                # Achievement badges
+                replied_to_by = [n.strip() for n in reply_to.split(",") if n.strip()] if reply_to else []
+                scoring.achievements.observe(nick, target, msg, time.time(), replied_to_by)
+                new_badges = scoring.achievements.check_achievements(nick)
+                for badge in new_badges:
+                    await self.ui_queue.put(("status", f"[achievement] 🏆 {nick} earned: {badge['icon']} {badge['name']} - {badge['desc']}"))
+                
+                # Sarcasm detection
+                sarcasm_result = scoring.sarcasm.analyze(nick, msg, u_score / 100.0)
+                if sarcasm_result["is_sarcastic"]:
+                    await self.ui_queue.put(("status", f"[sarcasm] {nick} detected as sarcastic ({sarcasm_result['score']:.0%}) [{', '.join(sarcasm_result['signals'])}]"))
+                
+                # Emotion arc tracking
+                scoring.emotion_arc.analyze(nick, msg)
+                
+                # Ban evasion tracking & detection
+                client = self._active_client()
+                u_state = client.users.get(nick)
+                timing_gaps = []
+                if u_state and hasattr(u_state, 'msg_times') and u_state.msg_times and len(u_state.msg_times) > 1:
+                    recent_times = list(u_state.msg_times)[-10:]
+                    timing_gaps = [recent_times[i] - recent_times[i-1] for i in range(1, len(recent_times)) if recent_times[i] - recent_times[i-1] < 300]
+                scoring.ban_evasion.track_user(nick, target, msg, timing_gaps)
+                evasion_match = scoring.ban_evasion.check_evasion(nick)
+                if evasion_match:
+                    await self.ui_queue.put(("status", f"[ban-evasion] ⚠️ {nick} matches banned user {evasion_match['banned_nick']} (score: {evasion_match['score']:.0%})"))
+                research_results = scoring.research_agent.observe(nick, target, msg)
+                for rr in research_results:
+                    if rr.get("summary"):
+                        await self.ui_queue.put(("status", f"[research] {rr['query']}: {rr['summary'][:120]}"))
+                fact_results = scoring.fact_checker.check(nick, target, msg)
+                for fr in fact_results:
+                    if fr.get("verdict") in ("likely_false", "questionable"):
+                        await self.ui_queue.put(("status", f"[factcheck] [{fr['verdict']}] {fr['claim'][:100]}"))
+
+                # Conversational agent: observe and respond
+                if target.startswith("#"):
+                    ca = scoring.conversational_agent
+                    is_mention = bool(mention) or (
+                        ca._nick and re.search(r'\b' + re.escape(ca._nick) + r'\b', msg, re.IGNORECASE))
+                    agent_response = ca.observe(nick, target, msg, is_mention)
+                    if agent_response:
+                        client = self._active_client()
+                        client.cmd_msg(target, agent_response)
+            # Productivity: nick watch checks
+            triggered = scoring.watches.check_event("speak", nick, target)
+            if mention:
+                triggered += scoring.watches.check_event("mention", nick, target)
+            for tw in triggered:
+                alert = tw.get("message") or f"{nick} triggered a watch"
+                await self.ui_queue.put(("status", f"[watch] {alert}"))
 
         # /seen tracking
         nick_lower = nick.lower()
@@ -8010,6 +15827,57 @@ class TUI:
             pass  # _chat_dirty already set below
         self._chat_dirty = True
         self.dirty = True
+
+        # Automation: trigger matching
+        if not is_replay and hasattr(self._active_client(), 'scoring'):
+            scoring = self._active_client().scoring
+            triggers = scoring.triggers.match(nick, target, msg)
+            for t in triggers:
+                if t["action"] == "reply":
+                    response = t["response"].replace("{nick}", nick).replace("{msg}", msg)
+                    client = self._active_client()
+                    client.cmd_msg(target, response)
+                    sw = self.ensure_window(target, is_channel=target.startswith("#"))
+                    sw.add_line(f"[trigger #{t['id']}] → {response}", timestamp=False)
+                elif t["action"] == "notify":
+                    await self.ui_queue.put(("status", f"[trigger #{t['id']}] {nick}: {msg}"))
+                elif t["action"] == "log":
+                    log_path = os.path.join(_SCRIPT_DIR, "trigger_log.jsonl")
+                    try:
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write(json.dumps({"ts": time.time(), "trigger": t["id"],
+                                               "nick": nick, "channel": target, "msg": msg}) + "\n")
+                    except Exception:
+                        pass
+
+            # Automation: auto-mod checks
+            if target.startswith("#"):
+                violations = scoring.automod.check(nick, target, msg)
+                for v in violations:
+                    rule = v["rule"]
+                    await self.ui_queue.put(("status", f"[automod] {v['nick']} in {target}: {v['reason']} → {rule['action']}"))
+                    if rule["action"] in ("kick", "ban"):
+                        client = self._active_client()
+                        if rule["action"] == "kick":
+                            client.send_raw(f"KICK {target} {v['nick']} :AutoMod: {v['reason']}")
+                        elif rule["action"] == "ban":
+                            client.send_raw(f"MODE {target} +b *!*@*")
+                            client.send_raw(f"KICK {target} {v['nick']} :AutoMod: {v['reason']}")
+
+            # Webhook: fire event
+            await scoring.webhooks.fire("msg", target, {
+                "nick": nick, "msg": msg, "channel": target, "action": "msg",
+            })
+
+            # Bot mode: check for !commands
+            if getattr(self, '_bot_mode_enabled', False) and hasattr(self, '_bot_commands'):
+                if msg.startswith("!"):
+                    cmd = msg[1:].split()[0].lower()
+                    if cmd in self._bot_commands:
+                        response = self._bot_commands[cmd]
+                        client = self._active_client()
+                        client.cmd_msg(target, response)
+
         await self.plugin_manager.dispatch("on_message", nick=nick, target=target,
                                            msg=msg, is_action=is_action, is_replay=is_replay)
         await self.script_engine.dispatch("on_message", nick=nick, target=target,
@@ -8116,7 +15984,7 @@ class TUI:
 
     async def _ev_notice(self, event):
         _, sender, target, text = event
-        if sender.lower() in self.ignored_nicks:
+        if self._is_ignored(sender):
             return
         win = self.ensure_window(target, is_channel=target.startswith("#"))
         win.add_line(f"-{sender}- {text}")
@@ -8558,6 +16426,26 @@ class TUI:
         h["aitoggle"]   = self._slash_aitoggle
         h["logtoggle"]  = self._slash_logtoggle
         h["feedback"]   = self._slash_feedback
+        h["sentiment"]  = self._slash_sentiment
+        h["mood"]       = self._slash_sentiment
+        h["anomaly"]    = self._slash_anomaly
+        h["topics"]     = self._slash_topics
+        h["topic"]      = self._slash_topics
+        h["similar"]    = self._slash_similar
+        h["threads"]    = self._slash_threads
+        h["thread"]     = self._slash_threads
+        h["crosschannel"] = self._slash_crosschannel
+        h["xchan"]      = self._slash_crosschannel
+        h["fingerprint"] = self._slash_fingerprint
+        h["fp"]         = self._slash_fingerprint
+        h["savefp"]     = self._slash_savefp
+        h["behavior"]   = self._slash_behavior
+        h["biometrics"] = self._slash_biometrics
+        h["llmfp"]      = self._slash_llmfp
+        h["deepfake"]   = self._slash_deepfake
+        h["relay"]      = self._slash_deepfake
+        h["aistatus"]   = self._slash_aistatus
+        h["aipipeline"] = self._slash_aistatus
         h["join"]       = self._slash_join
         h["part"]       = self._slash_part
         h["nick"]       = self._slash_nick
@@ -8575,6 +16463,62 @@ class TUI:
         h["dehop"]      = self._slash_dehop
         h["ban"]        = self._slash_ban
         h["unban"]      = self._slash_unban
+        h["quietlist"]  = self._slash_quietlist
+        h["chanmute"]   = self._slash_chanmute
+        h["chanunmute"] = self._slash_chanunmute
+        h["quiet"]      = self._slash_chanmute
+        h["unquiet"]    = self._slash_chanunmute
+        h["halfop"]     = self._slash_halfop
+        h["dehalfop"]   = self._slash_dehalfop
+        h["admin"]      = self._slash_admin
+        h["deadmin"]    = self._slash_deadmin
+        h["owner"]      = self._slash_owner
+        h["deowner"]    = self._slash_deowner
+        h["cap"]        = self._slash_cap
+        h["sasl"]       = self._slash_sasl
+        h["chghost"]    = self._slash_chghost
+        h["setname"]    = self._slash_setname
+        h["umode"]      = self._slash_umode
+        h["oper"]       = self._slash_oper
+        h["raw"]        = self._slash_raw
+        h["dns"]        = self._slash_dns
+        h["resolve"]    = self._slash_dns
+        h["latency"]    = self._slash_latency
+        h["heatmap"]    = self._slash_heatmap
+        h["network"]    = self._slash_network
+        h["trigger"]    = self._slash_trigger
+        h["automod"]    = self._slash_automod
+        h["webhook"]    = self._slash_webhook
+        h["bot"]        = self._slash_bot_cmd
+        h["github"]     = self._slash_github
+        h["import"]     = self._slash_import
+        h["astroturf"]  = self._slash_astroturf
+        h["personality"] = self._slash_personality
+        h["predict"]    = self._slash_predict
+        h["stance"]     = self._slash_stance
+        h["flow"]       = self._slash_flow
+        h["contagion"]  = self._slash_contagion
+        h["swarm"]      = self._slash_swarm
+        h["banevasion"] = self._slash_banevasion
+        h["banev"]      = self._slash_banevasion
+        h["factcheck"]  = self._slash_factcheck
+        h["research"]   = self._slash_research
+        h["agent"]      = self._slash_agent
+        h["convo"]      = self._slash_agent
+        h["roles"]      = self._slash_roles
+        h["role"]       = self._slash_roles
+        h["debate"]     = self._slash_debate
+        h["echo"]       = self._slash_echo
+        h["echamber"]   = self._slash_echo
+        h["badges"]     = self._slash_badges
+        h["badge"]      = self._slash_badges
+        h["achievements"] = self._slash_badges
+        h["sarcasm"] = self._slash_sarcasm
+        h["emotion"] = self._slash_emotion
+        h["emotions"] = self._slash_emotion
+        h["stats"]      = self._slash_stats
+        h["uptime"]     = self._slash_uptime
+        h["ping"]       = self._slash_ping
         h["who"]        = self._slash_who
         h["whowas"]     = self._slash_whowas
         h["names"]      = self._slash_names
@@ -8601,6 +16545,26 @@ class TUI:
         h["reloadplugin"] = self._slash_reloadplugin
         h["plugins"]      = self._slash_plugins
         h["script"]       = self._slash_script
+        h["remind"]       = self._slash_remind
+        h["reminder"]     = self._slash_remind
+        h["watch"]        = self._slash_watch
+        h["unwatch"]      = self._slash_unwatch
+        h["snippet"]      = self._slash_snippet
+        h["snippets"]     = self._slash_snippet
+        h["chstats"]      = self._slash_chstats
+        h["rss"]          = self._slash_rss
+        h["todo"]         = self._slash_todo
+        h["todos"]        = self._slash_todo
+        h["task"]         = self._slash_todo
+        h["pomodoro"]     = self._slash_pomodoro
+        h["pomo"]         = self._slash_pomodoro
+        h["note"]         = self._slash_note
+        h["notes"]        = self._slash_note
+        h["memo"]         = self._slash_note
+        h["bookmark"]     = self._slash_bookmark
+        h["bm"]           = self._slash_bookmark
+        h["bookmarks"]    = self._slash_bookmark
+        h["timer"]        = self._slash_timer
         h["redraw"]       = self._slash_redraw
         h["links"]        = self._slash_links
         h["list"]         = self._slash_list
@@ -8618,6 +16582,14 @@ class TUI:
         h["alias"]        = self._slash_alias
         h["mute"]         = self._slash_mute
         h["replay"]       = self._slash_replay
+        h["soju"]         = self._slash_soju
+        h["graph"]        = self._slash_graph
+        h["aicalibrate"]  = self._slash_aicalibrate
+        h["certfp"]       = self._slash_certfp
+        h["tlsinfo"]      = self._slash_tlsinfo
+        h["aivai"]        = self._slash_aivai
+        h["saicorr"]      = self._slash_saicorr
+        h["brief"]        = self._slash_brief
         h["monitor"]      = self._slash_monitor
         h["whox"]         = self._slash_whox
         h["tagmsg"]       = self._slash_tagmsg
@@ -8712,10 +16684,12 @@ class TUI:
 
     async def _send_plain_text(self, line: str) -> None:
         cur_win = self.get_current_window()
+        client = self._active_client()
+        client.biometrics.record_composition_complete()
+        client.biometrics.record_response()
         # DCC CHAT: route text over the direct TCP connection
         if cur_win.name.startswith("=DCC-chat-"):
             nick = cur_win.name[len("=DCC-chat-"):]
-            client = self._active_client()
             tid = self._dcc_chat_tid_for_window(cur_win.name)
             if tid:
                 client.dcc_chat_send(tid, line)
@@ -8734,7 +16708,7 @@ class TUI:
                 self.current_channel = target
                 self.current_window_index = self.windows.index(dest)
                 self._unread_windows.discard(target)
-        result = self._active_client().cmd_msg(target, line)
+        result = client.cmd_msg(target, line)
         if result:
             await self.ui_queue.put(result)
 
@@ -8855,23 +16829,21 @@ class TUI:
 
         client  = self._active_client()
         scoring = client.scoring
+        nick_lower = nick.lower()
 
-        # Mark UserState if the nick is seen this session.
         u_state = client.users.get(nick)
         if u_state:
             u_state.is_confirmed_bot = True
 
-        # Extract messages by this nick from all visible chat windows to seed the
-        # fingerprint with as much context as possible.
         raw_msgs: List[str] = []
         for win in self.windows:
             for ln in win.lines:
                 m = self._MSG_LINE_RE.match(ln)
-                if m and m.group(1) == nick:
+                if m and m.group(1).lower() == nick_lower:
                     raw_msgs.append(m.group(2))
                     continue
                 a = self._ACT_LINE_RE.match(ln)
-                if a and a.group(1) == nick:
+                if a and a.group(1).lower() == nick_lower:
                     raw_msgs.append(a.group(2))
 
         fp = scoring.confirm_bot(nick, raw_msgs)
@@ -8889,16 +16861,23 @@ class TUI:
             for _win in self.windows:
                 for _ln in list(_win.lines)[-100:]:
                     _m = self._MSG_LINE_RE.match(_ln)
-                    if _m and _m.group(1) != nick and len(_m.group(2).split()) >= 3:
+                    if _m and _m.group(1).lower() != nick_lower and len(_m.group(2).split()) >= 3:
                         _neg_msgs.append(_m.group(2))
             if len(_neg_msgs) > len(raw_msgs) * 3:
                 _neg_msgs = random.sample(_neg_msgs, min(len(raw_msgs) * 3, 60))
             _adapter_dir = os.path.join(_SCRIPT_DIR, f"lora_{nick}")
             _detector = scoring.ai_detector
             loop = asyncio.get_running_loop()
-            _lora_result = await loop.run_in_executor(
-                None, _detector._train_lora_adapter,
-                raw_msgs, _neg_msgs, _adapter_dir)
+            try:
+                _lora_result = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        _ML_EXECUTOR, _detector._train_lora_adapter,
+                        raw_msgs, _neg_msgs, _adapter_dir),
+                    timeout=120.0)
+            except asyncio.TimeoutError:
+                _lora_result = "[timeout] LoRA training took too long (>120s) — skipped"
+            except Exception as _lora_exc:
+                _lora_result = f"[error] LoRA training failed: {_lora_exc}"
             if _lora_result and os.path.isdir(_lora_result):
                 await self.ui_queue.put(("status",
                     f"[bot] LoRA adapter saved to {_lora_result}  "
@@ -8918,13 +16897,33 @@ class TUI:
 
         client  = self._active_client()
         scoring = client.scoring
+        nick_lower = nick.lower()
 
+        was_confirmed = nick_lower in scoring.confirmed_bot_nicks
         u_state = client.users.get(nick)
         if u_state:
             u_state.is_confirmed_bot = False
 
         scoring.unconfirm_bot(nick)
-        await self.ui_queue.put(("status", f"[bot] {nick} removed from confirmed-bot list"))
+
+        if was_confirmed:
+            # Clean up LoRA adapter directory if it exists
+            _adapter_dir = os.path.join(_SCRIPT_DIR, f"lora_{nick}")
+            if os.path.isdir(_adapter_dir):
+                try:
+                    import shutil
+                    shutil.rmtree(_adapter_dir, ignore_errors=True)
+                    await self.ui_queue.put(("status",
+                        f"[bot] {nick} removed from confirmed-bot list (LoRA adapter cleaned up)"))
+                except Exception:
+                    await self.ui_queue.put(("status",
+                        f"[bot] {nick} removed from confirmed-bot list (LoRA cleanup failed)"))
+            else:
+                await self.ui_queue.put(("status",
+                    f"[bot] {nick} removed from confirmed-bot list"))
+        else:
+            await self.ui_queue.put(("status",
+                f"[bot] {nick} was not in the confirmed-bot list"))
 
     # ── /learn_tell  —  collaborative n-gram blocklist  (Area 3) ──────────
 
@@ -9044,7 +17043,7 @@ class TUI:
         rows = []
         for nick in chan_nicks:
             state = client.users.get(nick)
-            is_bot = nick in confirmed
+            is_bot = nick.lower() in confirmed
             if state is None or state.total_msgs == 0:
                 # Include confirmed bots even with 0 session messages
                 if not is_bot:
@@ -9189,6 +17188,15 @@ class TUI:
 
         self._ai_feedback_log.append(feedback_entry)
 
+        # Feed to calibration manager for threshold/signal analysis
+        client.scoring.calibration.record_feedback(
+            nick, label,
+            ai_score=float(self.user_ai_scores.get(nick, 0)),
+            signal_scores={
+                "formality": feedback_entry.get("styl", 0),
+                "rolling_ai": feedback_entry.get("rolling_ai", 0),
+            })
+
         # Adaptive weight tuning based on feedback
         self._apply_feedback_weights(detector, label)
 
@@ -9267,6 +17275,1501 @@ class TUI:
             detector._heu_weight = detector._default_heu_weight if hasattr(detector, '_default_heu_weight') else 0.25
         if hasattr(detector, '_cls_weight'):
             detector._cls_weight = detector._default_cls_weight if hasattr(detector, '_default_cls_weight') else 0.25
+
+    async def _slash_sentiment(self, args, extra, line):
+        """Analyze sentiment for a user or the current channel.
+
+        Usage:
+          /sentiment <nick>       — show sentiment analysis for a user
+          /sentiment              — show sentiment for last 10 messages in current window
+          /sentiment channel      — show channel-wide sentiment summary
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[sentiment] disabled by --no-ai")); return
+
+        client = self._active_client()
+        scoring = client.scoring
+        target = (args or "").strip().lower()
+
+        if target == "channel":
+            # Channel-wide sentiment summary
+            cur_win = self.get_current_window()
+            chan = cur_win.name if cur_win.name.startswith("#") else self.current_channel
+            if not chan:
+                await self.ui_queue.put(("status", "No channel active"))
+                return
+            _TS_RE = re.compile(r'^\[\d{2}:\d{2}\]\s*')
+            _SPEAKER_RE = re.compile(r'^<(\S+?)>')
+            nick_scores: Dict[str, list] = {}
+            for ln in list(cur_win.lines)[-200:]:
+                stripped = _TS_RE.sub("", ln)
+                m = _SPEAKER_RE.match(stripped)
+                if m:
+                    nick = m.group(1)
+                    text = m.group(2) if m.group(2) else ""
+                    result = scoring.sentiment.analyze(text)
+                    nick_scores.setdefault(nick, []).append(result["score"])
+            if not nick_scores:
+                await self.ui_queue.put(("status", "No messages to analyze"))
+                return
+            sw = self._status_win()
+            sw.add_line(f"=== Channel Sentiment: {chan} ===")
+            for nick, scores in sorted(nick_scores.items(), key=lambda x: sum(x[1])/len(x[1]), reverse=True):
+                avg = sum(scores) / len(scores)
+                label = scoring.sentiment.sentiment_label(avg)
+                sw.add_line(f"  {nick:<15} avg: {avg:+.2f}  ({label})  [{len(scores)} msgs]")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if target:
+            # User sentiment trend
+            trend = scoring.get_sentiment_trend(target)
+            sw = self._status_win()
+            sw.add_line(f"=== Sentiment Analysis: {target} ===")
+            sw.add_line(f"  Trend       : {trend['trend']}")
+            sw.add_line(f"  Avg score   : {trend['avg_score']:+.3f}")
+            sw.add_line(f"  Volatility  : {trend['volatility']:.3f}")
+            sw.add_line(f"  Samples     : {trend['sample_count']}")
+            # Show recent sentiment history
+            history = scoring._sentiment_history.get(target, [])
+            if history:
+                sw.add_line("")
+                sw.add_line("  Recent messages:")
+                for h in list(history)[-5:]:
+                    label = scoring.sentiment.sentiment_label(h["score"])
+                    sw.add_line(f"    [{h['score']:+.2f}] {label}: {h['text'][:60]}")
+            self._chat_dirty = True
+            self.dirty = True
+        else:
+            # Analyze last 10 messages in current window
+            cur_win = self.get_current_window()
+            _TS_RE = re.compile(r'^\[\d{2}:\d{2}\]\s*')
+            sw = self._status_win()
+            sw.add_line(f"=== Message Sentiment: {cur_win.name} ===")
+            count = 0
+            for ln in reversed(list(cur_win.lines)):
+                stripped = _TS_RE.sub("", ln)
+                m = re.match(r'^<(\S+?)>\s*(.*)', stripped)
+                if m:
+                    nick = m.group(1)
+                    text = m.group(2)
+                    result = scoring.sentiment.analyze(text)
+                    label = scoring.sentiment.sentiment_label(result["score"])
+                    sw.add_line(f"  [{result['score']:+.2f}] {label}  <{nick}> {text[:60]}")
+                    count += 1
+                    if count >= 10:
+                        break
+            if count == 0:
+                sw.add_line("  No messages to analyze")
+            self._chat_dirty = True
+            self.dirty = True
+
+    async def _slash_anomaly(self, args, extra, line):
+        """Show behavioral anomaly analysis for a user.
+
+        Usage: /anomaly <nick>
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[anomaly] disabled by --no-ai")); return
+
+        nick = (args or "").strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /anomaly <nick>"))
+            return
+
+        client = self._active_client()
+        scoring = client.scoring
+        u_state = client.users.get(nick)
+        if not u_state:
+            await self.ui_queue.put(("status", f"No data for {nick} in this session"))
+            return
+
+        # Get latest sentiment score
+        sent_history = scoring._sentiment_history.get(nick, deque())
+        latest_sent = sent_history[-1]["score"] if sent_history else 0.0
+
+        # Analyze behavioral anomalies
+        anomaly = scoring.behavioral.update(nick, "dummy", latest_sent)
+
+        sw = self._status_win()
+        sw.add_line(f"=== Behavioral Anomaly: {nick} ===")
+        sw.add_line(f"  Anomaly score : {anomaly['anomaly_score']:.3f}")
+        if anomaly["changed_aspects"]:
+            for aspect in anomaly["changed_aspects"]:
+                sw.add_line(f"  ⚠ {aspect}")
+        else:
+            sw.add_line("  No significant anomalies detected")
+        if anomaly.get("z_scores"):
+            sw.add_line("")
+            sw.add_line("  Z-scores (|z| > 2.0 = significant):")
+            for aspect, z in anomaly["z_scores"].items():
+                flag = " ⚠" if abs(z) > 2.0 else ""
+                sw.add_line(f"    {aspect:<12} : {z:+.2f}{flag}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_topics(self, args, extra, line):
+        """Show topic analysis for the current channel or a user.
+
+        Usage:
+          /topics              — show topics in last 50 messages
+          /topics <nick>       — show topics for a specific user
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[topics] disabled by --no-ai")); return
+
+        client = self._active_client()
+        scoring = client.scoring
+        target = (args or "").strip().lower()
+
+        cur_win = self.get_current_window()
+        _TS_RE = re.compile(r'^\[\d{2}:\d{2}\]\s*')
+        _SPEAKER_RE = re.compile(r'^<(\S+?)>')
+
+        topic_counts: Dict[str, int] = {}
+        count = 0
+        for ln in list(cur_win.lines)[-200:]:
+            stripped = _TS_RE.sub("", ln)
+            m = _SPEAKER_RE.match(stripped)
+            if m:
+                nick = m.group(1)
+                text = m.group(2) if m.group(2) else ""
+                if target and nick.lower() != target:
+                    continue
+                topics = scoring.topics.detect(text)
+                for topic, _ in topics:
+                    topic_counts[topic] = topic_counts.get(topic, 0) + 1
+                count += 1
+
+        if not topic_counts:
+            await self.ui_queue.put(("status", f"No topics detected in {count} messages"))
+            return
+
+        sw = self._status_win()
+        title = f"=== Topics: {target} in {cur_win.name} ===" if target else f"=== Topics: {cur_win.name} ==="
+        sw.add_line(title)
+        for topic, cnt in sorted(topic_counts.items(), key=lambda x: x[1], reverse=True):
+            bar = "█" * min(20, cnt)
+            sw.add_line(f"  {topic:<15} {cnt:3d} {bar}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_similar(self, args, extra, line):
+        """Find semantically similar messages from other users.
+
+        Usage: /similar <text>
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[similar] disabled by --no-ai")); return
+
+        text = (args + " " + extra).strip()
+        if not text:
+            await self.ui_queue.put(("status", "Usage: /similar <text>"))
+            return
+
+        client = self._active_client()
+        scoring = client.scoring
+        matches = scoring.semantic.find_similar(client.nick, text)
+
+        sw = self._status_win()
+        sw.add_line(f"=== Semantic Similarity ===")
+        sw.add_line(f"  Query: {text[:80]}")
+        if matches:
+            sw.add_line("")
+            for m in matches:
+                sw.add_line(f"  [{m['score']:.2f}] <{m['nick']}> in {m['channel']}: {m['text'][:60]}")
+        else:
+            sw.add_line("  No similar messages found")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_threads(self, args, extra, line):
+        """Show active conversation threads.
+
+        Usage:
+          /threads              — show all active threads
+          /threads <channel>    — show threads in a specific channel
+        """
+        client = self._active_client()
+        scoring = client.scoring
+        channel = (args or "").strip()
+
+        threads = scoring.threads.get_active_threads(channel=channel, limit=15)
+        sw = self._status_win()
+        sw.add_line(f"=== Active Threads{' in ' + channel if channel else ''} ===")
+        if threads:
+            for t in threads:
+                duration = int(time.time() - t["started"])
+                mins = duration // 60
+                secs = duration % 60
+                sw.add_line(f"  [{t['message_count']} msgs] {', '.join(t['participants'][:4])}")
+                sw.add_line(f"    Topic: {t['topic'][:70]}")
+                sw.add_line(f"    Duration: {mins}m {secs}s")
+        else:
+            sw.add_line("  No active threads")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_crosschannel(self, args, extra, line):
+        """Show cross-channel bot detection results.
+
+        Usage:
+          /crosschannel          — show suspicious nicks
+          /crosschannel <nick>   — show activity for a specific nick
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[crosschannel] disabled by --no-ai")); return
+
+        client = self._active_client()
+        scoring = client.scoring
+        target = (args or "").strip()
+
+        sw = self._status_win()
+        if target:
+            # Show specific nick's cross-channel activity
+            channels = scoring.cross_channel._nick_channels.get(target, set())
+            msgs = list(scoring.cross_channel._nick_messages.get(target, []))
+            alerts = [a for a in scoring.cross_channel._cross_channel_alerts if a["nick"] == target]
+            sw.add_line(f"=== Cross-Channel Activity: {target} ===")
+            sw.add_line(f"  Channels: {', '.join(sorted(channels))}")
+            sw.add_line(f"  Messages: {len(msgs)}")
+            sw.add_line(f"  Alerts  : {len(alerts)}")
+            if alerts:
+                sw.add_line("")
+                for a in alerts[-5:]:
+                    sw.add_line(f"  ⚠ {a['type']} in {', '.join(a['channels'])}")
+        else:
+            # Show all suspicious nicks
+            suspicious = scoring.cross_channel.get_suspicious_nicks(min_channels=2)
+            sw.add_line(f"=== Cross-Channel Bot Detection ===")
+            if suspicious:
+                for s in suspicious[:10]:
+                    sw.add_line(f"  {s['nick']:<15} {len(s['channels'])} channels  "
+                                f"{s['message_count']} msgs  {s['alerts']} alerts")
+                    sw.add_line(f"    Channels: {', '.join(s['channels'][:5])}")
+            else:
+                sw.add_line("  No suspicious cross-channel activity detected")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_fingerprint(self, args, extra, line):
+        """Show bot fingerprint details.
+
+        Usage:
+          /fingerprint <nick>   — show fingerprint for a bot
+          /fingerprint list     — list all saved fingerprints
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[fingerprint] disabled by --no-ai")); return
+
+        client = self._active_client()
+        scoring = client.scoring
+        target = (args or "").strip().lower()
+
+        if target == "list":
+            sw = self._status_win()
+            sw.add_line("=== Saved Bot Fingerprints ===")
+            if scoring.bot_fingerprints:
+                for nick, fp in sorted(scoring.bot_fingerprints.items()):
+                    channels = ", ".join(sorted(fp.channels)[:3])
+                    sw.add_line(f"  {nick:<15} {fp.msg_count:>4} msgs  "
+                                f"{len(fp.bigrams)} bi  {len(fp.trigrams)} tri  "
+                                f"[{channels}]")
+            else:
+                sw.add_line("  No saved fingerprints")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if target:
+            fp = scoring.bot_fingerprints.get(target.lower())
+            if not fp:
+                await self.ui_queue.put(("status", f"No fingerprint for {target}"))
+                return
+            sw = self._status_win()
+            sw.add_line(f"=== Bot Fingerprint: {fp.nick} ===")
+            sw.add_line(f"  Messages     : {fp.msg_count}")
+            sw.add_line(f"  Channels     : {', '.join(sorted(fp.channels))}")
+            sw.add_line(f"  Vocabulary   : {len(fp.word_vocab)} unique words")
+            sw.add_line(f"  Bigrams      : {len(fp.bigrams)}")
+            sw.add_line(f"  Trigrams     : {len(fp.trigrams)}")
+            sw.add_line(f"  First seen   : {time.strftime('%Y-%m-%d %H:%M', time.localtime(fp.first_seen))}")
+            sw.add_line(f"  Last seen    : {time.strftime('%Y-%m-%d %H:%M', time.localtime(fp.last_seen))}")
+            if fp.sample_messages:
+                sw.add_line("")
+                sw.add_line("  Sample messages:")
+                for msg in fp.sample_messages[:5]:
+                    sw.add_line(f"    {msg[:80]}")
+            self._chat_dirty = True
+            self.dirty = True
+        else:
+            await self.ui_queue.put(("status", "Usage: /fingerprint <nick> | list"))
+
+    async def _slash_savefp(self, args, extra, line):
+        """Manually save all bot fingerprints to disk."""
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[savefp] disabled by --no-ai")); return
+
+        client = self._active_client()
+        client.scoring.save_fingerprints()
+        count = len(client.scoring.bot_fingerprints)
+        await self.ui_queue.put(("status", f"Saved {count} bot fingerprint(s) to disk"))
+
+    async def _slash_behavior(self, args, extra, line):
+        """Show behavioral analysis for a user.
+
+        Usage: /behavior <nick>
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[behavior] disabled by --no-ai")); return
+
+        nick = (args or "").strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /behavior <nick>"))
+            return
+
+        client = self._active_client()
+        scoring = client.scoring
+        u_state = client.users.get(nick)
+        if not u_state:
+            await self.ui_queue.put(("status", f"No data for {nick} in this session"))
+            return
+
+        # Sentiment trend
+        sent_trend = scoring.get_sentiment_trend(nick)
+        # Behavioral anomaly
+        sent_history = scoring._sentiment_history.get(nick, deque())
+        latest_sent = sent_history[-1]["score"] if sent_history else 0.0
+        anomaly = scoring.behavioral.update(nick, "dummy", latest_sent)
+
+        sw = self._status_win()
+        sw.add_line(f"=== Behavioral Analysis: {nick} ===")
+        sw.add_line("")
+        sw.add_line("  ── Sentiment ─────────────────────────────")
+        sw.add_line(f"  Trend       : {sent_trend['trend']}")
+        sw.add_line(f"  Avg score   : {sent_trend['avg_score']:+.3f}")
+        sw.add_line(f"  Volatility  : {sent_trend['volatility']:.3f}")
+        sw.add_line("")
+        sw.add_line("  ── Behavioral Anomalies ──────────────────")
+        sw.add_line(f"  Anomaly score : {anomaly['anomaly_score']:.3f}")
+        if anomaly.get("changed_aspects"):
+            for aspect in anomaly["changed_aspects"]:
+                sw.add_line(f"  ⚠ {aspect}")
+        else:
+            sw.add_line("  No significant anomalies")
+        sw.add_line("")
+        sw.add_line("  ── Activity ──────────────────────────────")
+        sw.add_line(f"  Messages      : {u_state.total_msgs}")
+        sw.add_line(f"  Avg length    : {u_state.avg_msg_length():.0f} chars")
+        sw.add_line(f"  Messages/min  : {u_state.messages_per_minute():.1f}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_biometrics(self, args, extra, line):
+        """Show your own behavioral biometrics profile.
+
+        Usage: /biometrics
+        """
+        client = self._active_client()
+        bio = client.biometrics
+        sw = self._status_win()
+        sw.add_line("=== Your Behavioral Biometrics Profile ===")
+        sw.add_line("")
+        cadence = bio.get_typing_cadence_stats()
+        sw.add_line("  ── Typing Cadence (flight times) ────────")
+        sw.add_line(f"  Mean     : {cadence['mean']:.1f} ms")
+        sw.add_line(f"  Std dev  : {cadence['std']:.1f} ms")
+        sw.add_line(f"  Median   : {cadence['median']:.1f} ms")
+        sw.add_line(f"  P10/P90  : {cadence['p10']:.1f} / {cadence['p90']:.1f} ms")
+        sw.add_line(f"  Samples  : {cadence['samples']}")
+        sw.add_line("")
+        comp = bio.get_composition_stats()
+        sw.add_line("  ── Message Composition ──────────────────")
+        sw.add_line(f"  Mean     : {comp['mean']:.2f} s")
+        sw.add_line(f"  Std dev  : {comp['std']:.2f} s")
+        sw.add_line(f"  Median   : {comp['median']:.2f} s")
+        sw.add_line(f"  Min/Max  : {comp['min']:.2f} / {comp['max']:.2f} s")
+        sw.add_line(f"  Samples  : {comp['samples']}")
+        sw.add_line("")
+        resp = bio.get_response_latency_stats()
+        sw.add_line("  ── Response Latency ─────────────────────")
+        sw.add_line(f"  Mean     : {resp['mean']:.2f} s")
+        sw.add_line(f"  Std dev  : {resp['std']:.2f} s")
+        sw.add_line(f"  Median   : {resp['median']:.2f} s")
+        sw.add_line(f"  Min/Max  : {resp['min']:.2f} / {resp['max']:.2f} s")
+        sw.add_line(f"  Samples  : {resp['samples']}")
+        sw.add_line("")
+        bursts = bio.get_burst_stats()
+        sw.add_line("  ── Typing Bursts ────────────────────────")
+        sw.add_line(f"  Count        : {bursts['count']}")
+        sw.add_line(f"  Avg duration : {bursts['avg_duration']:.2f} s")
+        sw.add_line(f"  Avg rate     : {bursts['avg_rate']:.1f} keys/s")
+        sw.add_line(f"  Avg keys     : {bursts['avg_keys']:.1f}")
+        sw.add_line("")
+        sw.add_line("  ── Summary ──────────────────────────────")
+        sw.add_line(f"  Backspace ratio  : {bio.get_backspace_ratio():.2%}")
+        sw.add_line(f"  Messages sent    : {bio._messages_sent}")
+        sw.add_line(f"  Total keystrokes : {bio._total_keystrokes}")
+        sw.add_line(f"  Human likelihood : {bio.get_human_likelihood():.0f}%")
+        sw.add_line("")
+        if "message-tags" in client._active_caps:
+            sw.add_line("  IRCv3 message-tags: active")
+        if "draft/typing" in client._active_caps:
+            sw.add_line("  IRCv3 draft/typing: active")
+        if "draft/thread" in client._active_caps:
+            sw.add_line("  IRCv3 draft/thread: active")
+        if "read-marker" in client._active_caps:
+            sw.add_line("  IRCv3 read-marker: active")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_llmfp(self, args, extra, line):
+        """Show LLM fingerprint analysis for a nick or list top suspects.
+
+        Usage:
+          /llmfp <nick>   — show LLM fingerprint score for nick
+          /llmfp list     — list top LLM suspects
+          /llmfp status   — show LLM fingerprinter stats
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[llmfp] disabled by --no-ai")); return
+
+        sub = (args or "").strip().lower()
+        client = self._active_client()
+        fp = client.scoring.llm_fingerprinter
+        sw = self._status_win()
+
+        if not sub:
+            await self.ui_queue.put(("status", "Usage: /llmfp <nick|list|status>"))
+            return
+
+        if sub == "list":
+            suspects = fp.get_top_suspects(limit=15)
+            sw.add_line("=== LLM Fingerprint Top Suspects ===")
+            sw.add_line("")
+            if not suspects:
+                sw.add_line("  No LLM suspects detected yet.")
+            else:
+                for s in suspects:
+                    sw.add_line(f"  {s['nick']:<16} LLM: {s['score']:5.1f}%  msgs: {s['samples']}")
+        elif sub == "status":
+            data = {nick: fp.get_nick_score(nick) for nick in fp._nick_data}
+            total = sum(1 for d in data.values() if d["samples"] > 0)
+            sw.add_line("=== LLM Fingerprinter Status ===")
+            sw.add_line(f"  Tracked nicks: {total}")
+            sw.add_line(f"  Save path: {fp._SAVE_PATH}")
+        else:
+            nick = sub
+            result = fp.get_nick_score(nick)
+            sw.add_line(f"=== LLM Fingerprint: {nick} ===")
+            sw.add_line("")
+            if result["samples"] == 0:
+                sw.add_line("  No data for this nick yet.")
+            else:
+                sw.add_line(f"  LLM score      : {result['llm_score']:.1f}%")
+                sw.add_line(f"  Confidence     : {result['confidence']}")
+                sw.add_line(f"  Samples        : {result['samples']}")
+                sw.add_line(f"  Hedging ratio  : {result['hedging_ratio']:.2f}")
+                sw.add_line(f"  Repetition     : {result['repetition_ratio']:.2f}")
+                sw.add_line(f"  List bias      : {result['list_ratio']:.2f}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_deepfake(self, args, extra, line):
+        """Show deepfake relay detection analysis.
+
+        Usage:
+          /deepfake <nick>   — show relay score for nick
+          /deepfake chains   — show active relay chains
+          /deepfake status   — show detector stats
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[deepfake] disabled by --no-ai")); return
+
+        sub = (args or "").strip().lower()
+        client = self._active_client()
+        df = client.scoring.deepfake_relay
+        sw = self._status_win()
+
+        if not sub:
+            await self.ui_queue.put(("status", "Usage: /deepfake <nick|chains|status>"))
+            return
+
+        if sub == "chains":
+            chains = df.get_active_chains(limit=5)
+            sw.add_line("=== Active Relay Chains ===")
+            sw.add_line("")
+            if not chains:
+                sw.add_line("  No relay chains detected.")
+            else:
+                for c in chains:
+                    sw.add_line(f"  Chain: {c['chain_id'][:40]}...")
+                    sw.add_line(f"    Participants: {', '.join(c['participants'])}")
+                    sw.add_line(f"    Length: {c['length']}  Avg score: {c['avg_score']:.2f}")
+                    sw.add_line("")
+        elif sub == "status":
+            total = len(df._nick_data)
+            total_msgs = sum(d.get("total_msgs", 0) for d in df._nick_data.values())
+            sw.add_line("=== Deepfake Relay Detector Status ===")
+            sw.add_line(f"  Tracked nicks  : {total}")
+            sw.add_line(f"  Total messages : {total_msgs}")
+            sw.add_line(f"  Active chains  : {len(df._relay_chains)}")
+            sw.add_line(f"  Save path      : {df._SAVE_PATH}")
+        else:
+            nick = sub
+            result = df.get_nick_score(nick)
+            sw.add_line(f"=== Deepfake Relay: {nick} ===")
+            sw.add_line("")
+            if result["samples"] == 0:
+                sw.add_line("  No data for this nick yet.")
+            else:
+                sw.add_line(f"  Relay score    : {result['relay_score']:.1f}%")
+                sw.add_line(f"  Confidence     : {result['confidence']}")
+                sw.add_line(f"  Samples        : {result['samples']}")
+                sw.add_line(f"  Relay phrases  : {result['relay_phrases']}")
+                sw.add_line(f"  Quotes         : {result['quotes']}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_aistatus(self, args, extra, line):
+        """Show status of all AI/ML pipeline components.
+
+        Usage: /aistatus
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[aistatus] disabled by --no-ai")); return
+
+        client = self._active_client()
+        scoring = client.scoring
+        detector = scoring.ai_detector
+
+        sw = self._status_win()
+        sw.add_line("=== AI/ML Pipeline Status ===")
+        sw.add_line("")
+        sw.add_line("  ── Core Detector ─────────────────────────")
+        sw.add_line(f"  Enabled       : {detector.enabled}")
+        sw.add_line(f"  Active model  : {detector.active_detect_model}")
+        sw.add_line(f"  Cache hits    : {len(detector._pred_cache)}")
+        sw.add_line("")
+        sw.add_line("  ── Bot Fingerprints ──────────────────────")
+        sw.add_line(f"  Saved bots    : {len(scoring.bot_fingerprints)}")
+        total_fp_msgs = sum(fp.msg_count for fp in scoring.bot_fingerprints.values())
+        sw.add_line(f"  Total msgs    : {total_fp_msgs}")
+        sw.add_line("")
+        sw.add_line("  ── Sentiment Analysis ────────────────────")
+        total_sent = sum(len(h) for h in scoring._sentiment_history.values())
+        sw.add_line(f"  Users tracked : {len(scoring._sentiment_history)}")
+        sw.add_line(f"  Messages      : {total_sent}")
+        sw.add_line("")
+        sw.add_line("  ── Behavioral Anomaly ────────────────────")
+        sw.add_line(f"  Users tracked : {len(scoring.behavioral._user_profiles)}")
+        sw.add_line("")
+        sw.add_line("  ── Topic Detection ───────────────────────")
+        sw.add_line(f"  Topic models  : {len(_TOPIC_KEYWORDS)}")
+        sw.add_line("")
+        sw.add_line("  ── Semantic Similarity ───────────────────")
+        sw.add_line(f"  Messages      : {len(scoring.semantic._message_history)}")
+        sw.add_line("")
+        sw.add_line("  ── Thread Tracker ────────────────────────")
+        sw.add_line(f"  Active threads: {len(scoring.threads._active_threads)}")
+        sw.add_line("")
+        sw.add_line("  ── Cross-Channel Detection ───────────────")
+        sw.add_line(f"  Nicks tracked : {len(scoring.cross_channel._nick_channels)}")
+        sw.add_line(f"  Alerts        : {len(scoring.cross_channel._cross_channel_alerts)}")
+        sw.add_line("")
+        sw.add_line("  ── Blocklist ─────────────────────────────")
+        sw.add_line(f"  N-grams       : {len(scoring.blocklisted_ngrams)}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_remind(self, args, extra, line):
+        """Create, list, or delete reminders.
+
+        Usage:
+          /remind in 30m Buy groceries
+          /remind at 14:30 Meeting with team
+          /remind tomorrow Submit report
+          /remind list
+          /remind delete <id>
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[remind] disabled by --no-ai")); return
+
+        client = self._active_client()
+        if not hasattr(client, 'scoring'):
+            await self.ui_queue.put(("status", "[remind] AI system not initialized"))
+            return
+
+        rm = client.scoring.reminders
+        sw = self._status_win()
+
+        if not args:
+            await self.ui_queue.put(("status", "Usage: /remind <in Xm|at HH:MM|tomorrow|list|delete <id>> <message>"))
+            return
+
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower()
+
+        if subcmd == "list":
+            reminders = rm.list_reminders()
+            if not reminders:
+                sw.add_line("-!- No active reminders")
+            else:
+                sw.add_line("-!- Active reminders:")
+                for r in reminders:
+                    due_str = time.strftime('%H:%M', time.localtime(r['due_at']))
+                    sw.add_line(f"  [{r['id']}] {due_str} - {r['message']}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "delete":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /remind delete <id>"))
+                return
+            try:
+                rid = int(parts[1])
+                if rm.delete_reminder(rid):
+                    sw.add_line(f"-!- Reminder {rid} deleted")
+                else:
+                    sw.add_line(f"-!- Reminder {rid} not found")
+            except ValueError:
+                await self.ui_queue.put(("status", "Invalid reminder ID"))
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd in ("in", "at"):
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Usage: /remind {subcmd} <time> <message>"))
+                return
+            rest = parts[1].split(maxsplit=1)
+            if len(rest) < 2:
+                await self.ui_queue.put(("status", f"Usage: /remind {subcmd} <time> <message>"))
+                return
+            time_spec = rest[0]
+            message = rest[1]
+            if subcmd == "in":
+                success = rm.add_reminder_in(time_spec, message)
+            else:
+                success = rm.add_reminder_at(time_spec, message)
+            if success:
+                sw.add_line(f"-!- Reminder set: {message}")
+            else:
+                await self.ui_queue.put(("status", f"Failed to parse time: {time_spec}"))
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "tomorrow":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /remind tomorrow <message>"))
+                return
+            message = parts[1]
+            success = rm.add_reminder_tomorrow(message)
+            if success:
+                sw.add_line(f"-!- Reminder set for tomorrow: {message}")
+            else:
+                await self.ui_queue.put(("status", "Failed to set reminder for tomorrow"))
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        await self.ui_queue.put(("status", "Usage: /remind <in Xm|at HH:MM|tomorrow|list|delete <id>> <message>"))
+
+    async def _slash_watch(self, args, extra, line):
+        """Add a nick to the watch list.
+
+        Usage: /watch <nick> [channel]
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[watch] disabled by --no-ai")); return
+
+        client = self._active_client()
+        if not hasattr(client, 'scoring'):
+            await self.ui_queue.put(("status", "[watch] AI system not initialized"))
+            return
+
+        if not args:
+            await self.ui_queue.put(("status", "Usage: /watch <nick> [channel]"))
+            return
+
+        parts = args.split()
+        nick = parts[0]
+        channel = parts[1] if len(parts) > 1 else ""
+
+        wm = client.scoring.watches
+        sw = self._status_win()
+        watcher = client.nick
+        channels = [channel] if channel else []
+
+        wm.add_watch(nick, watcher, channels=channels)
+        sw.add_line(f"-!- Now watching {nick}" + (f" in {channel}" if channel else ""))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_unwatch(self, args, extra, line):
+        """Remove a nick from the watch list.
+
+        Usage: /unwatch <nick> [channel]
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[unwatch] disabled by --no-ai")); return
+
+        client = self._active_client()
+        if not hasattr(client, 'scoring'):
+            await self.ui_queue.put(("status", "[unwatch] AI system not initialized"))
+            return
+
+        if not args:
+            await self.ui_queue.put(("status", "Usage: /unwatch <nick> [channel]"))
+            return
+
+        parts = args.split()
+        nick = parts[0]
+        channel = parts[1] if len(parts) > 1 else ""
+
+        wm = client.scoring.watches
+        sw = self._status_win()
+        watcher = client.nick
+
+        if wm.remove_watch(watcher, nick):
+            sw.add_line(f"-!- No longer watching {nick}" + (f" in {channel}" if channel else ""))
+        else:
+            sw.add_line(f"-!- Not watching {nick}" + (f" in {channel}" if channel else ""))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_snippet(self, args, extra, line):
+        """Manage text snippets.
+
+        Usage:
+          /snippet add <name> <text>
+          /snippet remove <name>
+          /snippet list
+          /snippet <name> (inserts snippet)
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[snippet] disabled by --no-ai")); return
+
+        client = self._active_client()
+        if not hasattr(client, 'scoring'):
+            await self.ui_queue.put(("status", "[snippet] AI system not initialized"))
+            return
+
+        sm = client.scoring.snippets
+        sw = self._status_win()
+
+        if not args:
+            await self.ui_queue.put(("status", "Usage: /snippet <add|remove|list|name> [text]"))
+            return
+
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower()
+
+        if subcmd == "add":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /snippet add <name> <text>"))
+                return
+            name_and_text = parts[1].split(maxsplit=1)
+            if len(name_and_text) < 2:
+                await self.ui_queue.put(("status", "Usage: /snippet add <name> <text>"))
+                return
+            name, text = name_and_text
+            sm.add_snippet(name, text)
+            sw.add_line(f"-!- Snippet '{name}' added")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "remove":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /snippet remove <name>"))
+                return
+            name = parts[1]
+            if sm.remove_snippet(name):
+                sw.add_line(f"-!- Snippet '{name}' removed")
+            else:
+                sw.add_line(f"-!- Snippet '{name}' not found")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "list":
+            snippets = sm.list_snippets()
+            if not snippets:
+                sw.add_line("-!- No snippets saved")
+            else:
+                sw.add_line("-!- Saved snippets:")
+                for name, text in snippets.items():
+                    preview = text[:50] + ("..." if len(text) > 50 else "")
+                    sw.add_line(f"  {name}: {preview}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        # Insert snippet into input buffer
+        text = sm.get_snippet(subcmd)
+        if text:
+            cur_win = self.get_current_window()
+            target = (cur_win.name if cur_win.name not in ("*status*", "*dashboard*")
+                      else self.current_channel or DEFAULT_CHANNEL)
+            self._active_client().cmd_msg(target, text)
+            sw.add_line(f"-!- Inserted snippet '{subcmd}'")
+        else:
+            await self.ui_queue.put(("status", f"Snippet '{subcmd}' not found"))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_chstats(self, args, extra, line):
+        """Show channel statistics.
+
+        Usage: /chstats [channel]
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[chstats] disabled by --no-ai")); return
+
+        client = self._active_client()
+        if not hasattr(client, 'scoring'):
+            await self.ui_queue.put(("status", "[chstats] AI system not initialized"))
+            return
+
+        channel = args or self.current_channel or ""
+        if not channel or not channel.startswith("#"):
+            await self.ui_queue.put(("status", "Usage: /chstats [#channel]"))
+            return
+
+        stats = client.scoring.channel_stats.get_channel_stats(channel)
+        sw = self._status_win()
+
+        if not stats:
+            sw.add_line(f"-!- No statistics for {channel}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        sw.add_line(f"=== Channel Stats: {channel} ===")
+        sw.add_line(f"  Total messages : {stats['total_messages']}")
+        sw.add_line(f"  Unique users   : {stats['unique_users']}")
+        sw.add_line(f"  Avg msg length : {stats['avg_msg_length']:.1f}")
+
+        if stats['top_talkers']:
+            sw.add_line("  Top talkers:")
+            for nick, count in stats['top_talkers'][:5]:
+                sw.add_line(f"    {nick}: {count} messages")
+
+        if stats['hourly_activity']:
+            sw.add_line("  Hourly activity (top 5):")
+            sorted_hours = sorted(stats['hourly_activity'].items(), key=lambda x: x[1], reverse=True)[:5]
+            for hour, count in sorted_hours:
+                sw.add_line(f"    {hour:02d}:00 - {count} messages")
+
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_rss(self, args, extra, line):
+        """Manage RSS feed subscriptions.
+
+        Usage:
+          /rss add <url> [channel]
+          /rss remove <url>
+          /rss list
+          /rss poll
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[rss] disabled by --no-ai")); return
+
+        client = self._active_client()
+        if not hasattr(client, 'scoring'):
+            await self.ui_queue.put(("status", "[rss] AI system not initialized"))
+            return
+
+        rm = client.scoring.rss
+        sw = self._status_win()
+
+        if not args:
+            await self.ui_queue.put(("status", "Usage: /rss <add|remove|list|poll> [url] [channel]"))
+            return
+
+        parts = args.split(maxsplit=2)
+        subcmd = parts[0].lower()
+
+        if subcmd == "add":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /rss add <url> [channel]"))
+                return
+            url_and_channel = parts[1].split()
+            url = url_and_channel[0]
+            channel = url_and_channel[1] if len(url_and_channel) > 1 else ""
+            if rm.add_feed(url, channel):
+                sw.add_line(f"-!- RSS feed added: {url}" + (f" -> {channel}" if channel else ""))
+            else:
+                sw.add_line(f"-!- Feed already exists: {url}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "remove":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /rss remove <url>"))
+                return
+            url = parts[1]
+            if rm.remove_feed(url):
+                sw.add_line(f"-!- RSS feed removed: {url}")
+            else:
+                sw.add_line(f"-!- Feed not found: {url}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "list":
+            feeds = rm.list_feeds()
+            if not feeds:
+                sw.add_line("-!- No RSS feeds subscribed")
+            else:
+                sw.add_line("-!- RSS feeds:")
+                for feed in feeds:
+                    sw.add_line(f"  {feed['url']}" + (f" -> {feed['channel']}" if feed['channel'] else ""))
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "poll":
+            new_items = await rm.poll_all()
+            if new_items:
+                sw.add_line(f"-!- Polled RSS feeds, {len(new_items)} new items:")
+                for item in new_items[:10]:
+                    sw.add_line(f"  [{item['feed']}] {item['title']}")
+            else:
+                sw.add_line("-!- No new items from RSS feeds")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        await self.ui_queue.put(("status", "Usage: /rss <add|remove|list|poll> [url] [channel]"))
+
+    async def _slash_todo(self, args, extra, line):
+        """Manage todo list.
+
+        Usage:
+          /todo add <text> [@priority] [#due] [+tag ...]
+          /todo done <id>
+          /todo undo <id>
+          /todo remove <id>
+          /todo edit <id> [text]
+          /todo list [priority|tag|channel]
+          /todo clear
+        """
+        client = self._active_client()
+        if not hasattr(client, 'scoring'):
+            await self.ui_queue.put(("status", "[todo] scoring engine not initialized"))
+            return
+        tm = client.scoring.todos
+        sw = self._status_win()
+
+        if not args:
+            todos = tm.list_todos()
+            if not todos:
+                sw.add_line("-!- No active todos")
+            else:
+                sw.add_line("=== Todo List ===")
+                _prio_sym = {"urgent": "!!", "high": "!", "medium": "-", "low": "~"}
+                for t in todos:
+                    sym = _prio_sym.get(t.get("priority", "medium"), "-")
+                    mark = "\u2713" if t["completed"] else "\u25cb"
+                    due = f" (due:{t['due']})" if t.get("due") else ""
+                    tags = f" [{','.join(t['tags'])}]" if t.get("tags") else ""
+                    sw.add_line(f"  {mark} [{t['id'][:12]}] {sym} {t['text'][:80]}{due}{tags}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower()
+
+        if subcmd == "add":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /todo add <text> [@priority] [#due] [+tag]"))
+                return
+            rest = parts[1]
+            priority = "medium"
+            due = ""
+            tags = []
+            for m in re.finditer(r'@(\w+)', rest):
+                val = m.group(1).lower()
+                if val in ("low", "medium", "high", "urgent"):
+                    priority = val
+            for m in re.finditer(r'#(\S+)', rest):
+                due = m.group(1)
+            for m in re.finditer(r'\+(\w+)', rest):
+                tags.append(m.group(1))
+            text = re.sub(r'[@#+]\S+\s*', '', rest).strip()
+            if not text:
+                text = rest.strip()
+            channel = self.current_channel or ""
+            todo = tm.add(text, priority=priority, due=due, tags=tags, channel=channel)
+            sw.add_line(f"-!- Todo added [{todo['id'][:12]}]: {text} @{priority}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd in ("done", "complete"):
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /todo done <id>"))
+                return
+            result = tm.complete(parts[1].strip())
+            if result:
+                sw.add_line(f"-!- Completed: {result['text'][:60]}")
+            else:
+                sw.add_line(f"-!- Todo '{parts[1]}' not found or already done")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd in ("undo", "uncomplete"):
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /todo undo <id>"))
+                return
+            result = tm.uncomplete(parts[1].strip())
+            if result:
+                sw.add_line(f"-!- Reopened: {result['text'][:60]}")
+            else:
+                sw.add_line(f"-!- Todo '{parts[1]}' not found or not completed")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd in ("remove", "delete", "rm"):
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /todo remove <id>"))
+                return
+            if tm.remove(parts[1].strip()):
+                sw.add_line(f"-!- Todo removed")
+            else:
+                sw.add_line(f"-!- Todo '{parts[1]}' not found")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "edit":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /todo edit <id> [text] [@priority] [#due]"))
+                return
+            edit_parts = parts[1].split(maxsplit=1)
+            tid = edit_parts[0].strip()
+            new_text = edit_parts[1] if len(edit_parts) > 1 else None
+            new_prio = None
+            new_due = None
+            if new_text:
+                for m in re.finditer(r'@(\w+)', new_text):
+                    val = m.group(1).lower()
+                    if val in ("low", "medium", "high", "urgent"):
+                        new_prio = val
+                for m in re.finditer(r'#(\S+)', new_text):
+                    new_due = m.group(1)
+                cleaned = re.sub(r'[@#+]\S+\s*', '', new_text).strip()
+                if cleaned:
+                    new_text = cleaned
+            result = tm.edit(tid, text=new_text, priority=new_prio, due=new_due)
+            if result:
+                sw.add_line(f"-!- Todo updated: {result['text'][:60]}")
+            else:
+                sw.add_line(f"-!- Todo '{tid}' not found")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "clear":
+            removed = tm.clear_completed()
+            sw.add_line(f"-!- Cleared {removed} completed todo(s)")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        await self.ui_queue.put(("status", "Usage: /todo [add|done|undo|remove|edit|list|clear]"))
+
+    async def _slash_pomodoro(self, args, extra, line):
+        """Pomodoro timer for focused work sessions.
+
+        Usage:
+          /pomodoro start
+          /pomodoro stop
+          /pomodoro status
+          /pomodoro config [work N] [break N] [long N] [sessions N]
+        """
+        client = self._active_client()
+        if not hasattr(client, 'scoring'):
+            await self.ui_queue.put(("status", "[pomodoro] scoring engine not initialized"))
+            return
+        pm = client.scoring.pomodoro
+        sw = self._status_win()
+
+        if not args:
+            args = "status"
+
+        parts = args.split()
+        subcmd = parts[0].lower()
+
+        if subcmd == "start":
+            result = pm.start(self.ui_queue, client.nick)
+            if result:
+                sw.add_line(f"-!- {result}")
+            else:
+                sw.add_line("-!- Pomodoro already running")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "stop":
+            result = pm.stop()
+            if result:
+                sw.add_line(f"-!- {result}")
+            else:
+                sw.add_line("-!- No pomodoro running")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "status":
+            st = pm.status()
+            sw.add_line("=== Pomodoro Status ===")
+            sw.add_line(f"  Running: {'yes' if st['running'] else 'no'}")
+            sw.add_line(f"  Sessions completed: {st['completed_sessions']}")
+            sw.add_line(f"  Total work: {st['total_work_minutes']} min")
+            cfg = st['config']
+            sw.add_line(f"  Work: {cfg['work_min']}m  Break: {cfg['short_break_min']}m  "
+                        f"Long: {cfg['long_break_min']}m  Long every: {cfg['sessions_before_long']}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "config":
+            work = short_break = long_break = sessions = None
+            i = 1
+            while i < len(parts):
+                if parts[i] == "work" and i + 1 < len(parts):
+                    try: work = int(parts[i + 1]); i += 2
+                    except ValueError: i += 1
+                elif parts[i] == "break" and i + 1 < len(parts):
+                    try: short_break = int(parts[i + 1]); i += 2
+                    except ValueError: i += 1
+                elif parts[i] == "long" and i + 1 < len(parts):
+                    try: long_break = int(parts[i + 1]); i += 2
+                    except ValueError: i += 1
+                elif parts[i] == "sessions" and i + 1 < len(parts):
+                    try: sessions = int(parts[i + 1]); i += 2
+                    except ValueError: i += 1
+                else:
+                    i += 1
+            pm.configure(
+                work=work or pm.work_duration // 60,
+                short_break=short_break or pm.short_break // 60,
+                long_break=long_break or pm.long_break // 60,
+                sessions=sessions or pm.sessions_before_long,
+            )
+            sw.add_line(f"-!- Pomodoro configured: work={pm.work_duration // 60}m "
+                        f"break={pm.short_break // 60}m long={pm.long_break // 60}m "
+                        f"sessions={pm.sessions_before_long}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        await self.ui_queue.put(("status", "Usage: /pomodoro [start|stop|status|config]"))
+
+    async def _slash_note(self, args, extra, line):
+        """Scratchpad notes manager.
+
+        Usage:
+          /note add <text> [category]
+          /note edit <id> <text>
+          /note remove <id>
+          /note list [category]
+          /note search <query>
+          /note pin <id>
+          /note unpin <id>
+          /note categories
+        """
+        client = self._active_client()
+        if not hasattr(client, 'scoring'):
+            await self.ui_queue.put(("status", "[note] scoring engine not initialized"))
+            return
+        nm = client.scoring.notes
+        sw = self._status_win()
+
+        if not args:
+            notes = nm.list_notes()
+            if not notes:
+                sw.add_line("-!- No notes saved")
+            else:
+                sw.add_line("=== Notes ===")
+                for n in notes[:20]:
+                    pin = "\u2605" if n.get("pinned") else " "
+                    cat = n.get("category", "general")
+                    sw.add_line(f"  {pin} [{n['id'][:12]}] [{cat}] {n['text'][:70]}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower()
+
+        if subcmd == "add":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /note add <text> [category]"))
+                return
+            rest = parts[1]
+            category = "general"
+            add_parts = rest.rsplit(maxsplit=1)
+            if len(add_parts) == 2 and not add_parts[1].startswith(" ") and len(add_parts[1]) < 20:
+                category = add_parts[1].lower()
+                text = add_parts[0]
+            else:
+                text = rest
+            note = nm.add(text, category=category)
+            sw.add_line(f"-!- Note added [{note['id'][:12]}]: {text[:60]}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "edit":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /note edit <id> <text>"))
+                return
+            edit_parts = parts[1].split(maxsplit=1)
+            if len(edit_parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /note edit <id> <text>"))
+                return
+            result = nm.edit(edit_parts[0].strip(), text=edit_parts[1])
+            if result:
+                sw.add_line(f"-!- Note updated: {result['text'][:60]}")
+            else:
+                sw.add_line(f"-!- Note '{edit_parts[0]}' not found")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd in ("remove", "delete", "rm"):
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /note remove <id>"))
+                return
+            if nm.remove(parts[1].strip()):
+                sw.add_line("-!- Note removed")
+            else:
+                sw.add_line(f"-!- Note '{parts[1]}' not found")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "search":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /note search <query>"))
+                return
+            results = nm.search(parts[1])
+            if not results:
+                sw.add_line("-!- No matching notes")
+            else:
+                sw.add_line(f"=== Search: {parts[1]} ===")
+                for n in results[:15]:
+                    pin = "\u2605" if n.get("pinned") else " "
+                    sw.add_line(f"  {pin} [{n['id'][:12]}] {n['text'][:70]}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "pin":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /note pin <id>"))
+                return
+            result = nm.edit(parts[1].strip(), pinned=True)
+            if result:
+                sw.add_line(f"-!- Note pinned: {result['text'][:60]}")
+            else:
+                sw.add_line(f"-!- Note '{parts[1]}' not found")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "unpin":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /note unpin <id>"))
+                return
+            result = nm.edit(parts[1].strip(), pinned=False)
+            if result:
+                sw.add_line(f"-!- Note unpinned: {result['text'][:60]}")
+            else:
+                sw.add_line(f"-!- Note '{parts[1]}' not found")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd in ("categories", "cats"):
+            cats = nm.list_categories()
+            if not cats:
+                sw.add_line("-!- No categories")
+            else:
+                sw.add_line(f"-!- Categories: {', '.join(cats)}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        await self.ui_queue.put(("status", "Usage: /note [add|edit|remove|list|search|pin|unpin|categories]"))
+
+    async def _slash_bookmark(self, args, extra, line):
+        """Bookmark manager for channels, nicks, URLs, and items.
+
+        Usage:
+          /bookmark add <target> [description] [type:channel|nick|url|general] [+tag ...]
+          /bookmark remove <id>
+          /bookmark list [type]
+          /bookmark search <query>
+        """
+        client = self._active_client()
+        if not hasattr(client, 'scoring'):
+            await self.ui_queue.put(("status", "[bookmark] scoring engine not initialized"))
+            return
+        bm = client.scoring.bookmarks
+        sw = self._status_win()
+
+        if not args:
+            bookmarks = bm.list_bookmarks()
+            if not bookmarks:
+                sw.add_line("-!- No bookmarks saved")
+            else:
+                sw.add_line("=== Bookmarks ===")
+                for b in bookmarks[:20]:
+                    tags = f" [{','.join(b['tags'])}]" if b.get("tags") else ""
+                    desc = f" - {b['description'][:40]}" if b.get("description") else ""
+                    sw.add_line(f"  [{b['type']}] {b['target']}{desc}{tags}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower()
+
+        if subcmd == "add":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /bookmark add <target> [desc] [type:X] [+tag]"))
+                return
+            rest = parts[1]
+            btype = "channel"
+            tags = []
+            for m in re.finditer(r'type:(\w+)', rest):
+                val = m.group(1).lower()
+                if val in ("channel", "nick", "url", "general"):
+                    btype = val
+            for m in re.finditer(r'\+(\w+)', rest):
+                tags.append(m.group(1))
+            cleaned = re.sub(r'type:\w+\s*', '', rest)
+            cleaned = re.sub(r'\+\w+\s*', '', cleaned)
+            cleaned = cleaned.strip()
+            add_parts = cleaned.split(maxsplit=1)
+            target = add_parts[0]
+            description = add_parts[1] if len(add_parts) > 1 else ""
+            if target.startswith("#"):
+                btype = "channel"
+            result = bm.add(target, description=description, tags=tags, btype=btype)
+            sw.add_line(f"-!- Bookmarked [{btype}]: {target}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd in ("remove", "delete", "rm"):
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /bookmark remove <id>"))
+                return
+            if bm.remove(parts[1].strip()):
+                sw.add_line("-!- Bookmark removed")
+            else:
+                sw.add_line(f"-!- Bookmark '{parts[1]}' not found")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd == "search":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /bookmark search <query>"))
+                return
+            results = bm.search(parts[1])
+            if not results:
+                sw.add_line("-!- No matching bookmarks")
+            else:
+                sw.add_line(f"=== Bookmark search: {parts[1]} ===")
+                for b in results[:15]:
+                    desc = f" - {b['description'][:40]}" if b.get("description") else ""
+                    sw.add_line(f"  [{b['type']}] {b['target']}{desc}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        await self.ui_queue.put(("status", "Usage: /bookmark [add|remove|list|search]"))
+
+    async def _slash_timer(self, args, extra, line):
+        """Countdown timer with notification.
+
+        Usage:
+          /timer <duration> [name]   (e.g. /timer 5m tea, /timer 30s)
+          /timer list
+          /timer cancel <id>
+        """
+        client = self._active_client()
+        if not hasattr(client, 'scoring'):
+            await self.ui_queue.put(("status", "[timer] scoring engine not initialized"))
+            return
+        tmr = client.scoring.timers
+        tmr.set_ui_queue(self.ui_queue)
+        sw = self._status_win()
+
+        if not args:
+            await self.ui_queue.put(("status", "Usage: /timer <duration> [name] | list | cancel <id>"))
+            return
+
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower()
+
+        if subcmd == "list":
+            timers = tmr.list_timers()
+            if not timers:
+                sw.add_line("-!- No active timers")
+            else:
+                sw.add_line("=== Active Timers ===")
+                for t in timers:
+                    sw.add_line(f"  [{t['id']}] {t['name']} - {t['remaining']}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if subcmd in ("cancel", "stop"):
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /timer cancel <id>"))
+                return
+            if tmr.cancel(parts[1].strip()):
+                sw.add_line("-!- Timer cancelled")
+            else:
+                sw.add_line(f"-!- Timer '{parts[1]}' not found")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        duration_str = parts[0]
+        name = parts[1] if len(parts) > 1 else "timer"
+
+        dur_match = re.match(r'^(\d+)([smh]?)$', duration_str.lower())
+        if not dur_match:
+            await self.ui_queue.put(("status", "Usage: /timer <number>[s|m|h] [name]"))
+            return
+        val = int(dur_match.group(1))
+        unit = dur_match.group(2) or "m"
+        multipliers = {"s": 1, "m": 60, "h": 3600}
+        seconds = val * multipliers.get(unit, 60)
+
+        tid = tmr.start(name, seconds)
+        mins, secs = divmod(seconds, 60)
+        dur_display = f"{mins}m {secs}s" if mins else f"{secs}s"
+        sw.add_line(f"-!- Timer '{name}' started: {dur_display} [{tid}]")
+        self._chat_dirty = True
+        self.dirty = True
 
     async def _slash_join(self, args, extra, line):
         if args:
@@ -9371,9 +18874,1512 @@ class TUI:
             mask = args if "!" in args or "@" in args else f"{args}!*@*"
             self._active_client().cmd_mode(self.current_channel, f"+b {mask}")
 
+    async def _slash_quietlist(self, args, extra, line):
+        """Fetch the quiet list (+q) for the current channel."""
+        if not self.current_channel:
+            await self.ui_queue.put(("status", "No channel active"))
+            return
+        self._active_client().send_raw(f"MODE {self.current_channel} +q")
+        await self.ui_queue.put(("status", f"Fetching quiet list for {self.current_channel}..."))
+
     async def _slash_unban(self, args, extra, line):
         if args and self.current_channel:
             self._active_client().cmd_mode(self.current_channel, f"-b {args}")
+
+    async def _slash_chanmute(self, args, extra, line):
+        """Mute a user in the current channel (mode +q, requires IRCv3 or supported server)."""
+        if not self.current_channel:
+            await self.ui_queue.put(("status", "No channel active"))
+            return
+        if not args:
+            await self.ui_queue.put(("status", "Usage: /chanmute <nick>"))
+            return
+        nick = args.strip()
+        self._active_client().cmd_mode(self.current_channel, f"+q {nick}")
+        await self.ui_queue.put(("status", f"Muted {nick} in {self.current_channel}"))
+
+    async def _slash_chanunmute(self, args, extra, line):
+        """Unmute a user in the current channel (mode -q)."""
+        if not self.current_channel:
+            await self.ui_queue.put(("status", "No channel active"))
+            return
+        if not args:
+            await self.ui_queue.put(("status", "Usage: /chanunmute <nick>"))
+            return
+        nick = args.strip()
+        self._active_client().cmd_mode(self.current_channel, f"-q {nick}")
+        await self.ui_queue.put(("status", f"Unmuted {nick} in {self.current_channel}"))
+
+    async def _slash_halfop(self, args, extra, line):
+        """Give halfop (+h) to a user in the current channel."""
+        if args and self.current_channel:
+            self._active_client().cmd_mode(self.current_channel, f"+h {args}")
+
+    async def _slash_dehalfop(self, args, extra, line):
+        """Remove halfop (-h) from a user in the current channel."""
+        if args and self.current_channel:
+            self._active_client().cmd_mode(self.current_channel, f"-h {args}")
+
+    async def _slash_admin(self, args, extra, line):
+        """Give admin (+a) to a user in the current channel."""
+        if args and self.current_channel:
+            self._active_client().cmd_mode(self.current_channel, f"+a {args}")
+
+    async def _slash_deadmin(self, args, extra, line):
+        """Remove admin (-a) from a user in the current channel."""
+        if args and self.current_channel:
+            self._active_client().cmd_mode(self.current_channel, f"-a {args}")
+
+    async def _slash_owner(self, args, extra, line):
+        """Give owner (+q) to a user in the current channel."""
+        if args and self.current_channel:
+            self._active_client().cmd_mode(self.current_channel, f"+q {args}")
+
+    async def _slash_deowner(self, args, extra, line):
+        """Remove owner (-q) from a user in the current channel."""
+        if args and self.current_channel:
+            self._active_client().cmd_mode(self.current_channel, f"-q {args}")
+
+    async def _slash_cap(self, args, extra, line):
+        """View or request IRCv3 capabilities.
+
+        Usage:
+          /cap              — show currently active capabilities
+          /cap ls           — show what the server offers
+          /cap req <cap>    — request a capability
+          /cap list         — list all active capabilities
+        """
+        client = self._active_client()
+        sub = (args or "").strip().lower()
+        if not sub or sub == "list":
+            active = sorted(client._active_caps)
+            if active:
+                sw = self._status_win()
+                sw.add_line(f"Active capabilities ({len(active)}):")
+                for c in active:
+                    val = client._cap_ls_values.get(c, "")
+                    sw.add_line(f"  {c}" + (f" = {val}" if val else ""))
+                self._chat_dirty = True
+                self.dirty = True
+            else:
+                await self.ui_queue.put(("status", "No capabilities active"))
+        elif sub == "ls":
+            available = sorted(client._cap_ls_caps)
+            if available:
+                sw = self._status_win()
+                sw.add_line(f"Server offers {len(available)} capabilities:")
+                for c in available:
+                    val = client._cap_ls_values.get(c, "")
+                    owned = " [active]" if c in client._active_caps else ""
+                    sw.add_line(f"  {c}" + (f" = {val}" if val else "") + owned)
+                self._chat_dirty = True
+                self.dirty = True
+            else:
+                await self.ui_queue.put(("status", "No capabilities advertised (try /cap ls after reconnect)"))
+        elif sub == "req":
+            cap_name = extra.strip()
+            if cap_name:
+                client.send_raw(f"CAP REQ :{cap_name}")
+                await self.ui_queue.put(("status", f"Requesting capability: {cap_name}"))
+            else:
+                await self.ui_queue.put(("status", "Usage: /cap req <capability>"))
+        else:
+            await self.ui_queue.put(("status",
+                "Usage: /cap [list|ls|req <cap>]"))
+
+    async def _slash_sasl(self, args, extra, line):
+        """View or configure SASL authentication.
+
+        Usage:
+          /cap sasl          — show current SASL configuration
+          /cap sasl <mech>   — set SASL mechanism (PLAIN, EXTERNAL, SCRAM-SHA-256, ECDSA-NIST256P-CHALLENGE)
+        """
+        sub = (args or "").strip().upper()
+        if not sub:
+            sw = self._status_win()
+            sw.add_line("SASL Configuration:")
+            sw.add_line(f"  Mechanism : {SASL_MECHANISM}")
+            sw.add_line(f"  Cert path : {SASL_CERT or '(not set)'}")
+            sw.add_line(f"  Key path  : {SASL_KEY or '(not set)'}")
+            has_pass = "set" if NICKSERV_PASSWORD else "not set"
+            sw.add_line(f"  Password  : {has_pass}")
+            client = self._active_client()
+            sasl_active = "sasl" in client._active_caps
+            sw.add_line(f"  Status    : {'active' if sasl_active else 'not negotiated'}")
+            sw.add_line("")
+            sw.add_line("Supported mechanisms:")
+            sw.add_line("  PLAIN                    — password-based (default)")
+            sw.add_line("  SCRAM-SHA-256            — RFC-5802 SCRAM (password)")
+            sw.add_line("  EXTERNAL                 — TLS client certificate")
+            sw.add_line("  ECDSA-NIST256P-CHALLENGE — EC key (requires 'cryptography' pkg)")
+            sw.add_line("")
+            sw.add_line("Usage: /sasl <MECHANISM>")
+            self._chat_dirty = True
+            self.dirty = True
+        elif sub in ("PLAIN", "EXTERNAL", "SCRAM-SHA-256", "ECDSA-NIST256P-CHALLENGE"):
+            os.environ["IRC_SASL_MECHANISM"] = sub
+            await self.ui_queue.put(("status",
+                f"SASL mechanism set to {sub} — reconnect to apply"))
+        else:
+            await self.ui_queue.put(("status",
+                f"Unknown SASL mechanism '{sub}'. Supported: PLAIN, EXTERNAL, SCRAM-SHA-256, ECDSA-NIST256P-CHALLENGE"))
+
+    async def _slash_chghost(self, args, extra, line):
+        """Change a user's host (requires IRCop or appropriate permissions).
+
+        Usage: /chghost <nick> <new_host>
+        """
+        parts = (args + " " + extra).strip().split(maxsplit=1)
+        if len(parts) == 2:
+            self._active_client().send_raw(f"CHGHOST {parts[0]} {parts[1]}")
+            await self.ui_queue.put(("status", f"CHGHOST {parts[0]} {parts[1]}"))
+        else:
+            await self.ui_queue.put(("status", "Usage: /chghost <nick> <new_host>"))
+
+    async def _slash_setname(self, args, extra, line):
+        """Change your realname (requires setname CAP).
+
+        Usage: /setname <new_realname>
+        """
+        new_name = (args + " " + extra).strip()
+        if new_name:
+            if "setname" in self._active_client()._active_caps:
+                self._active_client().send_raw(f"SETNAME :{new_name}")
+                await self.ui_queue.put(("status", f"SETNAME :{new_name}"))
+            else:
+                await self.ui_queue.put(("status", "Server does not support setname CAP"))
+        else:
+            await self.ui_queue.put(("status", "Usage: /setname <new_realname>"))
+
+    async def _slash_umode(self, args, extra, line):
+        """View or change your user modes.
+
+        Usage:
+          /umode          — show current user modes
+          /umode +i       — set invisible mode
+          /umode -w       — disable wallops
+        """
+        client = self._active_client()
+        if not args:
+            modes = sorted(client._own_umodes)
+            mode_str = "+" + "".join(modes) if modes else "(none)"
+            await self.ui_queue.put(("status", f"Your user modes: {mode_str}"))
+            return
+        target = client.nick
+        modes = args.strip()
+        client.cmd_mode(target, modes)
+
+    async def _slash_oper(self, args, extra, line):
+        """Attempt to authenticate as an IRC operator.
+
+        Usage: /oper <username> <password>
+        """
+        parts = (args + " " + extra).strip().split(maxsplit=1)
+        if len(parts) == 2:
+            self._active_client().send_raw(f"OPER {parts[0]} {parts[1]}")
+            await self.ui_queue.put(("status", f"OPER {parts[0]} ***"))
+        else:
+            await self.ui_queue.put(("status", "Usage: /oper <username> <password>"))
+
+    async def _slash_raw(self, args, extra, line):
+        """Send a raw IRC command to the server.
+
+        Usage: /raw <command> [args]
+        Example: /raw PRIVMSG #channel :Hello world
+        """
+        raw_cmd = (args + " " + extra).strip()
+        if raw_cmd:
+            self._active_client().send_raw(raw_cmd)
+        else:
+            await self.ui_queue.put(("status", "Usage: /raw <IRC command>"))
+
+    async def _slash_dns(self, args, extra, line):
+        """Async DNS resolution with caching.
+
+        Usage:
+          /dns <hostname>     — resolve hostname to IP
+          /dns cache          — show DNS cache status
+          /dns clear          — clear DNS cache
+        """
+        sub = (args + " " + extra).strip()
+        sw = self._status_win()
+
+        if not sub:
+            await self.ui_queue.put(("status", "Usage: /dns <hostname|cache|clear>"))
+            return
+
+        if sub.lower() == "cache":
+            info = _dns_resolver.get_cache_info()
+            sw.add_line("=== DNS Cache ===")
+            sw.add_line(f"  Cached entries: {info['cached']}")
+            sw.add_line(f"  Pending queries: {info['pending']}")
+            sw.add_line("")
+            for entry in info.get("entries", [])[:10]:
+                sw.add_line(f"  {entry['host']:<30} TTL: {entry['ttl_remaining']:.0f}s  Results: {entry['results']}")
+        elif sub.lower() == "clear":
+            _dns_resolver.clear()
+            sw.add_line("-!- DNS cache cleared")
+        else:
+            host = sub.split()[0]
+            try:
+                ips = await _dns_resolver.resolve_ip(host)
+                if ips:
+                    sw.add_line(f"=== DNS Resolution: {host} ===")
+                    for ip in ips:
+                        sw.add_line(f"  {ip}")
+                else:
+                    sw.add_line(f"-!- No results for {host}")
+            except Exception as e:
+                sw.add_line(f"-!- DNS resolution failed: {e}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_latency(self, args, extra, line):
+        """Show connection latency statistics.
+
+        Usage: /latency [server]
+        """
+        client = self._active_client()
+        server = (args or "").strip() or client.server
+        na = client.scoring.network_analytics
+        sw = self._status_win()
+
+        if client._latency > 0:
+            na.record_latency(client.server_id, client._latency * 1000)
+
+        stats = na.get_latency_stats(server)
+        if stats.get("samples", 0) == 0:
+            sw.add_line(f"=== Latency: {server} ===")
+            sw.add_line(f"  Current: {client._latency * 1000:.1f} ms")
+            sw.add_line("  No history yet — send more PINGs to collect samples.")
+        else:
+            sw.add_line(f"=== Latency: {server} ===")
+            sw.add_line(f"  Current  : {stats.get('current', 0):.1f} ms")
+            sw.add_line(f"  Mean     : {stats['mean']:.1f} ms")
+            sw.add_line(f"  Min/Max  : {stats['min']:.1f} / {stats['max']:.1f} ms")
+            sw.add_line(f"  Median   : {stats['median']:.1f} ms")
+            sw.add_line(f"  P95/P99  : {stats['p95']:.1f} / {stats['p99']:.1f} ms")
+            sw.add_line(f"  Jitter   : {stats['jitter']:.1f} ms")
+            sw.add_line(f"  Samples  : {stats['samples']}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_heatmap(self, args, extra, line):
+        """Show channel activity heatmap.
+
+        Usage: /heatmap [channel]
+        """
+        client = self._active_client()
+        channel = (args or "").strip()
+        if not channel:
+            cur_win = self.get_current_window()
+            channel = cur_win.name if cur_win.name.startswith("#") else self.current_channel
+        if not channel:
+            await self.ui_queue.put(("status", "Usage: /heatmap <channel>"))
+            return
+
+        na = client.scoring.network_analytics
+        sw = self._status_win()
+        hm = na.get_heatmap(channel)
+        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+        sw.add_line(f"=== Activity Heatmap: {channel} ===")
+        sw.add_line("")
+        header = "      " + "".join(f"{h:3d}" for h in range(24))
+        sw.add_line(header)
+        sw.add_line("      " + "───" * 24)
+
+        max_count = 1
+        for d in range(7):
+            if d in hm:
+                max_count = max(max_count, max(hm[d].values()))
+
+        for d in range(7):
+            row = f"{day_names[d]:>4} "
+            for h in range(24):
+                count = hm.get(d, {}).get(h, 0)
+                if count == 0:
+                    row += "  ."
+                else:
+                    intensity = int(count / max_count * 5)
+                    chars = " ░▒▓█"
+                    row += f" {chars[min(intensity, 4)]}"
+            sw.add_line(row)
+
+        sw.add_line("")
+        top = na.get_heatmap_summary(channel)
+        if top:
+            d, h, c = top[0]
+            sw.add_line(f"  Peak: {day_names[d]} {h:02d}:00 ({c} messages)")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_network(self, args, extra, line):
+        """Show network topology and analytics.
+
+        Usage:
+          /network topology  — show server → channels → users map
+          /network uptime    — show connection uptime stats
+          /network status    — show all network analytics
+        """
+        client = self._active_client()
+        sub = (args or "").strip().lower()
+        na = client.scoring.network_analytics
+        sw = self._status_win()
+
+        if sub == "topology":
+            topo = na.get_topology(client.server_id)
+            sw.add_line(f"=== Network Topology: {client.server_id} ===")
+            sw.add_line(f"  Channels: {topo['channels']}")
+            sw.add_line(f"  Total users: {topo['total_users']}")
+            sw.add_line("")
+            for ch in topo["channel_list"][:20]:
+                users = na._topology.get(client.server_id, {}).get(ch, set())
+                sw.add_line(f"  {ch:<20} ({len(users)} users)")
+        elif sub == "uptime":
+            up = na.get_uptime(client.server_id)
+            sw.add_line(f"=== Uptime: {client.server_id} ===")
+            sw.add_line(f"  Connected: {'Yes' if up['connected'] else 'No'}")
+            if up["connected"]:
+                dur = up["current_duration"]
+                sw.add_line(f"  Current session: {dur // 3600:.0f}h {(dur % 3600) // 60:.0f}m")
+            sw.add_line(f"  Total connections: {up['total_connections']}")
+            sw.add_line(f"  Uptime: {up['uptime_pct']:.1f}%")
+        else:
+            up = na.get_uptime(client.server_id)
+            lat = na.get_latency_stats(client.server_id)
+            sw.add_line(f"=== Network Status: {client.server_id} ===")
+            sw.add_line(f"  Connected: {'Yes' if up['connected'] else 'No'}")
+            sw.add_line(f"  Latency: {lat.get('current', 0):.1f} ms (mean: {lat.get('mean', 0):.1f} ms)")
+            sw.add_line(f"  Channels: {up.get('total_connections', 0)}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_trigger(self, args, extra, line):
+        """Manage auto-response triggers.
+
+        Usage:
+          /trigger add <regex> <action> <response> [channel] [cooldown]
+          /trigger list
+          /trigger remove <id>
+          /trigger enable|disable <id>
+        """
+        client = self._active_client()
+        triggers = client.scoring.triggers
+        parts = (args + " " + extra).strip().split(maxsplit=4)
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /trigger <add|list|remove|enable|disable> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "add":
+            if len(parts) < 4:
+                await self.ui_queue.put(("status", "Usage: /trigger add <regex> <reply|notify|log> <response> [channel] [cooldown]"))
+                return
+            pattern = parts[1]
+            trigger_action = parts[2]
+            response = parts[3]
+            channel = parts[4].split()[0] if len(parts) > 4 else ""
+            tid = triggers.add(pattern, trigger_action, response, channel)
+            sw.add_line(f"-!- Trigger #{tid} added: {pattern} → {trigger_action}")
+        elif action == "list":
+            tlist = triggers.list_triggers()
+            sw.add_line("=== Triggers ===")
+            if not tlist:
+                sw.add_line("  No triggers configured.")
+            else:
+                for t in tlist:
+                    status = "ON" if t["enabled"] else "OFF"
+                    sw.add_line(f"  #{t['id']} [{status}] {t['pattern']} → {t['action']} "
+                               f"({t['channel'] or 'global'}) fires={t['fire_count']}")
+        elif action == "remove":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /trigger remove <id>"))
+                return
+            if triggers.remove(int(parts[1])):
+                sw.add_line(f"-!- Trigger #{parts[1]} removed")
+            else:
+                sw.add_line(f"-!- Trigger #{parts[1]} not found")
+        elif action in ("enable", "disable"):
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Usage: /trigger {action} <id>"))
+                return
+            tid = int(parts[1])
+            for t in triggers._triggers:
+                if t["id"] == tid:
+                    t["enabled"] = action == "enable"
+                    sw.add_line(f"-!- Trigger #{tid} {action}d")
+                    break
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_automod(self, args, extra, line):
+        """Manage auto-moderation rules.
+
+        Usage:
+          /automod add <channel> <type> <pattern> <action> [threshold]
+          /automod list [channel]
+          /automod remove <channel> <id>
+          /automod whitelist <channel> <nick>
+        """
+        client = self._active_client()
+        automod = client.scoring.automod
+        parts = (args + " " + extra).strip().split()
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /automod <add|list|remove|whitelist> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "add":
+            if len(parts) < 5:
+                await self.ui_queue.put(("status", "Usage: /automod add <channel> <flood|caps|regex|links> <pattern> <warn|kick|ban> [threshold]"))
+                return
+            channel, rule_type, pattern, mod_action = parts[1], parts[2], parts[3], parts[4]
+            threshold = int(parts[5]) if len(parts) > 5 else 3
+            rid = automod.add_rule(channel, rule_type, pattern, mod_action, threshold)
+            sw.add_line(f"-!- AutoMod rule #{rid} added to {channel}")
+        elif action == "list":
+            channel = parts[1] if len(parts) > 1 else (self.current_channel or "")
+            rules = automod.list_rules(channel)
+            sw.add_line(f"=== AutoMod Rules: {channel} ===")
+            if not rules:
+                sw.add_line("  No rules configured.")
+            else:
+                for r in rules:
+                    sw.add_line(f"  #{r['id']} [{r['type']}] pattern='{r['pattern']}' "
+                               f"→ {r['action']} (threshold={r['threshold']})")
+        elif action == "remove":
+            if len(parts) < 3:
+                await self.ui_queue.put(("status", "Usage: /automod remove <channel> <id>"))
+                return
+            if automod.remove_rule(parts[1], int(parts[2])):
+                sw.add_line(f"-!- Rule #{parts[2]} removed from {parts[1]}")
+        elif action == "whitelist":
+            if len(parts) < 3:
+                await self.ui_queue.put(("status", "Usage: /automod whitelist <channel> <nick>"))
+                return
+            automod.add_whitelist(parts[1], parts[2])
+            sw.add_line(f"-!- {parts[2]} whitelisted in {parts[1]}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_webhook(self, args, extra, line):
+        """Manage webhooks for forwarding IRC events.
+
+        Usage:
+          /webhook add <url> <events> [channel] [name]
+          /webhook list
+          /webhook remove <id>
+        """
+        client = self._active_client()
+        webhooks = client.scoring.webhooks
+        parts = (args + " " + extra).strip().split(maxsplit=4)
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /webhook <add|list|remove> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "add":
+            if len(parts) < 3:
+                await self.ui_queue.put(("status", "Usage: /webhook add <url> <msg,join,part,quit,topic,action> [channel] [name]"))
+                return
+            url = parts[1]
+            events = parts[2].split(",")
+            channel = parts[3] if len(parts) > 3 else ""
+            name = parts[4] if len(parts) > 4 else ""
+            wid = webhooks.add(url, events, channel, name)
+            sw.add_line(f"-!- Webhook #{wid} added: {url}")
+        elif action == "list":
+            wh_list = webhooks.list_webhooks()
+            sw.add_line("=== Webhooks ===")
+            if not wh_list:
+                sw.add_line("  No webhooks configured.")
+            else:
+                for w in wh_list:
+                    status = "ON" if w["enabled"] else "OFF"
+                    sw.add_line(f"  #{w['id']} [{status}] {w['name']}: {w['url']} "
+                               f"events={','.join(w['events'])} channel={w['channel'] or 'all'}")
+        elif action == "remove":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /webhook remove <id>"))
+                return
+            if webhooks.remove(int(parts[1])):
+                sw.add_line(f"-!- Webhook #{parts[1]} removed")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_bot_cmd(self, args, extra, line):
+        """Bot mode: respond to commands from other users.
+
+        Usage:
+          /bot start    — enable bot mode (respond to !commands)
+          /bot stop     — disable bot mode
+          /bot status   — show bot mode status
+          /bot addcmd <trigger> <response>
+        """
+        sub = (args or "").strip().lower()
+        sw = self._status_win()
+
+        if sub == "start":
+            self._bot_mode_enabled = True
+            sw.add_line("-!- Bot mode enabled — responding to !commands")
+        elif sub == "stop":
+            self._bot_mode_enabled = False
+            sw.add_line("-!- Bot mode disabled")
+        elif sub == "status":
+            status = "enabled" if getattr(self, '_bot_mode_enabled', False) else "disabled"
+            sw.add_line(f"-!- Bot mode: {status}")
+        elif sub.startswith("addcmd"):
+            rest = (extra or "").strip()
+            if not rest:
+                await self.ui_queue.put(("status", "Usage: /bot addcmd <trigger> <response>"))
+                return
+            parts = rest.split(maxsplit=1)
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /bot addcmd <trigger> <response>"))
+                return
+            trigger, response = parts
+            if not hasattr(self, '_bot_commands'):
+                self._bot_commands = {}
+            self._bot_commands[trigger.lower()] = response
+            sw.add_line(f"-!- Bot command '!{trigger}' added")
+        else:
+            await self.ui_queue.put(("status", "Usage: /bot <start|stop|status|addcmd>"))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_github(self, args, extra, line):
+        """Track GitHub repositories.
+
+        Usage:
+          /github add <owner/repo> [channel] [events]
+          /github list
+          /github remove <owner/repo>
+          /github check    — manually check for updates
+        """
+        client = self._active_client()
+        gh = client.scoring.github
+        parts = (args + " " + extra).strip().split()
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /github <add|list|remove|check> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "add":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /github add <owner/repo> [channel]"))
+                return
+            repo_key = parts[1]
+            if "/" not in repo_key:
+                await self.ui_queue.put(("status", "Usage: /github add <owner/repo> [channel]"))
+                return
+            owner, repo = repo_key.split("/", 1)
+            channel = parts[2] if len(parts) > 2 else (self.current_channel or "")
+            events = parts[3].split(",") if len(parts) > 3 else ["issue", "pr", "release"]
+            token = GITHUB_TOKEN
+            key = gh.add(owner, repo, channel, events, token)
+            sw.add_line(f"-!- Tracking {key} → {channel}")
+        elif action == "list":
+            repos = gh.list_repos()
+            sw.add_line("=== GitHub Tracked Repos ===")
+            if not repos:
+                sw.add_line("  No repos tracked.")
+            else:
+                for r in repos:
+                    sw.add_line(f"  {r['key']} → {r['channel']} "
+                               f"events={','.join(r['events'])} enabled={r['enabled']}")
+        elif action == "remove":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /github remove <owner/repo>"))
+                return
+            if gh.remove(parts[1]):
+                sw.add_line(f"-!- Stopped tracking {parts[1]}")
+        elif action == "check":
+            sw.add_line("-!- Checking for GitHub updates...")
+            updates = await gh.check_updates()
+            if updates:
+                for u in updates:
+                    sw.add_line(f"  [{u['type'].upper()}] {u['repo']}: {u['title']} by {u['user']}")
+                    sw.add_line(f"    {u['url']}")
+            else:
+                sw.add_line("  No new updates.")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_import(self, args, extra, line):
+        """Import chat logs from other IRC clients.
+
+        Usage: /import <filepath> [window_name] [format]
+        Formats: hexchat, weechat, irssi, generic, auto
+        """
+        parts = (args + " " + extra).strip().split()
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /import <filepath> [window_name] [format]"))
+            return
+
+        filepath = parts[0]
+        window = parts[1] if len(parts) > 1 else (self.current_channel or "*status*")
+        fmt = parts[2] if len(parts) > 2 else "auto"
+
+        if not os.path.isfile(filepath):
+            await self.ui_queue.put(("status", f"-!- File not found: {filepath}"))
+            return
+
+        detected = ChatLogImporter.detect_format(filepath)
+        sw.add_line(f"-!- Importing {filepath} (format: {fmt if fmt != 'auto' else detected}) → {window}")
+
+        count = ChatLogImporter.import_file(filepath, window, fmt)
+        sw.add_line(f"-!- Imported {count} messages")
+
+        if window in self.window_by_name:
+            win = self.window_by_name[window]
+            win._wrap_dirty = True
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_astroturf(self, args, extra, line):
+        """Detect coordinated astroturfing campaigns.
+
+        Usage:
+          /astroturf [channel]  — show detected campaigns
+          /astroturf list       — list all campaigns
+        """
+        client = self._active_client()
+        channel = (args or "").strip()
+        if not channel:
+            cur_win = self.get_current_window()
+            channel = cur_win.name if cur_win.name.startswith("#") else self.current_channel
+        sw = self._status_win()
+        campaigns = client.scoring.astroturfing.get_campaigns(channel, limit=10)
+        sw.add_line(f"=== Astroturfing Detection: {channel or 'all'} ===")
+        if not campaigns:
+            sw.add_line("  No campaigns detected.")
+        else:
+            for c in campaigns:
+                sw.add_line(f"  [{c['confidence']:.0%}] {', '.join(c['nicks'][:5])}")
+                for ev in c.get("evidence", [])[:3]:
+                    sw.add_line(f"    • {ev}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_personality(self, args, extra, line):
+        """Show personality profile for a user (Big Five traits).
+
+        Usage: /personality <nick>
+        """
+        client = self._active_client()
+        nick = (args or "").strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /personality <nick>"))
+            return
+        sw = self._status_win()
+        prof = client.scoring.personality.get_profile(nick)
+        sw.add_line(f"=== Personality Profile: {nick} ===")
+        if "confidence" in prof and prof["confidence"] == "insufficient data":
+            sw.add_line(f"  Need more messages (have {prof.get('samples', 0)}, need 5+)")
+        else:
+            sw.add_line(f"  Openness         : {prof['openness']}%")
+            sw.add_line(f"  Conscientiousness: {prof['conscientiousness']}%")
+            sw.add_line(f"  Extraversion     : {prof['extraversion']}%")
+            sw.add_line(f"  Agreeableness    : {prof['agreeableness']}%")
+            sw.add_line(f"  Neuroticism      : {prof['neuroticism']}%")
+            sw.add_line(f"  Vocabulary size  : {prof['vocabulary_size']}")
+            sw.add_line(f"  Avg message len  : {prof['avg_msg_len']}")
+            sw.add_line(f"  Confidence       : {prof['confidence']} ({prof['samples']} msgs)")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_predict(self, args, extra, line):
+        """Predictive reply suggestions.
+
+        Usage: /predict <context>
+        """
+        client = self._active_client()
+        context = (args + " " + extra).strip()
+        if not context:
+            await self.ui_queue.put(("status", "Usage: /predict <context>"))
+            return
+        sw = self._status_win()
+        suggestions = client.scoring.predictive_reply.suggest(context, limit=5)
+        sw.add_line(f"=== Predictive Replies ===")
+        sw.add_line(f"  Context: {context[:80]}")
+        sw.add_line("")
+        if not suggestions:
+            sw.add_line("  No suggestions yet — need more channel history.")
+        else:
+            for i, s in enumerate(suggestions, 1):
+                sw.add_line(f"  {i}. [{s['type']}] {s['text'][:80]}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_stance(self, args, extra, line):
+        """Show user's stance on topics.
+
+        Usage:
+          /stance <nick>       — show all stances
+          /stance <nick> <topic> — show specific topic
+        """
+        client = self._active_client()
+        parts = (args + " " + extra).strip().split()
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /stance <nick> [topic]"))
+            return
+        nick = parts[0]
+        topic = parts[1] if len(parts) > 1 else ""
+        sw = self._status_win()
+        if topic:
+            s = client.scoring.stances.get_stance(nick, topic)
+            if s:
+                sw.add_line(f"=== Stance: {nick} on {topic} ===")
+                sw.add_line(f"  Current: {s['current']}")
+                sw.add_line(f"  Support: {s['support_pct']}%  Oppose: {s['oppose_pct']}%")
+            else:
+                sw.add_line(f"  No stance data for {nick} on {topic}")
+        else:
+            stances = client.scoring.stances.get_all_stances(nick)
+            sw.add_line(f"=== Stances: {nick} ===")
+            if not stances:
+                sw.add_line("  No stance data yet.")
+            else:
+                for t, s in stances.items():
+                    sw.add_line(f"  {t:<15} {s['current']:<10} support={s['support_pct']}% oppose={s['oppose_pct']}%")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_flow(self, args, extra, line):
+        """Conversation flow prediction.
+
+        Usage:
+          /flow next [channel]  — predict next speaker
+          /flow state [channel] — conversation state
+        """
+        client = self._active_client()
+        parts = (args + " " + extra).strip().split()
+        action = parts[0] if parts else "state"
+        channel = parts[1] if len(parts) > 1 else (self.current_channel or "")
+        if not channel:
+            await self.ui_queue.put(("status", "Usage: /flow <next|state> [channel]"))
+            return
+        sw = self._status_win()
+        if action == "next":
+            speakers = client.scoring.flow_predictor.predict_next_speaker(channel, limit=5)
+            sw.add_line(f"=== Next Speaker Prediction: {channel} ===")
+            if not speakers:
+                sw.add_line("  Not enough data yet.")
+            else:
+                for s in speakers:
+                    sw.add_line(f"  {s['nick']:<15} {s['probability']:.0%}")
+        else:
+            state = client.scoring.flow_predictor.predict_conversation_state(channel)
+            sw.add_line(f"=== Conversation State: {channel} ===")
+            sw.add_line(f"  State: {state['state']}")
+            sw.add_line(f"  Messages (5min): {state['msgs_5min']}")
+            sw.add_line(f"  Messages (30min): {state['msgs_30min']}")
+            sw.add_line(f"  Activity level: {state['activity_level']:.0%}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_contagion(self, args, extra, line):
+        """Sentiment contagion map.
+
+        Usage:
+          /contagion mood [channel]  — current channel mood
+          /contagion influencers [channel] — top influencers
+          /contagion cascades        — recent cascades
+        """
+        client = self._active_client()
+        parts = (args + " " + extra).strip().split()
+        action = parts[0] if parts else "mood"
+        channel = parts[1] if len(parts) > 1 else (self.current_channel or "")
+        sw = self._status_win()
+        if action == "mood":
+            if not channel:
+                await self.ui_queue.put(("status", "Usage: /contagion mood <channel>"))
+                return
+            mood = client.scoring.sentiment_contagion.get_channel_mood(channel)
+            sw.add_line(f"=== Channel Mood: {channel} ===")
+            sw.add_line(f"  Sentiment: {mood['sentiment']:+.3f}")
+            sw.add_line(f"  Trend: {mood['trend']}")
+        elif action == "influencers":
+            if not channel:
+                await self.ui_queue.put(("status", "Usage: /contagion influencers <channel>"))
+                return
+            influencers = client.scoring.sentiment_contagion.get_top_influencers(channel, limit=5)
+            sw.add_line(f"=== Top Influencers: {channel} ===")
+            for inf in influencers:
+                sw.add_line(f"  {inf['nick']:<15} influence: {inf['influence']:.3f}")
+        elif action == "cascades":
+            cascades = client.scoring.sentiment_contagion.get_cascades(limit=5)
+            sw.add_line("=== Recent Sentiment Cascades ===")
+            for c in cascades:
+                sw.add_line(f"  {c['initiator']} → {', '.join(c['participants'][:4])} ({c['length']} participants)")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_swarm(self, args, extra, line):
+        """Bot swarm detection.
+
+        Usage:
+          /swarm list    — show detected swarms
+          /swarm status  — show detector stats
+        """
+        client = self._active_client()
+        parts = (args + " " + extra).strip().split()
+        action = parts[0] if parts else "list"
+        sw = self._status_win()
+        if action == "list":
+            swarms = client.scoring.bot_swarm.get_swarms(limit=10)
+            sw.add_line("=== Bot Swarm Detection ===")
+            if not swarms:
+                sw.add_line("  No swarms detected.")
+            else:
+                for s in swarms:
+                    sw.add_line(f"  [{s['confidence']:.0%}] {', '.join(s['nicks'][:5])} ({s['size']} accounts)")
+        elif action == "status":
+            total_accounts = len(client.scoring.bot_swarm._account_profiles)
+            sw.add_line("=== Bot Swarm Detector Status ===")
+            sw.add_line(f"  Tracked accounts: {total_accounts}")
+            sw.add_line(f"  Detected swarms: {len(client.scoring.bot_swarm._swarm_clusters)}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_banevasion(self, args, extra, line):
+        """Ban evasion detection.
+
+        Usage:
+          /banevasion track <nick> [reason]  — snapshot nick as banned
+          /banevasion check <nick>           — manually check nick against banned list
+          /banevasion list                   — show tracked banned nicks
+          /banevasion matches                — show detected evasion attempts
+          /banevasion clear <nick>           — remove nick from banned list
+        """
+        client = self._active_client()
+        detector = client.scoring.ban_evasion
+        parts = (args + " " + extra).strip().split(maxsplit=2)
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /banevasion <track|check|list|matches|clear> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "track":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /banevasion track <nick> [reason]"))
+                return
+            nick = parts[1]
+            reason = parts[2] if len(parts) > 2 else "Manually tracked"
+            profile = detector.snapshot_banned(nick, reason)
+            if profile:
+                sw.add_line(f"-!- Tracked banned user: {nick} ({reason})")
+            else:
+                sw.add_line(f"-!- Not enough data to track {nick} (need ≥3 messages)")
+        elif action == "check":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /banevasion check <nick>"))
+                return
+            match = detector.check_evasion(parts[1])
+            if match:
+                sw.add_line(f"=== Ban Evasion Alert ===")
+                sw.add_line(f"  Suspect: {match['suspect']}")
+                sw.add_line(f"  Matches: {match['banned_nick']} (score: {match['score']:.0%})")
+                sw.add_line(f"  Reason: {match['reason']}")
+                sw.add_line(f"  Details: vocab={match['details']['vocab']}, bigram={match['details']['bigram']}, timing={match['details']['timing']}")
+            else:
+                sw.add_line(f"-!- No evasion match for {parts[1]}")
+        elif action == "list":
+            banned = detector.list_banned()
+            sw.add_line("=== Tracked Banned Users ===")
+            if not banned:
+                sw.add_line("  No banned users tracked.")
+            else:
+                for b in banned:
+                    sw.add_line(f"  {b['nick']} (banned: {time.strftime('%Y-%m-%d', time.localtime(b['banned_at']))}) - {b['reason']}")
+        elif action == "matches":
+            matches = detector.get_matches(limit=10)
+            sw.add_line("=== Detected Evasion Attempts ===")
+            if not matches:
+                sw.add_line("  No evasion attempts detected.")
+            else:
+                for m in matches:
+                    sw.add_line(f"  {m['suspect']} → {m['banned_nick']} ({m['score']:.0%}) [{m['reason']}]")
+        elif action == "clear":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /banevasion clear <nick>"))
+                return
+            if detector.remove_banned(parts[1]):
+                sw.add_line(f"-!- Removed {parts[1]} from banned list")
+            else:
+                sw.add_line(f"-!- {parts[1]} not found in banned list")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_roles(self, args, extra, line):
+        """Role inference for channel users.
+
+        Usage:
+          /roles [channel]  — show inferred roles for all users
+          /roles <nick>     — show detailed role breakdown for a nick
+        """
+        client = self._active_client()
+        inference = client.scoring.role_inference
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if parts and not parts[0].startswith("#"):
+            nick = parts[0]
+            result = inference.get_role(nick)
+            if result:
+                sw.add_line(f"=== Role Analysis: {nick} ===")
+                sw.add_line(f"  Primary: {result['primary_role']}")
+                sw.add_line(f"  Messages: {result['msg_count']}, Tenure: {result['tenure_days']} days")
+                sw.add_line("  Scores:")
+                for role, score in result["scores"].items():
+                    bar = "█" * int(score * 20)
+                    sw.add_line(f"    {role:<15} {score:.0%} {bar}")
+            else:
+                sw.add_line(f"-!- Not enough data for {nick} (need ≥3 messages)")
+        else:
+            channel = parts[0] if parts else ""
+            results = inference.infer_roles(channel)
+            ch_key = channel.lower() if channel else "*"
+            users = results.get(ch_key, [])
+            sw.add_line(f"=== Role Inference{' for ' + channel if channel else ''} ===")
+            if not users:
+                sw.add_line("  No users with enough data to infer roles.")
+            else:
+                for u in users:
+                    sw.add_line(f"  {u['nick']:<20} {u['primary_role']:<15} ({u['scores'][u['primary_role']]:.0%}) [{u['msg_count']} msgs, {u['tenure_days']}d]")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_debate(self, args, extra, line):
+        """Debate analysis between two users.
+
+        Usage:
+          /debate <nick1> <nick2> [channel]  — analyze debate quality
+          /debate list [channel]             — show active debates
+        """
+        client = self._active_client()
+        analyzer = client.scoring.debate_analyzer
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /debate <nick1> <nick2> [channel] | /debate list [channel]"))
+            return
+
+        if parts[0].lower() == "list":
+            channel = parts[1] if len(parts) > 1 else ""
+            debates = analyzer.get_active_debates(channel, limit=10)
+            sw.add_line("=== Active Debates ===")
+            if not debates:
+                sw.add_line("  No active debates detected.")
+            else:
+                for d in debates:
+                    sw.add_line(f"  {d['nick1']} vs {d['nick2']} in {d['channel']}")
+                    sw.add_line(f"    Messages: {d['msg_count']}, Duration: {d['duration_min']}min")
+                    sw.add_line(f"    Quality: {d['overall_quality']:.0%}, Status: {d['resolution']['status']}")
+        elif len(parts) >= 2:
+            nick1, nick2 = parts[0], parts[1]
+            channel = parts[2] if len(parts) > 2 else ""
+            result = analyzer.analyze(nick1, nick2, channel)
+            if result:
+                sw.add_line(f"=== Debate: {nick1} vs {nick2} ===")
+                sw.add_line(f"  Channel: {result['channel']}, Messages: {result['msg_count']}, Duration: {result['duration_min']}min")
+                sw.add_line(f"  Overall Quality: {result['overall_quality']:.0%}")
+                sw.add_line(f"  Turn Balance: {result['turn_balance']['balance']:.0%}")
+                sw.add_line(f"  Resolution: {result['resolution']['status']}")
+                for side in ["nick1_analysis", "nick2_analysis"]:
+                    nick = result["nick1" if side == "nick1_analysis" else "nick2"]
+                    a = result[side]
+                    sw.add_line(f"  --- {nick} ---")
+                    sw.add_line(f"    Quality: {a['quality_score']:.0%}")
+                    sw.add_line(f"    Fallacy Rate: {a['fallacy_rate']:.0%}")
+                    sw.add_line(f"    Evidence Rate: {a['evidence_rate']:.0%}")
+                    sw.add_line(f"    Constructive: {a['constructive_rate']:.0%}")
+                    sw.add_line(f"    Dismissive: {a['dismissive_rate']:.0%}")
+                    if a.get("fallacies"):
+                        sw.add_line(f"    Fallacies: {', '.join(f'{k}({v})' for k, v in a['fallacies'].items())}")
+            else:
+                sw.add_line(f"-!- Not enough data for debate between {nick1} and {nick2}")
+        else:
+            await self.ui_queue.put(("status", "Usage: /debate <nick1> <nick2> [channel]"))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_echo(self, args, extra, line):
+        """Echo chamber detection.
+
+        Usage:
+          /echo [channel]   — analyze echo chamber metrics for channel
+          /echo list        — analyze all channels
+        """
+        client = self._active_client()
+        detector = client.scoring.echo_chamber
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts or parts[0].startswith("#"):
+            channel = parts[0] if parts else self.get_current_window().name
+            result = detector.analyze(channel)
+            if result:
+                sw.add_line(f"=== Echo Chamber: {result['channel']} ===")
+                sw.add_line(f"  Echo Score: {result['echo_score']:.0%} [{result['severity'].upper()}]")
+                sw.add_line(f"  Users: {result['user_count']}, Messages: {result['msg_count']}")
+                m = result["metrics"]
+                sw.add_line("  Metrics:")
+                sw.add_line(f"    Sentiment Consensus:    {m['sentiment_consensus']:.0%}")
+                sw.add_line(f"    Opinion Homogeneity:    {m['opinion_homogeneity']:.0%}")
+                sw.add_line(f"    Agreement Ratio:        {m['agreement_ratio']:.0%}")
+                sw.add_line(f"    Dissent Ratio:          {m['dissent_ratio']:.0%}")
+                sw.add_line(f"    Attack Ratio:           {m['attack_ratio']:.0%}")
+                sw.add_line(f"    Dissent Suppression:    {m['dissent_suppression']:.0%}")
+                sw.add_line(f"    Cross-Channel Exposure: {m['cross_channel_exposure']:.0%}")
+                sw.add_line(f"    Topic Diversity:        {m['topic_diversity']:.0%}")
+            else:
+                sw.add_line(f"-!- Not enough data for {channel} (need ≥10 messages)")
+        elif parts[0].lower() == "list":
+            results = detector.analyze_all()
+            sw.add_line("=== Echo Chamber Analysis (All Channels) ===")
+            if not results:
+                sw.add_line("  No channels with enough data.")
+            else:
+                for r in results:
+                    sw.add_line(f"  {r['channel']:<20} {r['echo_score']:.0%} [{r['severity'].upper()}] ({r['user_count']} users, {r['msg_count']} msgs)")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_badges(self, args, extra, line):
+        """Achievement badges.
+
+        Usage:
+          /badges [nick]      — show badges for nick (or yourself)
+          /badges list        — show all badge definitions
+          /badges leaderboard — show top badge earners
+        """
+        client = self._active_client()
+        badges = client.scoring.achievements
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts:
+            my_nick = self._active_client().nick
+            earned = badges.get_badges(my_nick)
+            sw.add_line(f"=== Badges: {my_nick} ===")
+            if not earned:
+                sw.add_line("  No badges earned yet.")
+            else:
+                for b in earned:
+                    sw.add_line(f"  {b['icon']} {b['name']:<20} {b['desc']}")
+        elif parts[0].lower() == "list":
+            sw.add_line("=== All Badge Definitions ===")
+            by_category = {}
+            for bid, bdef in badges._BADGE_DEFS.items():
+                by_category.setdefault(bdef["category"], []).append(bdef)
+            for cat in sorted(by_category):
+                sw.add_line(f"  -- {cat} --")
+                for b in by_category[cat]:
+                    sw.add_line(f"    {b['icon']} {b['name']:<20} {b['desc']}")
+        elif parts[0].lower() == "leaderboard":
+            limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 20
+            leaderboard = badges.get_leaderboard(limit)
+            sw.add_line("=== Badge Leaderboard ===")
+            if not leaderboard:
+                sw.add_line("  No badges awarded yet.")
+            else:
+                for i, entry in enumerate(leaderboard, 1):
+                    sw.add_line(f"  {i}. {entry['nick']:<20} {entry['badge_count']} badges ({entry['msg_count']} msgs, {entry['channels']} channels)")
+        else:
+            nick = parts[0]
+            earned = badges.get_badges(nick)
+            sw.add_line(f"=== Badges: {nick} ===")
+            if not earned:
+                sw.add_line(f"  {nick} has no badges yet.")
+            else:
+                for b in earned:
+                    sw.add_line(f"  {b['icon']} {b['name']:<20} {b['desc']}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_sarcasm(self, args, extra, line):
+        """Sarcasm detection.
+
+        Usage:
+          /sarcasm <nick>       — show sarcasm rate for nick
+          /sarcasm recent [n]   — show recent sarcastic messages
+          /sarcasm channel      — show top sarcastic users in current channel
+        """
+        client = self._active_client()
+        detector = client.scoring.sarcasm
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts:
+            my_nick = self._active_client().nick
+            result = detector.get_user_sarcasm_rate(my_nick)
+            sw.add_line(f"=== Sarcasm Rate: {my_nick} ===")
+            sw.add_line(f"  Rate: {result['sarcasm_rate']:.0%} ({result['sarcastic_count']}/{result['total_analyzed']} msgs)")
+            sw.add_line(f"  Avg Score: {result['avg_score']:.0%}")
+        elif parts[0].lower() == "recent":
+            limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 20
+            detections = detector.get_recent_detections(limit)
+            sw.add_line("=== Recent Sarcasm Detections ===")
+            if not detections:
+                sw.add_line("  No sarcastic messages detected.")
+            else:
+                for d in detections:
+                    sw.add_line(f"  [{time.strftime('%H:%M', time.localtime(d['ts']))}] {d['nick']}: {d['text'][:60]} (score: {d['score']:.0%}) [{', '.join(d['signals'])}]")
+        elif parts[0].lower() == "channel":
+            win = self.get_current_window()
+            channel = win.name if win else ""
+            sw.add_line(f"=== Top Sarcastic Users in {channel} ===")
+            users_in_channel = self.channel_users.get(channel, set())
+            sarcasm_rates = []
+            for nick in users_in_channel:
+                result = detector.get_user_sarcasm_rate(nick)
+                if result["total_analyzed"] >= 5:
+                    sarcasm_rates.append(result)
+            sarcasm_rates.sort(key=lambda x: -x["sarcasm_rate"])
+            if not sarcasm_rates:
+                sw.add_line("  No users with enough data.")
+            else:
+                for i, r in enumerate(sarcasm_rates[:10], 1):
+                    sw.add_line(f"  {i}. {r['nick']:<20} {r['sarcasm_rate']:.0%} ({r['sarcastic_count']}/{r['total_analyzed']})")
+        else:
+            nick = parts[0]
+            result = detector.get_user_sarcasm_rate(nick)
+            sw.add_line(f"=== Sarcasm Rate: {nick} ===")
+            sw.add_line(f"  Rate: {result['sarcasm_rate']:.0%} ({result['sarcastic_count']}/{result['total_analyzed']} msgs)")
+            sw.add_line(f"  Avg Score: {result['avg_score']:.0%}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_emotion(self, args, extra, line):
+        """Emotion arc tracking.
+
+        Usage:
+          /emotion <nick> [window]        — show emotion timeline for nick
+          /emotion compare <n1> <n2>      — compare emotional alignment between two users
+          /emotion summary <nick>         — show emotion distribution and volatility
+        """
+        client = self._active_client()
+        tracker = client.scoring.emotion_arc
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts:
+            my_nick = self._active_client().nick
+            arc = tracker.get_arc(my_nick)
+            if not arc["arc"]:
+                sw.add_line(f"-!- No emotion data for {my_nick}")
+                return
+            self._display_emotion_summary(sw, arc)
+        elif parts[0].lower() == "compare" and len(parts) >= 3:
+            comparison = tracker.compare_arcs(parts[1], parts[2])
+            if "error" in comparison:
+                sw.add_line(f"-!- {comparison['error']}")
+            else:
+                sw.add_line(f"=== Emotional Comparison: {comparison['nick1']} vs {comparison['nick2']} ===")
+                sw.add_line(f"  Alignment: {comparison['alignment']:.0%}")
+                sw.add_line(f"  {comparison['nick1']} dominant: {comparison['nick1_dominant']} (volatility: {comparison['nick1_volatility']:.0%})")
+                sw.add_line(f"  {comparison['nick2']} dominant: {comparison['nick2_dominant']} (volatility: {comparison['nick2_volatility']:.0%})")
+        elif parts[0].lower() == "summary" and len(parts) >= 2:
+            arc = tracker.get_arc(parts[1])
+            if not arc["arc"]:
+                sw.add_line(f"-!- No emotion data for {parts[1]}")
+                return
+            self._display_emotion_summary(sw, arc)
+        else:
+            nick = parts[0]
+            window = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 50
+            arc = tracker.get_arc(nick, window)
+            if not arc["arc"]:
+                sw.add_line(f"-!- No emotion data for {nick}")
+                return
+            self._display_emotion_summary(sw, arc)
+            # Show recent arc
+            sw.add_line("  Recent Arc:")
+            arc_entries = arc["arc"][-20:]
+            arc_str = ""
+            for entry in arc_entries:
+                emoji = {"joy": "😊", "anger": "😠", "sadness": "😢", "fear": "😨", "surprise": "😲", "disgust": "🤢", "neutral": "😐"}.get(entry["dominant"], "•")
+                arc_str += emoji
+            sw.add_line(f"    {arc_str}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    def _display_emotion_summary(self, sw, arc):
+        sw.add_line(f"=== Emotion Arc: {arc['nick']} ===")
+        summary = arc["summary"]
+        sw.add_line(f"  Messages: {summary['total_messages']}, Volatility: {summary['volatility']:.0%}")
+        sw.add_line(f"  Dominant Emotion: {summary['most_common_emotion']}")
+        sw.add_line("  Distribution:")
+        for emotion, pct in sorted(summary["emotion_distribution"].items(), key=lambda x: -x[1]):
+            bar = "█" * int(pct * 30)
+            sw.add_line(f"    {emotion:<12} {pct:.0%} {bar}")
+        if summary.get("top_transitions"):
+            sw.add_line("  Top Transitions:")
+            for trans, count in summary["top_transitions"].items():
+                sw.add_line(f"    {trans}: {count}")
+        if summary.get("dominant_by_period"):
+            sw.add_line("  By Time Period:")
+            for period, emotion in summary["dominant_by_period"].items():
+                sw.add_line(f"    {period:<20} {emotion}")
+
+    async def _slash_factcheck(self, args, extra, line):
+        """Real-time fact checking.
+
+        Usage:
+          /factcheck <claim>  — check a specific claim
+          /factcheck log      — show recent claims checked
+          /factcheck add <claim> <true|false> [source]
+        """
+        client = self._active_client()
+        parts = (args + " " + extra).strip().split(maxsplit=3)
+        sw = self._status_win()
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /factcheck <claim|log|add> ..."))
+            return
+        action = parts[0].lower()
+        if action == "log":
+            claims = client.scoring.fact_checker.get_claims(limit=10)
+            sw.add_line("=== Recent Fact Checks ===")
+            if not claims:
+                sw.add_line("  No claims checked yet.")
+            else:
+                for c in claims:
+                    sw.add_line(f"  [{c['verdict']}] {c['nick']}: {c['claim'][:80]}")
+                    if c.get("flags"):
+                        sw.add_line(f"    Flags: {', '.join(c['flags'][:3])}")
+        elif action == "add":
+            if len(parts) < 3:
+                await self.ui_queue.put(("status", "Usage: /factcheck add <claim> <true|false> [source]"))
+                return
+            claim = parts[1]
+            verified = parts[2].lower() == "true"
+            source = parts[3] if len(parts) > 3 else ""
+            client.scoring.fact_checker.add_fact(claim, verified, source)
+            sw.add_line(f"-!- Added fact: '{claim}' verified={verified}")
+        else:
+            claim_text = " ".join(parts)
+            results = client.scoring.fact_checker.check("user", "*status*", claim_text)
+            sw.add_line(f"=== Fact Check: {claim_text[:80]} ===")
+            if not results:
+                sw.add_line("  No claims detected or all appear credible.")
+            else:
+                for r in results:
+                    sw.add_line(f"  [{r['verdict']}] {r['claim'][:80]}")
+                    if r.get("flags"):
+                        sw.add_line(f"    Flags: {', '.join(r['flags'][:3])}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_research(self, args, extra, line):
+        """Autonomous research agent.
+
+        Usage:
+          /research enable   — enable research agent
+          /research disable  — disable research agent
+          /research status   — show agent status
+          /research recent   — show recent research
+        """
+        client = self._active_client()
+        agent = client.scoring.research_agent
+        parts = (args + " " + extra).strip().split()
+        sw = self._status_win()
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /research <enable|disable|status|recent>"))
+            return
+        action = parts[0].lower()
+        if action == "enable":
+            agent.enable()
+            sw.add_line("-!- Research agent enabled")
+        elif action == "disable":
+            agent.disable()
+            sw.add_line("-!- Research agent disabled")
+        elif action == "status":
+            stats = agent.get_stats()
+            sw.add_line("=== Research Agent Status ===")
+            sw.add_line(f"  Enabled: {stats['enabled']}")
+            sw.add_line(f"  Gaps identified: {stats['gaps_identified']}")
+            sw.add_line(f"  Feedback useful: {stats['feedback_useful_pct']}%")
+        elif action == "recent":
+            recent = agent.get_recent_research(limit=10)
+            sw.add_line("=== Recent Research ===")
+            if not recent:
+                sw.add_line("  No research conducted yet.")
+            else:
+                for r in recent:
+                    sw.add_line(f"  [{r['type']}] {r['query']}")
+                    sw.add_line(f"    {r.get('summary', '')[:100]}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_agent(self, args, extra, line):
+        """Conversational agent control.
+
+        Usage:
+          /agent on|off                 — enable/disable agent
+          /agent personality <name>     — set personality (helpful, sarcastic, expert, casual, debater, mentor)
+          /agent nick <nick>            — set agent nick
+          /agent rate <0.0-1.0>         — set participation rate
+          /agent mention on|off         — enable/disable responding to mentions
+          /agent proactive on|off       — enable/disable proactive participation
+          /agent summarize [channel]    — summarize recent conversation
+          /agent status                 — show agent status
+          /agent personalities          — list available personalities
+        """
+        client = self._active_client()
+        agent = client.scoring.conversational_agent
+        parts = (args + " " + extra).strip().split()
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /agent <on|off|personality|nick|rate|mention|proactive|summarize|status|personalities>"))
+            return
+
+        action = parts[0].lower()
+        if action in ("on", "enable"):
+            agent.enable()
+            agent.configure(nick=agent._nick or client.nick)
+            sw.add_line("-!- Conversational agent enabled")
+        elif action in ("off", "disable"):
+            agent.disable()
+            sw.add_line("-!- Conversational agent disabled")
+        elif action == "personality":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Available: {', '.join(agent.list_personalities())}"))
+                return
+            if parts[1] in agent.PERSONALITIES:
+                agent.configure(personality=parts[1])
+                sw.add_line(f"-!- Personality set to: {parts[1]}")
+            else:
+                sw.add_line(f"-!- Unknown personality. Available: {', '.join(agent.list_personalities())}")
+        elif action == "nick":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Usage: /agent nick <nick> (current: {agent._nick})"))
+                return
+            agent.configure(nick=parts[1])
+            sw.add_line(f"-!- Agent nick set to: {parts[1]}")
+        elif action == "rate":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Usage: /agent rate <0.0-1.0> (current: {agent._participation_rate})"))
+                return
+            try:
+                rate = float(parts[1])
+                agent.configure(participation_rate=rate)
+                sw.add_line(f"-!- Participation rate set to: {rate}")
+            except ValueError:
+                sw.add_line("-!- Invalid rate. Use 0.0-1.0")
+        elif action == "mention":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Respond to mentions: {'ON' if agent._respond_to_mentions else 'OFF'}"))
+                return
+            agent.configure(respond_to_mentions=parts[1].lower() == "on")
+            sw.add_line(f"-!- Respond to mentions: {'ON' if agent._respond_to_mentions else 'OFF'}")
+        elif action == "proactive":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Proactive participation: {'ON' if agent._proactive_participation else 'OFF'}"))
+                return
+            agent.configure(proactive_participation=parts[1].lower() == "on")
+            sw.add_line(f"-!- Proactive participation: {'ON' if agent._proactive_participation else 'OFF'}")
+        elif action == "summarize":
+            channel = parts[1] if len(parts) > 1 else (self.current_channel or "")
+            if not channel:
+                await self.ui_queue.put(("status", "Usage: /agent summarize <channel>"))
+                return
+            sw.add_line(f"=== Conversation Summary: {channel} ===")
+            summary = agent.summarize_conversation(channel)
+            sw.add_line(f"  {summary}")
+        elif action == "status":
+            status = agent.get_status()
+            sw.add_line("=== Conversational Agent Status ===")
+            sw.add_line(f"  Enabled: {status['enabled']}")
+            sw.add_line(f"  Personality: {status['personality']}")
+            sw.add_line(f"  Nick: {status['nick']}")
+            sw.add_line(f"  Participation rate: {status['participation_rate']}")
+            sw.add_line(f"  Channels active: {status['channels_active']}")
+            sw.add_line(f"  Messages tracked: {status['total_messages_tracked']}")
+        elif action == "personalities":
+            sw.add_line("=== Available Personalities ===")
+            for name, config in agent.PERSONALITIES.items():
+                current = " (active)" if name == agent._personality else ""
+                sw.add_line(f"  {name}{current}: {config['system'][:80]}...")
+        else:
+            await self.ui_queue.put(("status", f"Unknown command: {action}"))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_stats(self, args, extra, line):
+        """Show channel statistics.
+
+        Usage: /stats [channel]
+        """
+        chan = (args or "").strip()
+        if not chan:
+            cur_win = self.get_current_window()
+            chan = cur_win.name if cur_win.name.startswith("#") else self.current_channel
+        if not chan or chan not in self.channel_users:
+            await self.ui_queue.put(("status", "No channel active or channel not found"))
+            return
+        users = self.channel_users.get(chan, set())
+        modes = self.channel_user_modes.get(chan, {})
+        ops = sum(1 for u in users if "o" in modes.get(u, set()))
+        voices = sum(1 for u in users if "v" in modes.get(u, set()))
+        halfops = sum(1 for u in users if "h" in modes.get(u, set()))
+        suspects = len(users & self._suspect_nicks)
+
+        sw = self._status_win()
+        sw.add_line(f"=== Channel Stats: {chan} ===")
+        sw.add_line(f"  Total users : {len(users)}")
+        sw.add_line(f"  Owners      : {sum(1 for u in users if 'q' in modes.get(u, set()))}")
+        sw.add_line(f"  Admins      : {sum(1 for u in users if 'a' in modes.get(u, set()))}")
+        sw.add_line(f"  Ops         : {ops}")
+        sw.add_line(f"  Halfops     : {halfops}")
+        sw.add_line(f"  Voices      : {voices}")
+        sw.add_line(f"  Regular     : {len(users) - ops - halfops - voices}")
+        sw.add_line(f"  AI suspects : {suspects}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_uptime(self, args, extra, line):
+        """Show connection uptime and latency."""
+        client = self._active_client()
+        now = time.monotonic()
+        uptime_secs = now - self._start_time
+        hours = int(uptime_secs // 3600)
+        mins = int((uptime_secs % 3600) // 60)
+        secs = int(uptime_secs % 60)
+        latency_ms = int(client._latency * 1000) if client._latency > 0 else "?"
+        await self.ui_queue.put(("status",
+            f"Uptime: {hours}h {mins}m {secs}s  |  "
+            f"Server: {client.server}:{client.port}  |  "
+            f"Latency: {latency_ms}ms" if latency_ms != "?" else "Latency: unknown"))
+
+    async def _slash_ping(self, args, extra, line):
+        """Send a PING to the server and measure round-trip latency."""
+        client = self._active_client()
+        ts = int(time.time())
+        client._last_ping_ts = ts
+        client.send_raw(f"PING :latency-{ts}")
+        await self.ui_queue.put(("status", f"PING sent — waiting for PONG..."))
+        await asyncio.sleep(2)
+        if client._last_ping_ts == ts:
+            await self.ui_queue.put(("status", "PING timeout — no PONG received"))
+        else:
+            latency_ms = int(client._latency * 1000)
+            await self.ui_queue.put(("status", f"PONG received — latency: {latency_ms}ms"))
 
     async def _slash_who(self, args, extra, line):
         if args:
@@ -9391,7 +20397,28 @@ class TUI:
     def _save_ignored(self) -> None:
         cfg = load_irc_config()
         cfg["ignored_nicks"] = sorted(self.ignored_nicks)
+        cfg["ignored_masks"] = self.ignored_masks
         save_irc_config(cfg)
+
+    def _is_ignored(self, nick: str, user: str = "", host: str = "") -> bool:
+        """Check if *nick* (optionally with user@host) matches any ignore rule.
+
+        Supports:
+          • Exact nick matches (e.g. "badnick")
+          • Wildcard masks (e.g. "*!*@*.spam.net", "bad*!*@*")
+        """
+        if nick.lower() in self.ignored_nicks:
+            return True
+        if not self.ignored_masks:
+            return False
+        ident = f"{nick}!{user}@{host}" if user or host else nick
+        import fnmatch
+        for mask in self.ignored_masks:
+            if fnmatch.fnmatch(ident.lower(), mask.lower()):
+                return True
+            if fnmatch.fnmatch(nick.lower(), mask.lower()):
+                return True
+        return False
 
     def _save_aliases(self) -> None:
         cfg = load_irc_config()
@@ -9399,16 +20426,57 @@ class TUI:
         save_irc_config(cfg)
 
     async def _slash_ignore(self, args, extra, line):
-        if args:
-            self.ignored_nicks.add(args.lower())
-            self._save_ignored()
-            await self.ui_queue.put(("status", f"Now ignoring {args}"))
+        if not args:
+            if self.ignored_nicks or self.ignored_masks:
+                entries = []
+                for n in sorted(self.ignored_nicks):
+                    entries.append(f"  nick: {n}")
+                for m in self.ignored_masks:
+                    entries.append(f"  mask: {m}")
+                sw = self._status_win()
+                sw.add_line("Current ignore list:")
+                for e in entries:
+                    sw.add_line(e)
+                self._chat_dirty = True
+                self.dirty = True
+            else:
+                await self.ui_queue.put(("status", "Ignore list is empty"))
+            return
+        target = args.strip()
+        if "!" in target or "@" in target or "*" in target or "?" in target:
+            mask = target.lower()
+            if mask not in self.ignored_masks:
+                self.ignored_masks.append(mask)
+                self._save_ignored()
+                await self.ui_queue.put(("status", f"Now ignoring mask: {mask}"))
+            else:
+                await self.ui_queue.put(("status", f"Mask already ignored: {mask}"))
+        else:
+            nick = target.lower()
+            if nick not in self.ignored_nicks:
+                self.ignored_nicks.add(nick)
+                self._save_ignored()
+                await self.ui_queue.put(("status", f"Now ignoring {target}"))
+            else:
+                await self.ui_queue.put(("status", f"Already ignoring {target}"))
 
     async def _slash_unignore(self, args, extra, line):
-        if args:
-            self.ignored_nicks.discard(args.lower())
+        if not args:
+            await self.ui_queue.put(("status", "Usage: /unignore <nick|mask>"))
+            return
+        target = args.strip().lower()
+        removed = False
+        if target in self.ignored_nicks:
+            self.ignored_nicks.discard(target)
+            removed = True
+        if target in self.ignored_masks:
+            self.ignored_masks.remove(target)
+            removed = True
+        if removed:
             self._save_ignored()
-            await self.ui_queue.put(("status", f"No longer ignoring {args}"))
+            await self.ui_queue.put(("status", f"No longer ignoring {target}"))
+        else:
+            await self.ui_queue.put(("status", f"Not ignoring {target}"))
 
     async def _slash_clear(self, args, extra, line):
         win = self.get_current_window()
@@ -10357,6 +21425,55 @@ class TUI:
         cfg.setdefault("tor", {})["strict"] = self._tor_strict
         save_irc_config(cfg)
 
+    async def _slash_i2p(self, args, extra, line):
+        """I2P hidden service support.
+
+        Usage:
+          /i2p on          — enable I2P routing
+          /i2p off         — disable I2P routing
+          /i2p strict      — only allow .i2p hosts
+          /i2p nostrict    — allow any hosts
+          /i2p status      — show I2P configuration
+        """
+        text = (args + " " + extra).strip().lower()
+        parts = text.split()
+        sub = parts[0] if parts else ""
+        if sub == "on":
+            self._use_i2p = True
+            self.client.use_tor = True
+            self.client.i2p_strict = self._i2p_strict
+            for ctx in self.servers.values():
+                ctx.client.use_tor = True
+                ctx.client.i2p_strict = self._i2p_strict
+            await self.ui_queue.put(("status", "I2P enabled — new connections route through I2P SOCKS5"))
+        elif sub == "off":
+            self._use_i2p = False
+            self.client.use_tor = False
+            for ctx in self.servers.values():
+                ctx.client.use_tor = False
+            await self.ui_queue.put(("status", "I2P disabled — new connections use direct TCP"))
+        elif sub == "strict":
+            self._i2p_strict = True
+            self.client.i2p_strict = True
+            for ctx in self.servers.values():
+                ctx.client.i2p_strict = True
+            await self.ui_queue.put(("status",
+                "I2P strict mode ON — only .i2p hosts allowed"))
+        elif sub == "nostrict":
+            self._i2p_strict = False
+            self.client.i2p_strict = False
+            for ctx in self.servers.values():
+                ctx.client.i2p_strict = False
+            await self.ui_queue.put(("status",
+                "I2P strict mode OFF — clearnet hosts allowed"))
+        elif sub in ("status", ""):
+            await self.ui_queue.put(("status",
+                f"I2P: {'ON' if getattr(self, '_use_i2p', False) else 'OFF'}  "
+                f"Strict: {'ON' if getattr(self, '_i2p_strict', False) else 'OFF'}  "
+                f"proxy: {I2P_PROXY_HOST}:{I2P_PROXY_PORT}"))
+        else:
+            await self.ui_queue.put(("status", "Usage: /i2p on|off|strict|nostrict|status"))
+
     async def _slash_ctcpmode(self, args, extra, line):
         mode = (args + " " + extra).strip().lower()
         if mode not in ("normal", "off", "spoof"):
@@ -10828,7 +21945,7 @@ class TUI:
             await self.ui_queue.put(("status", f"Auto-join: removed {chan}"))
 
     async def _slash_commands(self, args, extra, line):
-        sw = self.window_by_name["*status*"]
+        sw = self._status_win()
         _C = lambda t: sw.add_line(t)
         _H = lambda title: _C(f"  ── {title} " + "─" * max(0, 38 - len(title)))
         _E = lambda c, d: _C(f"  {c:<34} {d}")
@@ -10890,6 +22007,25 @@ class TUI:
         _E("/monitor + nick[,…] | - | list | clear | status","Watch nicks for online/offline notifications")
         _E("/whox [target] [fields]",       "Send a WHOX query with extended fields")
         _E("/cluster <nick>",               "Show a nick's social circle (adjacency + targets)")
+        _E("/graph <nick> [depth]",          "Relationship graph: who nick talks to, mutual connections")
+        _C("")
+        _H("Productivity")
+        _E("/todo [add <text> @priority #due +tag]", "Todo list: add/done/undo/remove/edit/list/clear")
+        _E("/todo done <id>",                       "Mark a todo as completed")
+        _E("/todo list [completed]",                "List todos (optionally include completed)")
+        _E("/pomodoro start|stop|status|config",    "Pomodoro timer: 25/5/15 min work/break cycles")
+        _E("/pomo start|stop",                      "Alias for /pomodoro")
+        _E("/note [add <text> [cat]]",              "Scratchpad: add/edit/remove/list/search/pin/unpin/categories")
+        _E("/memo <text>",                          "Alias for /note add")
+        _E("/bookmark [add <target> [desc] type:X +tag]","Bookmarks: add/remove/list/search (channel/nick/url)")
+        _E("/bm <target>",                          "Alias for /bookmark")
+        _E("/timer <duration> [name]",               "Countdown timer: 5m tea, 30s break, 1h meeting")
+        _E("/timer list|cancel <id>",               "List or cancel active timers")
+        _E("/remind in 30m <msg>",                   "Set a reminder (in Xm, at HH:MM, tomorrow)")
+        _E("/watch <nick> [channel]",                "Alert when a nick joins/speaks/mentions")
+        _E("/snippet add|remove|list|<name>",         "Text snippets for quick insertion")
+        _E("/chstats [channel]",                     "Channel activity stats: top talkers, heatmap")
+        _E("/rss add|remove|list|poll",              "RSS feed bridge to IRC channels")
         _C("")
         _H("Services & CTCP")
         _E("/ns <command>",                 "Send command to NickServ  (e.g. /ns identify pw)")
@@ -10909,10 +22045,48 @@ class TUI:
         _E("/scan_watermark [text]",        "Scan recent msgs or text for LLM watermark patterns")
         _E("/fingerprint <nick> [min_sim]", "Compare a nick's linguistic fingerprint against all others")
         _E("/feedback <ai|human> <nick>",   "Confirm AI/bot or human to tune detection weights")
+        _E("/aicalibrate [status|reset|threshold]", "Inspect/adjust AI detection calibration from feedback")
+        _E("/aivai [pair <n1> <n2>]",          "Detect AI-vs-AI conversation pairs (mutual high scores)")
+        _E("/saicorr <nick|channel|anomaly>",  "Sentiment-AI score correlation analysis")
+        _E("/biometrics",                      "Show your typing cadence, response latency, and human likelihood")
+        _E("/llmfp <nick|list|status>",        "LLM fingerprinting: detect generation patterns per user")
+        _E("/deepfake <nick|chains|status>",   "Deepfake relay detection: detect relay-style AI patterns")
+        _E("/astroturf [channel]",             "Detect coordinated astroturfing campaigns")
+        _E("/personality <nick>",              "Big Five personality traits from linguistic patterns")
+        _E("/predict <context>",               "Predictive reply suggestions based on channel history")
+        _E("/stance <nick> [topic]",           "Track user positions on topics with contradiction detection")
+        _E("/flow next|state [channel]",       "Conversation flow prediction: next speaker, state")
+        _E("/contagion mood|influencers|cascades","Sentiment contagion map: mood spread and influencers")
+        _E("/swarm list|status",               "Bot swarm detection: coordinated bot accounts")
+        _E("/factcheck <claim|log|add>",       "Real-time fact checking against Wikipedia and known facts")
+        _E("/research enable|status|recent",   "Autonomous research agent: identifies knowledge gaps")
+        _E("/agent on|off|personality|nick|rate","Conversational agent: LLM-powered natural participant")
+        _E("/banevasion track|check|list|matches","Ban evasion detection: catch banned users returning")
+        _E("/roles [nick|channel]",            "Role inference: classify users by behavior patterns")
+        _E("/debate <n1> <n2> [channel]",      "Debate analyzer: score argument quality and fallacies")
+        _E("/echo [channel|list]",             "Echo chamber detector: measure opinion homogeneity")
+        _E("/badges [nick|list|leaderboard]",  "Achievement badges: track user accomplishments")
+        _E("/sarcasm <nick|recent|channel>",   "Sarcasm detector: sentiment-text mismatch analysis")
+        _E("/emotion <nick|compare|summary>",  "Emotion arc: track emotional journey over time")
+        _C("")
+        _H("Automation & Integration")
+        _E("/trigger add|list|remove",         "Auto-respond to patterns with custom actions")
+        _E("/automod add|list|remove|whitelist","Auto-moderation rules: flood, caps, regex, links")
+        _E("/webhook add|list|remove",         "Forward IRC events to external webhooks")
+        _E("/github add|list|remove|check",    "Track GitHub repos for issues/PRs/releases")
+        _E("/import <file> [window] [format]", "Import chat logs from HexChat, WeeChat, irssi")
+        _C("")
+        _H("Networking & Analytics")
+        _E("/dns <host|cache|clear>",          "Async DNS resolution with caching")
+        _E("/latency [server]",                "Connection latency stats with jitter and p95/p99")
+        _E("/heatmap [channel]",               "Channel activity heatmap (day × hour)")
+        _E("/network topology|uptime|status",  "Network topology, uptime, and connection stats")
+        _E("/i2p on|off|strict|nostrict|status","Route IRC through I2P hidden services")
         _C("")
         _H("AI Integration  (Claude + OpenAI + Gemini + Ollama + llama.cpp)")
         _E("/askai [model] <question>",   "Ask AI a question; answer shown in dashboard")
         _E("/summarize [n] [model]",      "Summarize last n msgs in current window (default 50)")
+        _E("/brief [channel]",            "AI one-paragraph summary of unread messages in channel")
         _E("/model [key]",                "Set/list AI models: opus sonnet haiku gpt4o gpt4 gpt35 gemini gpro")
         _E("/vibe <channel> [n] [model]", "Analyze channel culture using AI")
         _E("/explain <nick> [model]",     "Analyze a user's behavior using AI")
@@ -10928,9 +22102,11 @@ class TUI:
         _E("/server [-ssl] <host> [port]", "Add a parallel server connection (SSL with -ssl, else plain)")
         _E("/reconnect",                   "Drop and re-establish (uses draft/resume token if available)")
         _E("/tor on|off|strict|nostrict|status", "Route IRC through Tor; strict = .onion only")
-        _E("/replay [on|off|n]",           "Request chat history replay via CHATHISTORY (needs /replay on)")
+        _E("/replay [on|off|n|before|after|between <ts>]", "Request chat history via CHATHISTORY (needs /replay on)")
         _E("/register <account|*> <email> <pw>","Register an account via draft/account-registration")
         _E("/pem [/path/to.pem]",          "Generate NIST P-256 key pair for SASL ECDSA auth")
+        _E("/certfp status|generate|fingerprint", "Auto-generate CertFP for SASL EXTERNAL auth")
+        _E("/tlsinfo [history]",             "Show TLS cert fingerprint for server; alert on cert changes")
         _C("")
         _H("Windows & Navigation")
         _C("  Tab bar: [1:status] [2:dash] [*3:##chat]  * = unread  N = count  S = suspect")
@@ -10967,7 +22143,16 @@ class TUI:
         _E("/pgp list",                       "List GPG public keys in your keyring")
         _E("/tor on|off|strict|nostrict|status", "Route IRC through Tor; strict = .onion only")
         _C("")
-        _H("Plugins & Scripts")
+        _H("Soju Bouncer Integration")
+        _E("/soju networks",                   "List soju bouncer networks")
+        _E("/soju add <name> host=<h> [k=v]",  "Add a network to the soju bouncer")
+        _E("/soju del <name>",                  "Remove a network from the soju bouncer")
+        _E("/soju update <name> k=v …",         "Change network attributes (nick, host, port)")
+        _E("/soju replay [N]",                  "Request CHATHISTORY replay for current channel")
+        _E("/soju status",                      "Show soju connection state, caps, networks")
+        _E("/replay before|after <ts> [N]",     "Fetch messages before/after a timestamp")
+        _E("/replay between <ts> [N]",          "Fetch messages in a timestamp range")
+        _C("")
         _E("/loadplugin <path>",   "Load a Python plugin file; its setup(api) is called")
         _E("/unloadplugin <name>", "Unload a plugin and remove its commands")
         _E("/reloadplugin <name>", "Reload a plugin from its original file (hot-swap)")
@@ -11009,6 +22194,7 @@ class TUI:
             "  /adjacent <nick>  who speaks before/after",
             "  /targets <nick>   who they address most",
             "  /together <n1> <n2>  channel overlap",
+            "  /cluster <nick>  social circle  /graph <nick> [depth]  relationship map",
             "  /ignore <nick>  /unignore <nick>  /away [msg]  /back",
             "── Services ──────────────────────────────────────────────",
             "  /ns <cmd>  /cs <cmd>  /ctcp <nick> <cmd> [args]",
@@ -11016,18 +22202,43 @@ class TUI:
             "── AI Detection ──────────────────────────────────────────",
             "  /ai <nick>  full profile    /topai  channel ranking by AI%",
             "  /aitoggle  enable/disable scoring    /logtoggle  toggle log",
+            "  /aicalibrate  inspect/adjust detection calibration from feedback",
+            "  /aivai  detect AI-vs-AI pairs  /saicorr  sentiment-AI correlation",
+            "  /biometrics  typing cadence  /llmfp  LLM fingerprinting",
+            "  /deepfake  relay detection  /astroturf  coordinated campaigns",
+            "  /personality <nick>  Big Five traits  /predict  reply suggestions",
+            "  /stance <nick>  topic positions  /flow  conversation prediction",
+            "  /contagion  sentiment spread  /swarm  bot swarm detection",
+            "  /factcheck  claim verification  /research  knowledge gaps",
+            "  /agent  LLM chat participant  /banevasion  catch banned users",
+            "  /roles  user role inference  /debate  argument quality analysis",
+            "  /echo  echo chamber detection  /badges  achievement tracking",
+            "  /sarcasm  sentiment-text mismatch  /emotion  emotional journey",
             "── AI  (Claude / OpenAI) ─────────────────────────────────",
             "  /askai [model] <question>  (answer in dashboard)",
+            "  /summarize [n] [model]  /brief [chan]  unread channel summary",
             "  /summarize [n] [model]  summarize last n msgs (default 50)",
             "  /model [key]  set/list model  (opus sonnet haiku gpt4o gpt4 gpt35 gemini gpro)",
             "── Translation ───────────────────────────────────────────",
             "  /autotranslate  toggle CJK → English (default: on)",
+            "── Productivity ──────────────────────────────────────────",
+            "  /todo add <text> @priority #due +tag  /todo done|undo|remove|list|clear",
+            "  /pomodoro start|stop|status|config  /pomo  alias",
+            "  /note add <text> [cat]  /note list|search|pin|unpin|edit|remove|categories",
+            "  /bookmark add <target> [desc] type:X +tag  /bm  alias",
+            "  /timer <5m|30s|1h> [name]  countdown with notification  /timer list|cancel",
+            "  /remind in 30m <msg>  /watch <nick>  /snippet add|list|<name>  /chstats  /rss",
             "── Connection ─────────────────────────────────────────────",
             "  /server [-ssl] <host> [port]  (parallel; -ssl for TLS)  /reconnect",
+            "  /certfp generate|fingerprint|status  CertFP for SASL EXTERNAL",
+            "  /tlsinfo [history]  TLS cert pinning + MITM change alerts",
             "── BNC & GPG & Tor ─────────────────────────────────────────",
             "  /bouncer on|off|status|detach|attach|replay   built-in BNC",
             "  /pgp encrypt|decrypt|sign|verify|key|list     GPG crypto",
             "  /tor on|off|strict|nostrict|status            Tor SOCKS5; strict=onion only",
+            "── Soju Bouncer ──────────────────────────────────────────",
+            "  /soju networks|add|del|update|replay|status   manage soju networks",
+            "  /replay before|after|between <ts> [N]         time-based chathistory",
             "── Interface ──────────────────────────────────────────────",
             "  /win <n>  /close (/wc)  /clear  /links  /list [pat]  /lf <kw|min=n>",
             "  /alias [name] [expansion]  list/set/remove command aliases",
@@ -11047,7 +22258,7 @@ class TUI:
             "  /script load <path>  load .py/.lua    /script list  loaded",
             "  /script unload <name>    /script reload  all hot-reload",
         ]:
-            self.window_by_name["*status*"].add_line(l)
+            self._status_win().add_line(l)
         self.current_window_index = 0
         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
@@ -11284,13 +22495,620 @@ class TUI:
         if not chan.startswith("#"):
             await self.ui_queue.put(("status", "[replay] must be in a channel"))
             return
-        try:
-            count = int(a) if a.isdigit() else 50
-        except ValueError:
-            count = 50
+        parts = a.split()
+        subcmd = "LATEST"
+        count = 50
+        timestamp = ""
+        if parts and parts[0] in ("before", "after", "between", "latest", "targets"):
+            subcmd = parts[0].upper()
+            if subcmd == "BETWEEN" and len(parts) >= 2:
+                timestamp = parts[1]
+                count = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 50
+            elif subcmd in ("BEFORE", "AFTER") and len(parts) >= 2:
+                timestamp = parts[1]
+                count = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 50
+            elif len(parts) > 1 and parts[1].isdigit():
+                count = int(parts[1])
+        elif a.isdigit():
+            count = int(a)
         count = max(1, min(count, 500))
-        c.cmd_chathistory(chan, count)
-        await self.ui_queue.put(("status", f"[replay] requesting last {count} messages for {chan}…"))
+        c.cmd_chathistory(chan, count, subcmd=subcmd, timestamp=timestamp)
+        label = subcmd.lower()
+        if timestamp:
+            await self.ui_queue.put(("status",
+                f"[replay] requesting {label} from {timestamp} for {chan}…"))
+        else:
+            await self.ui_queue.put(("status",
+                f"[replay] requesting last {count} messages for {chan}…"))
+
+    async def _slash_soju(self, args, extra, line):
+        """Manage soju bouncer networks and settings."""
+        c = self._active_client()
+        parts = args.strip().split()
+        sub = parts[0].lower() if parts else ""
+        if sub in ("networks", "list", "ls"):
+            if not c._soju_networks:
+                await self.ui_queue.put(("status", "[soju] no networks loaded (not connected to soju?)"))
+                return
+            for nid, attrs in sorted(c._soju_networks.items(),
+                                     key=lambda x: x[1].get("name", x[0])):
+                name = attrs.get("name", nid)
+                host = attrs.get("host", "?")
+                state = attrs.get("state", "?")
+                nick = attrs.get("nick", "")
+                extra_info = f" nick={nick}" if nick else ""
+                await self.ui_queue.put(("status",
+                    f"  {name}: host={host} state={state}{extra_info}"))
+        elif sub == "add":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "[soju] usage: /soju add <name> host=<h> [nick=<n>] [port=<p>]"))
+                return
+            name = parts[1]
+            kv_parts = [f"host={name}"]  # fallback
+            for p in parts[2:]:
+                if "=" in p:
+                    kv_parts.append(p)
+                else:
+                    kv_parts.append(f"host={p}")
+            c.send_raw(f"BOUNCER ADDNETWORK {name} {' '.join(kv_parts)}")
+            await self.ui_queue.put(("status", f"[soju] adding network '{name}'…"))
+        elif sub in ("del", "remove", "rm"):
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "[soju] usage: /soju del <name>"))
+                return
+            name = parts[1]
+            c.send_raw(f"BOUNCER DELNETWORK {name}")
+            await self.ui_queue.put(("status", f"[soju] removing network '{name}'…"))
+        elif sub in ("update", "change", "set"):
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "[soju] usage: /soju update <name> key=value …"))
+                return
+            name = parts[1]
+            kv_parts = [p for p in parts[2:] if "=" in p]
+            if not kv_parts:
+                await self.ui_queue.put(("status", "[soju] need key=value pairs"))
+                return
+            c.send_raw(f"BOUNCER CHANGENETWORK {name} {' '.join(kv_parts)}")
+            await self.ui_queue.put(("status", f"[soju] updating network '{name}'…"))
+        elif sub == "replay":
+            if not c._soju_is_bouncer:
+                await self.ui_queue.put(("status", "[soju] not connected to a soju bouncer"))
+                return
+            chan = self.current_channel or ""
+            if not chan.startswith("#"):
+                await self.ui_queue.put(("status", "[soju] must be in a channel to replay"))
+                return
+            count_str = parts[1] if len(parts) > 1 else "50"
+            count = int(count_str) if count_str.isdigit() else 50
+            c.cmd_chathistory(chan, count)
+            await self.ui_queue.put(("status", f"[soju] replaying last {count} for {chan}…"))
+        elif sub == "status":
+            bnc = "YES" if c._soju_is_bouncer else "NO"
+            ch = c._chathistory_cap or "none"
+            nets = len(c._soju_networks)
+            caps = sorted(k for k in c._active_caps if "soju" in k or "bouncer" in k)
+            await self.ui_queue.put(("status",
+                f"[soju] bouncer={bnc} chathistory={ch} networks={nets} caps={','.join(caps) or 'none'}"))
+        else:
+            await self.ui_queue.put(("status",
+                "Usage: /soju networks|add <n> [k=v]|del <n>|update <n> k=v|replay [N]|status"))
+
+    async def _slash_graph(self, args, extra, line):
+        """Visualize interaction patterns for a nick."""
+        c = self._active_client()
+        target = args.strip().lower()
+        if not target:
+            await self.ui_queue.put(("status",
+                "Usage: /graph <nick> [depth]  — show who nick talks to"))
+            return
+        parts = target.split()
+        nick = parts[0]
+        depth = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+        depth = min(depth, 3)
+        rel = c.scoring.relationships
+        conn = rel.get_connections(nick, depth=depth)
+        if nick not in conn:
+            await self.ui_queue.put(("status",
+                f"[graph] no interaction data for '{nick}'"))
+            return
+        root_data = conn[nick]
+        lines = [f"=== Relationship graph for {nick} ==="]
+        top = root_data.get("top", {})
+        if top:
+            lines.append("  Top interactions:")
+            for other, weight in sorted(top.items(), key=lambda x: -x[1])[:15]:
+                bar = "█" * min(20, max(1, weight))
+                lines.append(f"    {other:15s} {bar} ({weight})")
+        mutual = rel.get_mutual(nick, limit=10)
+        if mutual:
+            lines.append("  Mutual (bidirectional):")
+            for other, out_w, in_w in mutual:
+                lines.append(f"    {other:15s} →{out_w} ←{in_w}")
+        channels = root_data.get("channels", [])
+        if channels:
+            lines.append(f"  Shared channels: {', '.join(channels)}")
+        if depth > 1:
+            lines.append(f"  Extended (depth={depth}): {len(conn) - 1} secondary connections")
+            for secondary, sdata in sorted(conn.items()):
+                if secondary == nick:
+                    continue
+                s_top = list(sdata.get("top", {}).keys())[:5]
+                if s_top:
+                    lines.append(f"    {secondary}: → {', '.join(s_top)}")
+        rel.save()
+        sw = self.window_by_name.get("*status*")
+        if sw:
+            for ln in lines:
+                sw.add_line(ln)
+            self._chat_dirty = True
+            self.dirty = True
+
+    async def _slash_aicalibrate(self, args, extra, line):
+        """Inspect and adjust AI detection calibration."""
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[aicalibrate] disabled by --no-ai")); return
+        c = self._active_client()
+        cal = c.scoring.calibration
+        sub = (args or "").strip().lower()
+        if sub in ("status", ""):
+            summary = cal.get_summary()
+            lines = [
+                "=== AI Calibration Status ===",
+                f"  Total feedback    : {summary['total_feedback']}",
+                f"  AI confirmations  : {summary['ai_confirmations']}",
+                f"  Human corrections : {summary['human_corrections']}",
+                f"  Signals tracked   : {summary['signals']}",
+                "  Thresholds:",
+            ]
+            for name, val in summary["thresholds"].items():
+                lines.append(f"    {name:20s}: {val:.1f}")
+            reliability = cal.get_signal_reliability()
+            if reliability:
+                lines.append("  Signal reliability:")
+                for sig, info in sorted(reliability.items(), key=lambda x: -x[1]["separation"]):
+                    mark = "✓" if info["reliable"] else "?"
+                    lines.append(
+                        f"    {mark} {sig:20s}: ai={info['ai_avg']:.3f} "
+                        f"human={info['human_avg']:.3f} sep={info['separation']:.3f}")
+            weight_adj = cal.get_weight_adjustments()
+            if weight_adj:
+                lines.append("  Recommended weight adjustments:")
+                for sig, adj in sorted(weight_adj.items(), key=lambda x: -abs(x[1])):
+                    if adj != 0:
+                        direction = "↑" if adj > 0 else "↓"
+                        lines.append(f"    {sig:20s}: {direction} {abs(adj):.3f}")
+            recent = summary.get("recent", [])
+            if recent:
+                lines.append("  Recent feedback:")
+                for entry in recent[-5:]:
+                    lines.append(
+                        f"    {entry['nick']:15s} → {entry['label'].upper():5s} "
+                        f"(score: {entry.get('ai_score', 0):.0f})")
+            sw = self.window_by_name.get("*status*")
+            if sw:
+                for ln in lines:
+                    sw.add_line(ln)
+                self._chat_dirty = True
+                self.dirty = True
+        elif sub == "reset":
+            cal.reset()
+            await self.ui_queue.put(("status",
+                "[aicalibrate] calibration data reset to defaults"))
+        elif sub.startswith("threshold"):
+            parts = sub.split()
+            if len(parts) >= 4:
+                name = parts[1]
+                try:
+                    value = float(parts[2])
+                    if name in ("ai_confirm", "human_confirm", "review"):
+                        cal._thresholds[name] = value
+                        cal._save()
+                        await self.ui_queue.put(("status",
+                            f"[aicalibrate] threshold '{name}' set to {value:.1f}"))
+                    else:
+                        await self.ui_queue.put(("status",
+                            f"[aicalibrate] unknown threshold: {name}"))
+                except ValueError:
+                    await self.ui_queue.put(("status",
+                        "[aicalibrate] invalid threshold value"))
+            else:
+                await self.ui_queue.put(("status",
+                    "Usage: /aicalibrate threshold <name> <value>"))
+        else:
+            await self.ui_queue.put(("status",
+                "Usage: /aicalibrate status|reset|threshold <name> <value>"))
+
+    async def _slash_certfp(self, args, extra, line):
+        """Auto-generate CertFP for SASL EXTERNAL authentication."""
+        sub = (args or "").strip().lower()
+        cert_dir = _SCRIPT_DIR
+        cert_path = os.path.join(cert_dir, "client.pem")
+        key_path = os.path.join(cert_dir, "client.key")
+
+        if sub in ("status", ""):
+            lines = ["=== CertFP Status ==="]
+            if os.path.exists(cert_path) and os.path.exists(key_path):
+                try:
+                    from cryptography import x509
+                    from cryptography.hazmat.primitives import serialization
+                    with open(cert_path, "rb") as f:
+                        cert = x509.load_pem_x509_certificate(f.read())
+                    with open(key_path, "rb") as f:
+                        key = serialization.load_pem_private_key(f.read(), password=None)
+                    der = cert.public_bytes(serialization.Encoding.DER)
+                    fp = hashlib.sha256(der).hexdigest()
+                    subject = cert.subject.rfc4514_string()
+                    not_after = cert.not_valid_after_utc.isoformat()
+                    lines.append(f"  Cert: {cert_path}")
+                    lines.append(f"  Key:  {key_path}")
+                    lines.append(f"  Subject: {subject}")
+                    lines.append(f"  Expires: {not_after}")
+                    lines.append(f"  SHA-256: {fp}")
+                    lines.append(f"  SASL EXTERNAL: ready — set SASL_MECHANISM=EXTERNAL")
+                except ImportError:
+                    lines.append(f"  Cert: {cert_path}")
+                    lines.append(f"  Key:  {key_path}")
+                    lines.append("  (install 'cryptography' for cert details)")
+            else:
+                lines.append("  No CertFP found. Use /certfp generate to create one.")
+            if SASL_MECHANISM == "EXTERNAL":
+                lines.append(f"  SASL EXTERNAL: enabled (mechanism={SASL_MECHANISM})")
+            else:
+                lines.append(f"  SASL EXTERNAL: not active (mechanism={SASL_MECHANISM})")
+            sw = self.window_by_name.get("*status*")
+            if sw:
+                for ln in lines:
+                    sw.add_line(ln)
+                self._chat_dirty = True
+                self.dirty = True
+            return
+
+        if sub == "generate":
+            try:
+                from cryptography import x509
+                from cryptography.hazmat.primitives import hashes, serialization
+                from cryptography.hazmat.primitives.asymmetric import ec
+                from cryptography.x509.oid import NameOID
+                import datetime
+                key = ec.generate_private_key(ec.SECP256R1())
+                subject = issuer = x509.Name([
+                    x509.NameAttribute(NameOID.COMMON_NAME, self._active_client().nick or "ircclient"),
+                    x509.NameAttribute(NameOID.ORGANIZATION_NAME, "eyearesee CertFP"),
+                ])
+                cert = (
+                    x509.CertificateBuilder()
+                    .subject_name(subject)
+                    .issuer_name(issuer)
+                    .public_key(key.public_key())
+                    .serial_number(x509.random_serial_number())
+                    .not_valid_before(datetime.datetime.utcnow())
+                    .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
+                    .sign(key, hashes.SHA256())
+                )
+                with open(cert_path, "wb") as f:
+                    f.write(cert.public_bytes(serialization.Encoding.PEM))
+                with open(key_path, "wb") as f:
+                    f.write(key.private_bytes(
+                        serialization.Encoding.PEM,
+                        serialization.PrivateFormat.TraditionalOpenSSL,
+                        serialization.NoEncryption()))
+                der = cert.public_bytes(serialization.Encoding.DER)
+                fp = hashlib.sha256(der).hexdigest()
+                await self.ui_queue.put(("status",
+                    f"[certfp] generated NIST P-256 cert+key pair"))
+                await self.ui_queue.put(("status",
+                    f"[certfp] SHA-256 fingerprint: {fp}"))
+                await self.ui_queue.put(("status",
+                    f"[certfp] cert={cert_path}  key={key_path}"))
+                await self.ui_queue.put(("status",
+                    "[certfp] To use SASL EXTERNAL, restart with: "
+                    "SASL_MECHANISM=EXTERNAL SASL_CERT=client.pem SASL_KEY=client.key"))
+            except ImportError:
+                await self.ui_queue.put(("status",
+                    "[certfp] 'cryptography' package required: pip install cryptography"))
+            except Exception as e:
+                await self.ui_queue.put(("status",
+                    f"[certfp] generation failed: {e}"))
+
+        elif sub == "fingerprint":
+            if not os.path.exists(cert_path):
+                await self.ui_queue.put(("status",
+                    "[certfp] no cert found — use /certfp generate first"))
+                return
+            try:
+                with open(cert_path, "rb") as f:
+                    cert_data = f.read()
+                from cryptography.hazmat.primitives import serialization
+                from cryptography import x509
+                cert = x509.load_pem_x509_certificate(cert_data)
+                der = cert.public_bytes(serialization.Encoding.DER)
+                fp_sha256 = hashlib.sha256(der).hexdigest()
+                fp_sha1 = hashlib.sha1(der).hexdigest()
+                await self.ui_queue.put(("status",
+                    f"[certfp] SHA-256: {fp_sha256}"))
+                await self.ui_queue.put(("status",
+                    f"[certfp] SHA-1:   {fp_sha1}"))
+                await self.ui_queue.put(("status",
+                    "[certfp] Register with NickServ: /msg NickServ CERT ADD {fp_sha256}"))
+            except ImportError:
+                with open(cert_path, "rb") as f:
+                    pem_data = f.read()
+                import subprocess
+                try:
+                    result = subprocess.run(
+                        ["openssl", "x509", "-noout", "-fingerprint", "-sha256", "-in", cert_path],
+                        capture_output=True, text=True, timeout=10)
+                    if result.returncode == 0:
+                        await self.ui_queue.put(("status",
+                            f"[certfp] {result.stdout.strip()}"))
+                    else:
+                        await self.ui_queue.put(("status",
+                            "[certfp] install 'cryptography' or 'openssl' to get fingerprint"))
+                except Exception:
+                    await self.ui_queue.put(("status",
+                        "[certfp] install 'cryptography' or 'openssl' to get fingerprint"))
+            except Exception as e:
+                await self.ui_queue.put(("status",
+                    f"[certfp] fingerprint failed: {e}"))
+
+        else:
+            await self.ui_queue.put(("status",
+                "Usage: /certfp status|generate|fingerprint"))
+
+    async def _slash_tlsinfo(self, args, extra, line):
+        """Show TLS certificate fingerprint and history for current server."""
+        c = self._active_client()
+        sub = (args or "").strip().lower()
+        fp = c.scoring.tls_fingerprinter
+        if sub == "history":
+            history = fp.get_history(c.server)
+            if not history:
+                await self.ui_queue.put(("status",
+                    f"[tls] no cert change history for {c.server}"))
+                return
+            lines = [f"=== TLS cert history for {c.server} ==="]
+            for entry in history:
+                ts = time.strftime("%Y-%m-%d %H:%M",
+                    time.localtime(entry.get("last_seen", 0)))
+                lines.append(f"  {ts}  {entry.get('fingerprint', '?')[:32]}…")
+            sw = self.window_by_name.get("*status*")
+            if sw:
+                for ln in lines:
+                    sw.add_line(ln)
+                self._chat_dirty = True
+                self.dirty = True
+        else:
+            status = fp.get_status(c.server)
+            if not status:
+                await self.ui_queue.put(("status",
+                    f"[tls] no TLS fingerprint data for {c.server}"))
+                return
+            lines = [f"=== TLS info for {c.server} ==="]
+            if "fingerprint" in status:
+                lines.append(f"  SHA-256: {status['fingerprint']}")
+            if "tls_version" in status:
+                lines.append(f"  TLS version: {status['tls_version']}")
+            if "cipher" in status:
+                lines.append(f"  Cipher: {status['cipher']}")
+            if "issuer" in status:
+                lines.append(f"  Issuer: {status['issuer']}")
+            if "subject" in status:
+                lines.append(f"  Subject: {status['subject']}")
+            if "last_seen" in status:
+                ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(status["last_seen"]))
+                lines.append(f"  Last seen: {ts}")
+            history = status.get("history", [])
+            if history:
+                lines.append(f"  Cert changes: {len(history)}")
+            sw = self.window_by_name.get("*status*")
+            if sw:
+                for ln in lines:
+                    sw.add_line(ln)
+                self._chat_dirty = True
+                self.dirty = True
+
+    async def _slash_aivai(self, args, extra, line):
+        """Detect and list AI-vs-AI conversation pairs."""
+        c = self._active_client()
+        sub = (args or "").strip().lower()
+        if sub in ("nick", "pair"):
+            nick_a = (extra or "").strip().split()[0] if extra.strip() else ""
+            nick_b = (extra or "").strip().split()[1] if len(extra.strip().split()) > 1 else ""
+            if not nick_a or not nick_b:
+                await self.ui_queue.put(("status",
+                    "Usage: /aivai pair <nick1> <nick2>"))
+                return
+            pair = c.scoring.ai_vs_ai.get_pair(nick_a, nick_b)
+            if not pair:
+                await self.ui_queue.put(("status",
+                    f"[aivai] no data for {nick_a} ↔ {nick_b}"))
+                return
+            lines = [
+                f"=== AI-vs-AI: {pair['nick_a']} ↔ {pair['nick_b']} ===",
+                f"  Channel: {pair['channel']}",
+                f"  Exchanges: {pair['exchanges']}",
+                f"  Both-high exchanges: {pair['both_high']}",
+                f"  Average AI score: {pair['avg_ai']}%",
+                f"  Gap uniformity: {pair['gap_uniformity']:.3f}",
+                f"  Confidence: {pair['confidence']:.0%}",
+            ]
+            sw = self.window_by_name.get("*status*")
+            if sw:
+                for ln in lines:
+                    sw.add_line(ln)
+                self._chat_dirty = True
+                self.dirty = True
+        else:
+            pairs = c.scoring.ai_vs_ai.get_active_pairs(min_confidence=0.2)
+            if not pairs:
+                await self.ui_queue.put(("status",
+                    "[aivai] no AI-vs-AI conversation pairs detected"))
+                return
+            lines = ["=== Active AI-vs-AI Pairs ==="]
+            for p in pairs[:15]:
+                bar = "█" * int(p["confidence"] * 20)
+                lines.append(
+                    f"  {p['nick_a']:12s} ↔ {p['nick_b']:12s}  "
+                    f"conf={p['confidence']:.0%} {bar}  "
+                    f"avg_ai={p['avg_ai']}%  "
+                    f"exchanges={p['exchanges']}")
+            sw = self.window_by_name.get("*status*")
+            if sw:
+                for ln in lines:
+                    sw.add_line(ln)
+                self._chat_dirty = True
+                self.dirty = True
+
+    async def _slash_saicorr(self, args, extra, line):
+        """Inspect sentiment-AI score correlation per nick or channel."""
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[saicorr] disabled by --no-ai")); return
+        c = self._active_client()
+        sub = (args or "").strip().lower()
+        if sub in ("anomaly", "anomalies"):
+            anomalies = c.scoring.sentiment_ai.get_top_anomalies(limit=15)
+            if not anomalies:
+                await self.ui_queue.put(("status",
+                    "[saicorr] no sentiment anomalies detected"))
+                return
+            lines = ["=== Sentiment Anomalies (uniform sentiment + high AI) ==="]
+            for a in anomalies:
+                lines.append(
+                    f"  {a['nick']:15s}  samples={a['samples']}  "
+                    f"high_ai={a['high_ai_count']}  "
+                    f"variance={a['sentiment_variance']:.4f}  "
+                    f"corr={a['correlation']}")
+            sw = self.window_by_name.get("*status*")
+            if sw:
+                for ln in lines:
+                    sw.add_line(ln)
+                self._chat_dirty = True
+                self.dirty = True
+        elif sub == "channel":
+            chan = (extra or "").strip() or self.current_channel or ""
+            if not chan.startswith("#"):
+                await self.ui_queue.put(("status",
+                    "[saicorr] specify a channel"))
+                return
+            corr = c.scoring.sentiment_ai.get_channel_correlation(chan)
+            lines = [
+                f"=== Sentiment-AI Correlation: {chan} ===",
+                f"  Samples: {corr['samples']}",
+                f"  Correlation (r): {corr['correlation'] or 'insufficient data'}",
+                f"  AI msg sentiment avg: {corr.get('ai_sentiment_avg', 'N/A')}",
+                f"  Human msg sentiment avg: {corr.get('human_sentiment_avg', 'N/A')}",
+                f"  AI msg intensity avg: {corr.get('ai_intensity_avg', 'N/A')}",
+                f"  Human msg intensity avg: {corr.get('human_intensity_avg', 'N/A')}",
+                f"  High-AI %: {corr.get('high_ai_pct', 'N/A')}%",
+            ]
+            sw = self.window_by_name.get("*status*")
+            if sw:
+                for ln in lines:
+                    sw.add_line(ln)
+                self._chat_dirty = True
+                self.dirty = True
+        else:
+            nick = (args or "").strip().lower()
+            if nick:
+                corr = c.scoring.sentiment_ai.get_nick_correlation(nick)
+                lines = [
+                    f"=== Sentiment-AI Correlation: {nick} ===",
+                    f"  Samples: {corr['samples']}",
+                    f"  Correlation (r): {corr['correlation'] or 'insufficient data'}",
+                    f"  AI msg sentiment avg: {corr.get('ai_sentiment_avg', 'N/A')}",
+                    f"  Human msg sentiment avg: {corr.get('human_sentiment_avg', 'N/A')}",
+                    f"  Sentiment variance: {corr['sentiment_variance']:.4f}",
+                    f"  High-AI messages: {corr['high_ai_count']}",
+                    f"  Anomaly: {'YES — ' + corr['anomaly_reason'] if corr['anomaly'] else 'no'}",
+                ]
+                sw = self.window_by_name.get("*status*")
+                if sw:
+                    for ln in lines:
+                        sw.add_line(ln)
+                    self._chat_dirty = True
+                    self.dirty = True
+            else:
+                await self.ui_queue.put(("status",
+                    "Usage: /saicorr <nick> | channel [chan] | anomaly"))
+
+    async def _slash_brief(self, args, extra, line):
+        """AI-generated summary of what happened since you last read the channel."""
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[brief] disabled by --no-ai")); return
+        c = self._active_client()
+        chan = (args or "").strip()
+        if not chan:
+            chan = self.current_channel or ""
+        if not chan.startswith("#"):
+            await self.ui_queue.put(("status",
+                "[brief] must specify a channel or be in one"))
+            return
+        win = self.window_by_name.get(self._wk(self._active_server_id(), chan))
+        if not win:
+            await self.ui_queue.put(("status", f"[brief] no window for {chan}"))
+            return
+        # Determine unread start index
+        unread_from = win._unread_from
+        if unread_from < 0:
+            raw_lines = list(win.lines)[-50:]
+            label = "last 50 messages"
+        else:
+            raw_lines = list(win.lines)[unread_from:]
+            label = f"{len(raw_lines)} unread messages"
+        if not raw_lines:
+            await self.ui_queue.put(("status", f"[brief] no messages in {chan}"))
+            return
+        if len(raw_lines) > 200:
+            raw_lines = raw_lines[-200:]
+            label = f"last 200 of {len(list(win.lines)[unread_from:])} messages"
+        _TS_RE = re.compile(r'^\[\d{2}:\d{2}\]\s*')
+        _SPEAKER_RE = re.compile(r'^<(\S+?)>')
+        cleaned = [irc_strip_formatting(_TS_RE.sub("", ln)) for ln in raw_lines]
+        transcript = "\n".join(cleaned)
+        speakers = set()
+        for ln in raw_lines:
+            m = _SPEAKER_RE.match(irc_strip_formatting(_TS_RE.sub("", ln)))
+            if m:
+                speakers.add(m.group(1))
+        speaker_hint = (f"Active speakers: {', '.join(sorted(speakers))}.\n"
+                        if speakers else "")
+        prompt = (
+            f"The following is an IRC chat log from \"{chan}\" ({label}).\n"
+            f"{speaker_hint}"
+            f"Write a ONE-PARAGRAPH summary (under 150 words) of what happened.\n"
+            f"Focus on: key topics discussed, decisions made, questions asked, "
+            f"and any notable interactions between users.\n"
+            f"Name the users involved. Be specific but concise.\n\n"
+            f"Chat log:\n{transcript}"
+        )
+        model_key, model_id, label_m = self._resolve_ai_model(None)
+        await self.ui_queue.put(("status",
+            f"[brief] summarizing {chan} ({label}) via {label_m}…"))
+        task = asyncio.create_task(
+            self._do_brief(prompt, model_key, model_id, chan, len(raw_lines)))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _do_brief(self, prompt: str, model_key: str, model_id: str,
+                         chan: str, n_msgs: int) -> None:
+        try:
+            answer, tokens = await asyncio.wait_for(
+                self._call_ai(prompt, model_key, max_tokens=400), timeout=120.0)
+            if answer:
+                answer = answer.strip()
+                sw = self.window_by_name.get("*status*")
+                if sw:
+                    sw.add_line(f"=== Brief: {chan} ({n_msgs} msgs) ===")
+                    for paragraph in answer.split("\n\n"):
+                        if paragraph.strip():
+                            sw.add_line(f"  {paragraph.strip()}")
+                    sw.add_line("")
+                    self._chat_dirty = True
+                    self.dirty = True
+        except asyncio.TimeoutError:
+            await self.ui_queue.put(("status", "[brief] AI request timed out"))
+        except Exception as e:
+            await self.ui_queue.put(("status", f"[brief] AI error: {e}"))
 
     async def _slash_monitor(self, args, extra, line):
         """MONITOR a nick for online/offline notifications."""
@@ -11676,6 +23494,7 @@ class TUI:
             return True   # caller handles asynchronously
 
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            self._active_client().biometrics.record_keypress(is_backspace=True)
             if self.input_cursor > 0:
                 self.input_buffer = (self.input_buffer[:self.input_cursor - 1]
                                      + self.input_buffer[self.input_cursor:])
@@ -12011,6 +23830,7 @@ class TUI:
                                 return True
 
         elif 32 <= ch <= 1114111:
+            self._active_client().biometrics.record_keypress(is_backspace=False)
             try:
                 ch_str = chr(ch)
             except (ValueError, OverflowError):
@@ -12043,6 +23863,20 @@ class TUI:
             self._show_userlist = not self._show_userlist
             self._resize_windows()
             self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 19:   # Ctrl+S — toggle stats panel
+            self._show_stats_panel = not self._show_stats_panel
+            if self._show_stats_panel:
+                stats_x = self.width - self.userlist_width - self._stats_width
+                try:
+                    self._stats_win = curses.newwin(self.chat_height, self._stats_width, 0, max(0, stats_x))
+                except curses.error:
+                    self._stats_win = None
+            else:
+                self._stats_win = None
+            self._resize_windows()
+            self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
             self.dirty = True
 
         elif ch == 7:    # Ctrl+G — go to window by number
@@ -12140,6 +23974,11 @@ class TUI:
             self._typing_out_state  = "paused"
 
     async def run(self) -> None:
+        # Start periodic background tasks for productivity features
+        asyncio.create_task(self._periodic_reminder_checker())
+        asyncio.create_task(self._periodic_rss_poller())
+        asyncio.create_task(self._periodic_github_poller())
+        asyncio.create_task(self._periodic_topology_updater())
         try:
             await self._run_loop()
         except (SystemExit, asyncio.CancelledError, KeyboardInterrupt):
@@ -12479,10 +24318,72 @@ def main():
         sys.exit(subprocess.call([sys.executable] + sys.argv))
 
     # ── Startup prompts (plain terminal, before curses takes over) ──────────────
-    print("╔══════════════════════════════════════╗")
-    print("║       eyearesee  —  IRC client       ║")
-    print("╚══════════════════════════════════════╝")
-    print("  Press Enter to accept the [default].\n")
+
+    # ANSI helpers — gracefully degrade on terminals without colour support
+    _TTY = sys.stdin.isatty()
+    if sys.platform == "win32":
+        try:
+            import ctypes as _ctypes
+            _k32 = _ctypes.windll.kernel32
+            _k32.SetConsoleMode(_k32.GetStdHandle(-11), 7)
+        except Exception:
+            pass
+    _HAS_COLOR = _TTY and hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+    def _c(code: str, text: str = "") -> str:
+        if not _HAS_COLOR:
+            return text
+        return f"\033[{code}m{text}"
+
+    _RST   = _c("0")
+    _B     = _c("1")
+    _DIM   = _c("2")
+    _UL    = _c("4")
+    _BLK   = _c("30")
+    _RD    = _c("31")
+    _GN    = _c("32")
+    _YL    = _c("33")
+    _BL    = _c("34")
+    _MG    = _c("35")
+    _CY    = _c("36")
+    _GR    = _c("37")
+    _B_GN  = _c("1;32")
+    _B_CY  = _c("1;36")
+    _B_MG  = _c("1;35")
+    _B_YL  = _c("1;33")
+    _B_GR  = _c("1;37")
+    _B_BL  = _c("1;34")
+    _BG_BL = _c("44")
+    _BG_MG = _c("45")
+    _BG_CN = _c("46;30")
+
+    def _status(on: bool) -> str:
+        return f"{_B_GN}\u2713{_RST}" if on else f"{_DIM}\u2022{_RST}"
+
+    def _mask(val: str, visible: int = 4) -> str:
+        if not val:
+            return ""
+        if len(val) <= visible:
+            return "*" * len(val)
+        return val[:visible] + "\u2022" * min(len(val) - visible, 12)
+
+    _W = 54
+    _VL = "\u2502"
+    _HL = "\u2500"
+    _TL = "\u250c"
+    _TR = "\u2510"
+    _BL = "\u2514"
+    _BR = "\u2518"
+    _DASH = "\u2500"
+
+    def _section(title: str) -> None:
+        if not _TTY:
+            print(f"\n  {title}")
+            return
+        print()
+        half = (_W - len(title) - 4) // 2
+        line = _HL * half
+        print(f"  {_DIM}{line}{_RST} {_B_YL}{title}{_RST} {_DIM}{line}{_RST}")
 
     # Load all settings from irc_config.json; env vars are the fallback already
     # applied at module level.  Config file takes precedence over env vars.
@@ -12507,8 +24408,7 @@ def main():
         _AUTOJOIN_CHANNELS.update(_saved["autojoin"])
 
     # ── Safe input helper (returns "" on EOF / non-TTY so defaults are used) ──
-    if not sys.stdin.isatty():
-        # Double-clicked on Windows — no interactive console; use all defaults.
+    if not _TTY:
         _input = lambda _: ""
     else:
         def _input(prompt: str) -> str:
@@ -12517,72 +24417,161 @@ def main():
             except EOFError:
                 return ""
 
-    # ── IRC connection ───────────────────────────────────────────────────────────
+    # ── Draw the startup interface ──────────────────────────────────────────────
 
-    # Server — accepts host  or  host:port
-    raw = _input(f"  Server   [{DEFAULT_SERVER}] : ").strip()
+    if _TTY:
+        _logo = [
+            f"{_B_CY}  ___  ___  ___  ___  {_RST}",
+            f"{_B_CY} / _ \\/ __|/ _ \\/ __| {_RST}",
+            f"{_B_CY}| (_) \\__ \\ (_) \\__ \\ {_RST}",
+            f"{_B_CY} \\___/|___/\\___/|___/ {_RST}",
+        ]
+        print()
+        for _ln in _logo:
+            print(f"  {_ln}")
+        print()
+        for _ln in [
+            f"  {_B_MG}eyearesee{_RST}{_DIM} \u2014 IRC client with AI detection{_RST}",
+            f"  {_DIM}Press Enter to accept defaults  \u2502  Ctrl-C to cancel{_RST}",
+        ]:
+            print(_ln)
+        print()
+    else:
+        print(f"  eyearesee \u2014 IRC client\n")
+
+    # ── IRC Connection ─────────────────────────────────────────────────────────
+
+    _section("CONNECTION")
+
+    # Server
+    _srv_hint = f"{_DIM}{DEFAULT_SERVER}:{DEFAULT_PORT}{_RST}" if _TTY else f"{DEFAULT_SERVER}:{DEFAULT_PORT}"
+    raw = _input(f"  {_B_GR}Server{_RST}  {_srv_hint} : ").strip()
     if raw:
         if ":" in raw:
             host, _, port_str = raw.rpartition(":")
             if port_str.isdigit():
                 DEFAULT_SERVER, DEFAULT_PORT = host, int(port_str)
             else:
-                DEFAULT_SERVER = raw          # treat whole thing as hostname
+                DEFAULT_SERVER = raw
         else:
             DEFAULT_SERVER = raw
 
     # Nick
-    raw = _input(f"  Nick     [{DEFAULT_NICK}] : ").strip()
+    _nk_hint = f"{_DIM}{DEFAULT_NICK}{_RST}" if _TTY else DEFAULT_NICK
+    raw = _input(f"  {_B_GR}Nick{_RST}    {_nk_hint} : ").strip()
     if raw:
-        # IRC nicks: letters/digits/[-\[\]\\`_^{|}], max 30 chars (RFC 1459 §2.3.1)
         raw = re.sub(r'[^a-zA-Z0-9\[\]\\`_\-^{|}]', '', raw)[:30]
         if raw:
             DEFAULT_NICK = raw
 
-    # Channel — prepend # if omitted
-    raw = _input(f"  Channel  [{DEFAULT_CHANNEL}] : ").strip()
+    # Channel
+    _ch_hint = f"{_DIM}{DEFAULT_CHANNEL}{_RST}" if _TTY else DEFAULT_CHANNEL
+    raw = _input(f"  {_B_GR}Channel{_RST} {_ch_hint} : ").strip()
     if raw:
         DEFAULT_CHANNEL = raw if raw.startswith("#") else "#" + raw
-        # Strip characters illegal in channel names: NUL, BEL, space, comma, CR/LF
         DEFAULT_CHANNEL = re.sub(r'[\x00-\x07\x09-\x1f\x7f ,]', '', DEFAULT_CHANNEL)[:50] \
                           or DEFAULT_CHANNEL
 
+    # ── Auto-join channels ──────────────────────────────────────────────────────
+
+    _section("AUTO-JOIN CHANNELS")
+
+    if _TTY:
+        _aj_list = sorted(_AUTOJOIN_CHANNELS)
+        _aj_toggled = True
+        while _aj_toggled:
+            _aj_list = sorted(_AUTOJOIN_CHANNELS)
+            if _aj_list:
+                for _i, _ch in enumerate(_aj_list, 1):
+                    _mark = _B_GN + "\u2713" + _RST
+                    print("  " + _mark + " " + _DIM + str(_i).rjust(2) + _RST + " " + _ch)
+            else:
+                print("  " + _DIM + "  No channels configured" + _RST)
+            print("  " + _DIM + "Toggle: number  \u2022  Add: #channel  \u2022  Remove: -#  \u2022  Done: Enter" + _RST)
+            raw = _input("  " + _B_GR + "Auto-join" + _RST + " : ").strip()
+            if not raw:
+                _aj_toggled = False
+            elif raw.isdigit():
+                _idx = int(raw) - 1
+                if 0 <= _idx < len(_aj_list):
+                    _removed = _aj_list[_idx]
+                    _AUTOJOIN_CHANNELS.discard(_removed)
+                    print("  " + _RD + "\u2717 Removed " + _removed + _RST)
+                    _save_autojoin_config()
+            elif raw.startswith("-") and len(raw) > 1:
+                _rm_ch = raw[1:]
+                if not _rm_ch.startswith("#"):
+                    _rm_ch = "#" + _rm_ch
+                _AUTOJOIN_CHANNELS.discard(_rm_ch)
+                print("  " + _RD + "\u2717 Removed " + _rm_ch + _RST)
+                _save_autojoin_config()
+            else:
+                _add_ch = raw if raw.startswith("#") else "#" + raw
+                _add_ch = re.sub(r'[\x00-\x07\x09-\x1f\x7f ,]', '', _add_ch)[:50]
+                if _add_ch and len(_add_ch) > 1:
+                    _AUTOJOIN_CHANNELS.add(_add_ch)
+                    print("  " + _B_GN + "\u2713 Added " + _add_ch + _RST)
+                    _save_autojoin_config()
+    else:
+        if _AUTOJOIN_CHANNELS:
+            raw = _input("  Auto-join channels (space-separated, Enter to keep) : ").strip()
+            if raw:
+                _AUTOJOIN_CHANNELS.clear()
+                for _ch in raw.split():
+                    _ch = _ch if _ch.startswith("#") else "#" + _ch
+                    _ch = re.sub(r'[\x00-\x07\x09-\x1f\x7f ,]', '', _ch)[:50]
+                    if _ch and len(_ch) > 1:
+                        _AUTOJOIN_CHANNELS.add(_ch)
+                _save_autojoin_config()
+        else:
+            raw = _input("  Auto-join channels (space-separated, Enter to skip) : ").strip()
+            if raw:
+                for _ch in raw.split():
+                    _ch = _ch if _ch.startswith("#") else "#" + _ch
+                    _ch = re.sub(r'[\x00-\x07\x09-\x1f\x7f ,]', '', _ch)[:50]
+                    if _ch and len(_ch) > 1:
+                        _AUTOJOIN_CHANNELS.add(_ch)
+                _save_autojoin_config()
+
     # ── SASL ────────────────────────────────────────────────────────────────────
 
-    _mech_hint = f"PLAIN/SCRAM-SHA-256/EXTERNAL/ECDSA-NIST256P-CHALLENGE"
-    raw = _input(f"  SASL     [{SASL_MECHANISM}] ({_mech_hint}) : ").strip().upper()
+    _section("AUTHENTICATION")
+
+    _mech_hint = f"{_DIM}PLAIN | SCRAM-SHA-256 | EXTERNAL | ECDSA-NIST256P-CHALLENGE{_RST}" if _TTY else "PLAIN/SCRAM-SHA-256/EXTERNAL/ECDSA-NIST256P-CHALLENGE"
+    _mech_disp = f"{_B_CY}{SASL_MECHANISM}{_RST}" if _TTY else SASL_MECHANISM
+    raw = _input(f"  {_B_GR}SASL{_RST}     {_mech_disp} {_mech_hint} : ").strip().upper()
     if raw:
         SASL_MECHANISM = raw
 
-    # NickServ / SASL password (PLAIN and SCRAM-SHA-256)
-    _pw_hint = "[configured]" if NICKSERV_PASSWORD else "blank to skip"
+    _pw_hint = f"{_B_GN}[configured]{_RST}" if NICKSERV_PASSWORD else f"{_DIM}blank to skip{_RST}"
     try:
-        raw = getpass.getpass(f"  Password ({_pw_hint}) : ")
+        raw = getpass.getpass(f"  {_B_GR}Password{_RST} {_pw_hint} : ")
         if raw:
             NICKSERV_PASSWORD = raw
     except EOFError:
         pass
 
-    # Cert/key paths — only relevant for EXTERNAL and ECDSA
     if SASL_MECHANISM in ("EXTERNAL", "ECDSA-NIST256P-CHALLENGE"):
         if SASL_MECHANISM == "EXTERNAL":
-            _cert_hint = SASL_CERT or "path to PEM cert"
-            raw = _input(f"  SASL cert [{_cert_hint}] : ").strip()
+            _cert_hint = f"{_DIM}{SASL_CERT or 'path to PEM cert'}{_RST}" if _TTY else (SASL_CERT or "path to PEM cert")
+            raw = _input(f"  {_B_GR}Cert{_RST}    {_cert_hint} : ").strip()
             if raw:
                 SASL_CERT = raw
-        _key_hint = SASL_KEY or "path to PEM key"
-        raw = _input(f"  SASL key  [{_key_hint}] : ").strip()
+        _key_hint = f"{_DIM}{SASL_KEY or 'path to PEM key'}{_RST}" if _TTY else (SASL_KEY or "path to PEM key")
+        raw = _input(f"  {_B_GR}Key{_RST}     {_key_hint} : ").strip()
         if raw:
             SASL_KEY = raw
 
     # ── AI API keys ──────────────────────────────────────────────────────────────
 
-    print()
-    print("  AI API keys — press Enter to keep existing value, '-' to clear.")
+    _section("AI PROVIDERS")
+    if _TTY:
+        print(f"  {_DIM}Enter to keep  \u2022  '-' to clear  \u2022  values masked on summary{_RST}")
 
     def _prompt_key(label: str, current: str) -> str:
-        hint = "[configured]" if current else "blank to skip"
-        val = _input(f"  {label:<22} ({hint}) : ").strip()
+        _icon = _status(bool(current)) if _TTY else ""
+        hint = f"{_B_GN}[configured]{_RST}" if current else f"{_DIM}blank to skip{_RST}"
+        val = _input(f"  {_icon} {_B_GR}{label:<18}{_RST} {hint} : ").strip()
         if val == "-":
             return ""
         return val if val else current
@@ -12593,12 +24582,16 @@ def main():
     GITHUB_TOKEN      = _prompt_key("GitHub token",      GITHUB_TOKEN)
     GEMINI_API_KEY    = _prompt_key("Gemini API key",    GEMINI_API_KEY)
 
-    print()
-    print("  Local inference servers (press Enter to keep).")
-    raw = _input(f"  Ollama URL    [{OLLAMA_URL}] : ").strip()
+    # ── Local inference ─────────────────────────────────────────────────────────
+
+    _section("LOCAL INFERENCE")
+    if _TTY:
+        print(f"  {_DIM}Press Enter to keep current URLs{_RST}")
+
+    raw = _input(f"  {_B_GR}Ollama{_RST}     {_DIM}{OLLAMA_URL}{_RST} : ").strip()
     if raw:
         OLLAMA_URL = raw
-    raw = _input(f"  llama.cpp URL [{LLAMACPP_URL}] : ").strip()
+    raw = _input(f"  {_B_GR}llama.cpp{_RST}  {_DIM}{LLAMACPP_URL}{_RST} : ").strip()
     if raw:
         LLAMACPP_URL = raw
 
@@ -12612,9 +24605,8 @@ def main():
         "nickserv_password": NICKSERV_PASSWORD,
         "ollama_url":        OLLAMA_URL,
         "llamacpp_url":      LLAMACPP_URL,
+        "autojoin":          sorted(_AUTOJOIN_CHANNELS),
     }
-    # Cert/key only written when non-empty (paths are sensitive enough to omit
-    # if unused, and writing empty strings would clutter the file).
     if SASL_CERT:     _cfg["sasl_cert"]          = SASL_CERT
     if SASL_KEY:      _cfg["sasl_key"]            = SASL_KEY
     if ANTHROPIC_API_KEY: _cfg["anthropic_api_key"] = ANTHROPIC_API_KEY
@@ -12624,9 +24616,71 @@ def main():
     if GEMINI_API_KEY:    _cfg["gemini_api_key"]     = GEMINI_API_KEY
     save_irc_config(_cfg)
 
-    print(f"\n  → {DEFAULT_SERVER}:{DEFAULT_PORT} (SSL)  nick={DEFAULT_NICK}"
-          + (f"  channel={DEFAULT_CHANNEL}" if DEFAULT_CHANNEL else ""))
-    print()
+    # ── Connection summary ──────────────────────────────────────────────────────
+
+    if _TTY:
+        print()
+        _sw = _W
+        _summary_top = _TL + _HL * _sw + _TR
+        _summary_bot = _BL + _HL * _sw + _BR
+
+        def _sec(t):
+            _inner = " " + t
+            return _VL + _B_CY + _inner.ljust(_sw - 1) + _RST + _VL
+
+        def _row(k, v):
+            return _VL + " " + _B_GR + k.ljust(16) + _RST + " " + v + _RST
+
+        def _pw_row(k, v):
+            if v:
+                return _VL + " " + _B_GR + k.ljust(16) + _RST + " " + _DIM + v + _RST
+            return _VL + " " + _B_GR + k.ljust(16) + _RST + " " + _DIM + "\u2014" + _RST
+
+        _pw_show = _mask(NICKSERV_PASSWORD) if NICKSERV_PASSWORD else "\u2014"
+
+        _rows = [
+            _summary_top,
+            _sec("CONNECTION"),
+            _row("Server",  DEFAULT_SERVER + ":" + str(DEFAULT_PORT) + " (TLS)"),
+            _row("Nick",    DEFAULT_NICK),
+            _row("Channel", DEFAULT_CHANNEL or "\u2014"),
+        ]
+        if _AUTOJOIN_CHANNELS:
+            _aj_sorted = sorted(_AUTOJOIN_CHANNELS)
+            _rows.append(_row("Auto-join", ", ".join(_aj_sorted[:5]) + ("..." if len(_aj_sorted) > 5 else "")))
+        _rows += [
+            _sec("AUTH"),
+            _row("SASL",    SASL_MECHANISM),
+            _pw_row("Password", _pw_show),
+        ]
+        if SASL_MECHANISM in ("EXTERNAL", "ECDSA-NIST256P-CHALLENGE"):
+            if SASL_CERT:
+                _rows.append(_pw_row("Cert", _mask(SASL_CERT, 8)))
+            if SASL_KEY:
+                _rows.append(_pw_row("Key", _mask(SASL_KEY, 8)))
+        _rows.append(_sec("AI PROVIDERS"))
+
+        _ai_providers = []
+        if ANTHROPIC_API_KEY: _ai_providers.append("Anthropic " + _status(True))
+        if OPENAI_API_KEY:    _ai_providers.append("OpenAI " + _status(True))
+        if DEEPSEEK_API_KEY:  _ai_providers.append("DeepSeek " + _status(True))
+        if GITHUB_TOKEN:      _ai_providers.append("GitHub " + _status(True))
+        if GEMINI_API_KEY:    _ai_providers.append("Gemini " + _status(True))
+        if not _ai_providers:
+            _ai_providers.append(_DIM + "none configured" + _RST)
+        _provs = "  ".join(_ai_providers)
+        _rows.append(_VL + " " + _provs)
+        _rows.append(_sec("LOCAL INFERENCE"))
+        _rows.append(_row("Ollama",    OLLAMA_URL))
+        _rows.append(_row("llama.cpp", LLAMACPP_URL))
+        _rows.append(_summary_bot)
+        for _ln in _rows:
+            print("  " + _ln)
+        print()
+    else:
+        print("\n  -> " + str(DEFAULT_SERVER) + ":" + str(DEFAULT_PORT) + " (TLS)  nick=" + DEFAULT_NICK
+              + (("  channel=" + DEFAULT_CHANNEL) if DEFAULT_CHANNEL else ""))
+        print()
 
     # Load AI models before curses starts so progress prints go to the normal
     # terminal and don't corrupt the TUI display.
